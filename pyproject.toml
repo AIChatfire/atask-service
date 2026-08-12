@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "async-gateway"
+version = "0.1.0"
+description = "异步 AI 网关：原生透传 + new-api 兼容视频形态，复用 new-api tasks 表，预扣+结算计费闭环"
+requires-python = ">=3.12"
+dependencies = [
+    # Web 框架与 ASGI 服务（SPEC §2）
+    "fastapi==0.115.14",
+    "uvicorn==0.34.0",
+    "gunicorn==23.0.0",
+    # 配置
+    "pydantic==2.11.7",
+    "pydantic-settings==2.9.1",
+    # 存储：MySQL（与 new-api 共享实例）+ Redis
+    "sqlalchemy[asyncio]==2.0.41",
+    "asyncmy==0.2.10",
+    "redis==5.2.1",
+    # 出站 HTTP
+    "httpx[http2]==0.28.1",
+    # 观测
+    "logfire==3.25.0",
+    # logfire.instrument_* 依赖的 OTel instrumentation 包（版本对齐 logfire 3.25.0
+    # 传递依赖 opentelemetry-sdk 1.35.0 对应的 0.56b0 线）
+    "opentelemetry-instrumentation-fastapi==0.56b0",
+    "opentelemetry-instrumentation-httpx==0.56b0",
+    "opentelemetry-instrumentation-sqlalchemy==0.56b0",
+    "opentelemetry-instrumentation-redis==0.56b0",
+    # 计费表达式沙箱（>=1.0.6 修复 GHSA-vp47-9734-prjw，订阅 GHSA）
+    "asteval==1.0.9",
+    # 重试
+    "tenacity==9.1.2",
+    # 上游 JWT 鉴权（kling AK/SK HS256）
+    "PyJWT==2.10.1",
+    # 回调事件 ID（evt_ + ulid）
+    "ulid-py==1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.26.0",
+    "ruff==0.11.13",
+    "mypy==1.15.0",
+    "respx==0.22.0",
+    # W6 compose 清单静态断言（缺失时对应冒烟测试跳过）
+    "pyyaml==6.0.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# ---------- ruff（SPEC §6 代码质量线） ----------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = [
+    "E501",     # 行长由 formatter 管
+    "RUF001",   # 中文代码库：全角标点非歧义字符（docstring/comment/string）
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B008"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true

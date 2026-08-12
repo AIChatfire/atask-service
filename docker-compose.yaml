@@ -1,0 +1,29 @@
+# 本项目只容器化 Redis；MySQL 复用 NewAPI 现有实例（GW_DATABASE_URL 指向它，不进编排）。
+# 本地开发若 MySQL 跑在宿主机：extra_hosts 已配 host.docker.internal，
+# .env 里写 mysql+asyncmy://user:pass@host.docker.internal:3306/newapi 即可。
+services:
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  gateway:                            # API 进程（无状态，可多副本）
+    build: .
+    env_file: .env
+    depends_on: [redis]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["8000:8000"]
+
+  worker:                             # 任务执行进程：结算/通知/探测
+    build: .
+    env_file: .env
+    depends_on: [redis]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: taskiq worker app.queue:broker --max-async-tasks 100
+    # deploy.replicas: 2               # 队列积压时直接加副本补并发
+
+  scheduler:                          # 定时进程：派发延迟任务 + 每分钟补数巡检（单副本即可）
+    build: .
+    env_file: .env
+    depends_on: [redis]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: taskiq scheduler app.queue:scheduler
