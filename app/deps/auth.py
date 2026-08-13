@@ -24,7 +24,9 @@ class TokenCtx:
 
 
 def extract_token(authorization: str | None) -> TokenCtx:
-    if isinstance(authorization, Header):  ### 临时规避
+    from fastapi.params import Header as HeaderParam  # 实际的类
+
+    if isinstance(authorization, HeaderParam):  ### 临时规避
         authorization = None
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing or invalid Authorization header")
