@@ -11,7 +11,7 @@ import time
 from sqlalchemy import bindparam, text
 
 from app.config import settings
-from app.db import SessionLocal
+from app.db import get_session_factory
 from app.schemas import ACTIVE, TERMINAL
 
 log = logging.getLogger("gateway.taskstore")
@@ -29,7 +29,7 @@ async def create(
     data: dict,
 ) -> None:
     now = _now()
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         await db.execute(
             text(
                 """
@@ -55,7 +55,7 @@ async def create(
 
 
 async def get(task_id: str) -> dict | None:
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         row = (
             await db.execute(
                 text("SELECT * FROM tasks WHERE task_id = :t LIMIT 1"), {"t": task_id}
@@ -93,7 +93,7 @@ async def cas(
         WHERE task_id = :tid AND status IN :froms
         """
     ).bindparams(bindparam("froms", expanding=True))
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         res = await db.execute(
             stmt,
             {
@@ -127,7 +127,7 @@ async def patch_data(task_id: str, patch: dict, status: str | None = None) -> No
     }
     if status:
         params["status"] = status
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         await db.execute(text(sql), params)
         await db.commit()
 
@@ -139,7 +139,7 @@ async def mark_settled(task_id: str, amount: float) -> None:
 async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
     """Sweeper：非终态且长时间未更新的任务"""
     cutoff = _now() - stale_seconds
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(
@@ -157,7 +157,7 @@ async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
 
 async def counts_by_status() -> dict[str, int]:
     """任务状态分布（队列观测用）"""
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(
@@ -171,7 +171,7 @@ async def counts_by_status() -> dict[str, int]:
 
 async def terminal_unsettled(limit: int = 200) -> list[dict]:
     """Sweeper：终态但结算标记未落的任务（事件丢失的兜底重发）"""
-    async with SessionLocal() as db:
+    async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(

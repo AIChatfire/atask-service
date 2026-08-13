@@ -1,18 +1,16 @@
-# docker-compose（架构 §12.2 本地/小规格形态；W6 交付）
+# docker-compose（本地/小规格形态）
 #
 # 快速开始：
 #   cp .env.example .env
 #   docker compose up --build
-# 可选计费服务占位（联调计费契约时替换为真实镜像）：
-#   docker compose --profile billing up --build
 #
 # 说明：
 # - 本地以单 MySQL 模拟「与 new-api 共享实例」；tasks 表由 new-api AutoMigrate
-#   初始化（或按简报 C §一 对照脚本）。**零自有表（决策 A）**：网关不建任何
-#   gateway_* 表，自有状态全部在 Redis（AOF everysec）与环境变量。
-# - biz 注册表由 BIZ_CONFIGS（.env 内联 JSON）或 BIZ_CONFIGS_FILE 提供（决策 B）。
-# - 各服务 env_file 读 .env（与 .env.example 对齐），environment 段仅覆盖
-#   compose 网络内的服务地址（127.0.0.1 → 服务名）。
+#   初始化。**零自有表**：网关不建任何表，自有状态全部在 Redis（AOF everysec）
+#   与环境变量。
+# - **零路由文件**：上游配置唯一事实源是 keypool 渠道元数据（group=biz 同名
+#   约定 + 渠道 setting.gateway 提取配置块），随租约实时下发。
+# - 三个外部微服务（keypool/pricing/newapi-billing）地址在 .env 配置。
 
 services:
   gateway:
@@ -20,15 +18,9 @@ services:
     command: gunicorn -c gunicorn.conf.py app.main:app
     env_file: .env
     environment: &gwenv
-      DATABASE_URL: mysql+asyncmy://${MYSQL_USER:-gw}:${MYSQL_PASSWORD:-devonly}@mysql:3306/new_api?charset=utf8mb4
-      REDIS_URL: redis://redis:6379/0
-      BILLING_SERVICE_URL: http://billing-service:8080
-      PRICING_SERVICE_URL: http://pricing-logic:8080
+      GW_DATABASE_URL: mysql+asyncmy://${MYSQL_USER:-gw}:${MYSQL_PASSWORD:-devonly}@mysql:3306/new_api?charset=utf8mb4
+      GW_REDIS_URL: redis://redis:6379/0
       GUNICORN_WORKERS: "3"
-    # 可选：BIZ_CONFIGS_FILE 挂载文件热更（决策 B，免重启改 biz 注册表）。
-    # 在 .env 设置 BIZ_CONFIGS_FILE=/etc/gateway/biz_configs.json 后取消注释：
-    # volumes:
-    #   - ./biz_configs.json:/etc/gateway/biz_configs.json:ro
     ports:
       - "8000:8000"
     depends_on:
@@ -37,21 +29,20 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz/live"]
+      # python:3.12-slim 无 curl，用标准库 urllib 探活
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz/live', timeout=2)"]
       interval: 15s
       timeout: 3s
       start_period: 10s
       retries: 3
-    # SIGKILL 前留 60s：覆盖 gunicorn graceful_timeout=30（gunicorn.conf.py）
     stop_grace_period: 60s
     restart: unless-stopped
 
-  worker:  # poll + dispatcher + outbox + renewer 合一（开发环境；生产拆分，架构 §12.1）
+  worker:   # 探测/结算/通知任务执行器；多副本直接加 --max-async-tasks 或 replicas
     build: .
-    command: python -m app.worker
+    command: taskiq worker app.queue:broker --max-async-tasks 100
     env_file: .env
     environment: *gwenv
-    # 可选：BIZ_CONFIGS_FILE 挂载文件热更（同 gateway 注释示例）
     depends_on:
       mysql:
         condition: service_healthy
@@ -61,10 +52,21 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  scheduler:  # 延迟任务派发（探测退避/重试退避）+ 每分钟 sweep 补数巡检
+    build: .
+    command: taskiq scheduler app.queue:scheduler
+    env_file: .env
+    environment: *gwenv
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    restart: unless-stopped
+
   mysql:
     image: mysql:8.0
     # 本地开发默认口令 devonly（仅本地，勿用于生产）；生产在 .env 覆盖
-    # MYSQL_ROOT_PASSWORD / MYSQL_USER / MYSQL_PASSWORD（见 .env.example）
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-devonly}
       MYSQL_DATABASE: new_api
@@ -86,9 +88,8 @@ services:
 
   redis:
     image: redis:7
-    # 零自有表后 Redis 承接自有状态（dlv/obx 延迟队列、tidx 反查索引、
-    # debt 欠费单、queue:upstream_callbacks）：必须 AOF everysec（丢失窗口 ≤1s，
-    # 残差由对账任务（python -m app.billing.reconcile）与轮询兜底收敛，架构 §12.1）
+    # Redis 承接自有状态（taskiq 队列/延迟任务、幂等键、令牌会话、熔断计数、
+    # 路由热覆盖）：必须 AOF everysec（丢失窗口 ≤1s，残差由 sweep 巡检收敛）
     command: redis-server --appendonly yes --appendfsync everysec
     volumes:
       - redis-data:/data
@@ -99,19 +100,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
-
-  # ---- 计费两服务占位（profile 默认不启动；联调时替换为真实镜像/仓库 build） ----
-  billing-service:
-    profiles: ["billing"]
-    image: nginx:1.27-alpine  # 占位：返回默认页；真实契约 /api/v1/billing/*（简报 A §3）
-    ports:
-      - "8080:80"
-
-  pricing-logic:
-    profiles: ["billing"]
-    image: nginx:1.27-alpine  # 占位：真实契约 GET /api/v1/pricing/logic（V4 建议验证）
-    ports:
-      - "8081:80"
 
 volumes:
   mysql-data:

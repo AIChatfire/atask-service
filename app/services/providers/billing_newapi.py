@@ -1,12 +1,18 @@
-"""newapi-billing-service 实现（https://github.com/AIChatfire/newapi-billing-service）
+"""newapi-billing-service 实现（https://github.com/AIChatfire/newapi-billing-service）。
 
-POST {BASE}/api/v1/auth/inspect     Authorization: Bearer <用户token>
-  → 200 {"valid": true, "user_id": 123, "token_id": 45} / 401
-POST {BASE}/api/v1/billing/freeze   Authorization: Bearer <用户token>
-  → 200 {..., "user_id": 123} / 401 非法 / 402 余额不足 / 409 request_id 已存在（幂等成功）
-POST {BASE}/api/v1/billing/settle   Authorization: Bearer <服务账号token>
-POST {BASE}/api/v1/billing/cancel   Authorization: Bearer <服务账号token>
+统一前缀 ``/api/v1``；鉴权恒为 ``Authorization: Bearer <终端用户 sk- 令牌>``，
+user_id 由令牌解析（网关不指定、不缓存用户余额）。金额为 USD 十进制数。
+
+- ``POST /auth/inspect`` → 200 扁平 ``{"valid": true, "user_id", "token_id"}`` / 401
+- ``POST /billing/freeze``  body {request_id, biz_type, metric, amount, units?, attrs?, ttl_seconds?}
+  → 200 / 401 非法 / 402 余额不足 / 409 锁竞争（可带相同 request_id 退避重试）
+- ``POST /billing/settle``  body {request_id, actual_amount, units?, attrs?}（多退少补，幂等）
+- ``POST /billing/cancel``  body {request_id}（全额解冻，幂等）
+
+freeze 幂等：request_id 唯一索引，重复提交返回首次结果（不重复扣款）。
 """
+
+from __future__ import annotations
 
 import logging
 
@@ -16,6 +22,14 @@ from app.services import httpc
 from app.services.providers import BillingError
 
 log = logging.getLogger("gateway.provider.billing")
+
+
+def _err_body(resp) -> str:
+    try:
+        data = resp.json()
+        return str(data.get("error") or data)[:200]
+    except Exception:
+        return resp.text[:200]
 
 
 class NewapiBillingProvider:
@@ -33,48 +47,58 @@ class NewapiBillingProvider:
         data = resp.json()
         if not data.get("valid"):
             return None
-        return UserIdentity(user_id=data["user_id"], token_id=data.get("token_id", 0))
+        return UserIdentity(user_id=int(data["user_id"]), token_id=int(data.get("token_id", 0)))
 
     async def freeze(self, *, raw_token: str, request_id: str, biz_type: str,
-                     metric: str, amount: float, ttl_seconds: int, attrs: dict) -> dict:
+                     metric: str, amount: float, ttl_seconds: int,
+                     units: float | None = None, attrs: dict | None = None) -> dict:
+        body: dict = {
+            "request_id": request_id,
+            "biz_type": biz_type,
+            "metric": metric,
+            "amount": round(amount, 6),
+            "ttl_seconds": ttl_seconds,
+            "attrs": attrs or {},
+        }
+        if units is not None:
+            body["units"] = units
         async with self._client() as client:
             resp = await client.post(
                 "/api/v1/billing/freeze",
                 headers={"Authorization": f"Bearer {raw_token}"},
-                json={
-                    "request_id": request_id,
-                    "biz_type": biz_type,
-                    "metric": metric,
-                    "amount": amount,
-                    "ttl_seconds": ttl_seconds,
-                    "attrs": attrs,
-                },
+                json=body,
             )
-        if resp.status_code == 409:
-            return {"duplicated": True}                    # 幂等重放，视为成功
         if resp.status_code != 200:
-            raise BillingError(resp.status_code, resp.text[:200])
+            # 402 余额不足 / 409 锁竞争（可重试）/ 4xx 参数错误——状态码原样上抛
+            raise BillingError(resp.status_code, _err_body(resp))
         data = resp.json()
-        if data.get("error"):
-            raise BillingError(502, str(data["error"]))
-        return data
+        payload = data.get("data", data)
+        if isinstance(payload, dict) and payload.get("error"):
+            raise BillingError(502, str(payload["error"]))
+        return payload if isinstance(payload, dict) else {"ok": True}
 
-    async def settle(self, request_id: str, actual_amount: float) -> None:
+    async def settle(self, *, raw_token: str, request_id: str, actual_amount: float,
+                     units: float | None = None, attrs: dict | None = None) -> None:
+        body: dict = {"request_id": request_id, "actual_amount": round(actual_amount, 6)}
+        if units is not None:
+            body["units"] = units
+        if attrs:
+            body["attrs"] = attrs
         async with self._client() as client:
             resp = await client.post(
                 "/api/v1/billing/settle",
-                headers={"Authorization": f"Bearer {settings.billing_admin_token}"},
-                json={"request_id": request_id, "actual_amount": actual_amount},
+                headers={"Authorization": f"Bearer {raw_token}"},
+                json=body,
             )
         if resp.status_code != 200:
-            raise BillingError(resp.status_code, f"settle {request_id}: {resp.text[:200]}")
+            raise BillingError(resp.status_code, f"settle {request_id}: {_err_body(resp)}")
 
-    async def cancel(self, request_id: str) -> None:
+    async def cancel(self, *, raw_token: str, request_id: str) -> None:
         async with self._client() as client:
             resp = await client.post(
                 "/api/v1/billing/cancel",
-                headers={"Authorization": f"Bearer {settings.billing_admin_token}"},
+                headers={"Authorization": f"Bearer {raw_token}"},
                 json={"request_id": request_id},
             )
         if resp.status_code != 200:
-            raise BillingError(resp.status_code, f"cancel {request_id}: {resp.text[:200]}")
+            raise BillingError(resp.status_code, f"cancel {request_id}: {_err_body(resp)}")

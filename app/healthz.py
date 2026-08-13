@@ -1,4 +1,4 @@
-"""健康检查端点（SPEC §3.9.3 / 架构 §2.3 容器探针）。
+"""健康检查端点（容器探针）。
 
 - ``/healthz/live``：恒 200（零依赖，进程活着即通过）；
 - ``/healthz/ready``：Redis ``PING`` + DB ``SELECT 1``，全过 200 否则 503；
@@ -7,14 +7,16 @@
 
 from __future__ import annotations
 
-import logfire
+import logging
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.db import get_session_factory
-from app.redis_client import get_redis
+from app.redis import r
 
+log = logging.getLogger("gateway.healthz")
 router = APIRouter()
 
 
@@ -30,12 +32,11 @@ async def healthz_ready() -> JSONResponse:
     checks: dict[str, str] = {}
 
     try:
-        redis = await get_redis()
-        await redis.ping()
+        await r.ping()
         checks["redis"] = "ok"
     except Exception as exc:
         checks["redis"] = f"fail: {type(exc).__name__}"
-        logfire.warning("readiness redis check failed", error=type(exc).__name__)
+        log.warning("readiness redis check failed: %s", type(exc).__name__)
 
     try:
         sf = get_session_factory()
@@ -44,7 +45,7 @@ async def healthz_ready() -> JSONResponse:
         checks["db"] = "ok"
     except Exception as exc:
         checks["db"] = f"fail: {type(exc).__name__}"
-        logfire.warning("readiness db check failed", error=type(exc).__name__)
+        log.warning("readiness db check failed: %s", type(exc).__name__)
 
     ok = all(v == "ok" for v in checks.values())
     return JSONResponse(

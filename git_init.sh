@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #git init
-git add *
+git add * .env*
 git commit -m "init"
 
 #git rm  -r dist

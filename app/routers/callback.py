@@ -1,6 +1,9 @@
 """Callback Hub：接收上游 webhook。
 入站 HMAC 验签 → Redis 去重 → 状态机推进 → 结算/通知事件。
+路由配置按任务的 channel_id 从 keypool 租约重建（渠道元数据为唯一事实源）。
 """
+
+from __future__ import annotations
 
 import hashlib
 import hmac
@@ -8,12 +11,14 @@ import json
 import logging
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.redis import K_CB, r
 from app.schemas import ACTIVE, TERMINAL
-from app.services import flow, statelog, statusmap, taskstore, upstream
-from app.services.registry import registry
+from app.services import flow, providers, statelog, statusmap, taskstore, upstream
+from app.services.providers import KeyLeaseError
+from app.services.registry import registry, route_from_lease
 
 log = logging.getLogger("gateway.callback")
 router = APIRouter()
@@ -33,13 +38,26 @@ def _verify(secret: str | None, sig_header: str, headers, raw: bytes) -> bool:
 
 @router.post("/callback/{biz}/{task_id}")
 async def receive_callback(biz: str, task_id: str, request: Request):
-    route = registry.get(biz)
+    task = await taskstore.get(task_id)
+    if not task or (task.get("data") or {}).get("biz") != biz:
+        return {"status": "ignored"}          # 不认识的任务直接丢弃
+
+    # 按原 channel 直达租约重建路由（渠道元数据唯一事实源；缓存兜底）
+    route = registry.get_cached(biz)
     if route is None:
-        return {"status": "ignored"}
+        try:
+            key = await providers.keys.lease(
+                biz, model=str((task.get("data") or {}).get("model") or ""),
+                key_id=task.get("channel_id") or None,
+            )
+        except KeyLeaseError as exc:
+            log.warning("callback route resolve failed: %s", exc)
+            return JSONResponse(status_code=503, content={"status": "route_unavailable"})
+        route = registry.remember(route_from_lease(biz, key))
 
     raw = await request.body()
     if not _verify(route.callback_secret, route.callback_sig_header, request.headers, raw):
-        return JSONResponse_401()
+        return JSONResponse(status_code=401, content={"status": "invalid_signature"})
     try:
         payload = json.loads(raw or b"{}")
     except json.JSONDecodeError:
@@ -50,10 +68,6 @@ async def receive_callback(biz: str, task_id: str, request: Request):
     if not await r.set(K_CB.format(biz=biz, event_id=event_id), "1", ex=settings.cb_dedup_ttl, nx=True):
         return {"status": "duplicate"}
 
-    task = await taskstore.get(task_id)
-    if not task:
-        return {"status": "ignored"}          # 不认识的任务直接丢弃
-
     upstream_status = upstream.extract_path(payload, route.status_path)
     mapped = statusmap.map_status(route, upstream_status)
 
@@ -63,16 +77,8 @@ async def receive_callback(biz: str, task_id: str, request: Request):
     if mapped is None:
         return {"status": "ignored_unknown_status"}   # 已记日志，待字典扩展
     if mapped in TERMINAL:
-        await flow.finalize_task(
-            task, mapped, payload,
-            fail_reason=str(upstream.extract_path(payload, "error") or upstream.extract_path(payload, "fail_reason") or ""),
-        )
+        await flow.finalize_task(task, mapped, payload, route=route)
     elif mapped in ACTIVE:
         await taskstore.patch_data(task_id, {"upstream_status": upstream_status}, status=mapped)
 
     return {"status": "ok"}
-
-
-def JSONResponse_401():
-    from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=401, content={"status": "invalid_signature"})

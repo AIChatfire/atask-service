@@ -38,6 +38,8 @@ async def sweep_once() -> None:
     if stale:
         log.info("sweeper requeued %d stale tasks", len(stale))
 
+    # 终态但结算未落：重发计费事件（需用户令牌；令牌会话丢失则冻结已由
+    # billing TTL 兜底解冻，直接收口并告警，不再无限重发）
     unsettled = await taskstore.terminal_unsettled()
     for item in unsettled:
         data = item.get("data") or {}
@@ -45,12 +47,22 @@ async def sweep_once() -> None:
         if amount <= 0:
             await taskstore.mark_settled(item["task_id"], 0)
             continue
+        from app.services import tokensession
+
+        user_sk = await tokensession.get(item["task_id"])
+        if not user_sk:
+            log.error("unsettled task %s missing token session, force-close "
+                      "(freeze ttl covers refund)", item["task_id"])
+            await taskstore.mark_settled(
+                item["task_id"], float(data.get("settled_amount") or 0))
+            continue
         if item["status"] == SUCCESS:
             await publish_settle(
                 item["task_id"],
                 float(data.get("settled_amount") or amount),
+                user_sk,
             )
         else:
-            await publish_cancel(item["task_id"])
+            await publish_cancel(item["task_id"], user_sk)
     if unsettled:
         log.warning("sweeper republished %d unsettled billing events", len(unsettled))

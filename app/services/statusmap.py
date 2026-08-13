@@ -20,7 +20,6 @@ from app.schemas import (
     FAILURE,
     IN_PROGRESS,
     QUEUED,
-    SUBMITTED,
     SUCCESS,
     RouteConfig,
 )
@@ -47,6 +46,7 @@ _ENUM: dict[str, str] = {
     # QUEUED / SUBMITTED（都归入 QUEUED，提交瞬间的 SUBMITTED 由网关自己写入）
     "queued": QUEUED, "pending": QUEUED, "submitted": QUEUED, "accepted": QUEUED,
     "created": QUEUED, "scheduled": QUEUED, "waiting": QUEUED, "received": QUEUED,
+    "preparing": QUEUED, "initializing": QUEUED,
 }
 
 # ---- 前缀猜测（有序，先终态后活跃，首个命中生效）----

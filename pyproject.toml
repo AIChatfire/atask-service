@@ -3,12 +3,12 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "async-gateway"
-version = "0.1.0"
-description = "异步 AI 网关：原生透传 + new-api 兼容视频形态，复用 new-api tasks 表，预扣+结算计费闭环"
+name = "atask-service"
+version = "0.2.0"
+description = "异步 AI 网关：动态路由 + keypool/pricing/newapi-billing 三微服务协同，配置驱动接入任意异步模型"
 requires-python = ">=3.12"
 dependencies = [
-    # Web 框架与 ASGI 服务（SPEC §2）
+    # Web 框架与 ASGI 服务
     "fastapi==0.115.14",
     "uvicorn==0.34.0",
     "gunicorn==23.0.0",
@@ -21,22 +21,17 @@ dependencies = [
     "redis==5.2.1",
     # 出站 HTTP
     "httpx[http2]==0.28.1",
+    # 异步任务队列（探测/结算/通知/补数）
+    "taskiq==0.11.18",
+    "taskiq-redis==1.0.2",
     # 观测
     "logfire==3.25.0",
     # logfire.instrument_* 依赖的 OTel instrumentation 包（版本对齐 logfire 3.25.0
     # 传递依赖 opentelemetry-sdk 1.35.0 对应的 0.56b0 线）
     "opentelemetry-instrumentation-fastapi==0.56b0",
     "opentelemetry-instrumentation-httpx==0.56b0",
-    "opentelemetry-instrumentation-sqlalchemy==0.56b0",
-    "opentelemetry-instrumentation-redis==0.56b0",
     # 计费表达式沙箱（>=1.0.6 修复 GHSA-vp47-9734-prjw，订阅 GHSA）
     "asteval==1.0.9",
-    # 重试
-    "tenacity==9.1.2",
-    # 上游 JWT 鉴权（kling AK/SK HS256）
-    "PyJWT==2.10.1",
-    # 回调事件 ID（evt_ + ulid）
-    "ulid-py==1.1.0",
 ]
 
 [project.optional-dependencies]
@@ -46,8 +41,6 @@ dev = [
     "ruff==0.11.13",
     "mypy==1.15.0",
     "respx==0.22.0",
-    # W6 compose 清单静态断言（缺失时对应冒烟测试跳过）
-    "pyyaml==6.0.3",
 ]
 
 [tool.setuptools.packages.find]
@@ -69,9 +62,13 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B008"]
+"app/routers/*" = ["B008"]   # FastAPI Depends 惯用法
+"app/queue.py" = ["B008"]    # taskiq TaskiqDepends 惯用法
+"app/deps/*" = ["B008"]      # FastAPI Header/Depends 惯用法
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.mypy]

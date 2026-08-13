@@ -11,12 +11,13 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from app import queue
 from app.deps.preflight import preflight
 from app.deps.ratelimit import ip_rate_limit
-from app import queue
 from app.schemas import ACTIVE, FAILURE, QUEUED
 from app.services import flow, providers, taskstore, upstream
-from app.services.registry import registry
+from app.services.providers import KeyLeaseError
+from app.services.registry import registry, route_from_lease
 
 log = logging.getLogger("gateway.proxy")
 router = APIRouter()
@@ -34,14 +35,16 @@ def _forward_headers(request: Request, extra: dict) -> dict:
 
 @router.api_route("/{biz}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def dynamic_proxy(biz: str, path: str, request: Request):
-    route = registry.get(biz)
-    if route is None:
-        return JSONResponse(status_code=404, content={"error": f"unknown biz: {biz}"})
-
     billable = request.method not in ("GET", "HEAD", "OPTIONS")
     pf = None
     if billable:
-        pf = await preflight(biz, request)     # 内含鉴权+计费+freeze+key租约
+        pf = await preflight(biz, request)     # 内含鉴权+计费+freeze+key租约+路由构建
+        if pf.replay_task_id:                  # 幂等重放：直接回放首个任务，不重复透传
+            task = await taskstore.get(pf.replay_task_id)
+            if task:
+                return JSONResponse(status_code=202, content=flow.public_view(task))
+        route = pf.route
+        assert route is not None
         await taskstore.create(
             task_id=pf.task_id,
             user_id=pf.identity.user_id,
@@ -54,11 +57,16 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
             },
         )
         key_lease = pf.key
+        assert key_lease is not None
     else:
         await ip_rate_limit(request)
-        key_lease = await providers.keys.lease(biz, model="", group=route.key_group)
+        try:
+            key_lease = await providers.keys.lease(biz, model="")
+        except KeyLeaseError:
+            return JSONResponse(status_code=404, content={"error": f"unknown biz: {biz}"})
+        route = registry.remember(route_from_lease(biz, key_lease))
 
-    client = upstream.client_for(route)
+    client = upstream.client_for(route, key_lease)
     fwd_headers = _forward_headers(request, upstream.auth_headers(route, key_lease))
     req = client.build_request(request.method, f"/{path}", headers=fwd_headers, content=request.stream())
 
@@ -69,7 +77,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
         if pf:
             await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(exc)[:500])
             if pf.amount > 0:
-                await queue.publish_cancel(pf.task_id)
+                await queue.publish_cancel(pf.task_id, pf.token.raw)
         return JSONResponse(status_code=502, content={"error": f"upstream unreachable: {exc}"})
     await upstream.breaker_report(biz, ok=resp.status_code < 500)
 
@@ -96,7 +104,7 @@ async def _finalize_proxy(biz, route, pf, status_code: int, body: bytes) -> None
     if status_code >= 400:
         await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=f"upstream {status_code}: {body[:400]!r}")
         if pf.amount > 0:
-            await queue.publish_cancel(pf.task_id)
+            await queue.publish_cancel(pf.task_id, pf.token.raw)
         return
     upstream_task_id = None
     try:

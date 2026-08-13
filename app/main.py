@@ -1,89 +1,90 @@
-"""FastAPI 入口。API 进程只跑路由配置热更新一个后台循环；
-异步任务由独立的 taskiq 进程执行：
-  taskiq worker    app.queue:broker --max-async-tasks 100
-  taskiq scheduler app.queue:scheduler
-路由注册顺序：callback → tasks → videos → proxy（通配必须最后）。
+"""FastAPI 应用装配入口。
+
+- 路由注册顺序即 Starlette 首匹配优先级：healthz → 上游 callback → ops →
+  tasks/videos 业务端点 → 动态透传（/{biz}/{path:path} 通配，永远最后）。
+- **网关零路由文件**：上游配置（base_url / 提交探测路径 / 渠道覆盖 / 凭证）
+  唯一事实源是 keypool 渠道元数据，随租约实时下发（app.services.registry）；
+  接入新模型只在 new-api 渠道上配置，网关不改代码、不配文件。
+- 后台异步协同（探测/结算/通知/补数）由 taskiq 进程承担：
+  ``taskiq worker app.queue:broker`` + ``taskiq scheduler app.queue:scheduler``。
+- 冒烟纪律：``from app.main import app`` 在无 DB/Redis 环境下必须可导入——
+  引擎/客户端全部惰性创建。
 """
 
-import asyncio
+from __future__ import annotations
+
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.config import settings
-from app.db import engine
-from app.redis import r
-from app.routers import callback, ops, proxy, tasks, videos
+from app.db import close_db
+from app.errors import register_exception_handlers
 from app.services import upstream
-from app.services.registry import registry
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("gateway.main")
 
 
-def _init_logfire(app: FastAPI) -> None:
+def _setup_logfire(app: FastAPI) -> None:
+    """GW_LOGFIRE_ENABLED=true 时接入 logfire（无 token 走本地，不阻塞启动）。"""
     if not settings.logfire_enabled:
         return
     try:
         import logfire
 
-        # 脱敏只针对凭证类字段；result（上游结果直链）正常记录，便于排查
         logfire.configure(
+            service_name="async-gateway",
+            service_version=settings.app_version,
+            environment=settings.app_env,
             token=settings.logfire_token,
-            scrubbing=logfire.ScrubbingOptions(extra_patterns=["authorization", "Bearer", "sk-"]),
+            send_to_logfire="if-token-present",
+            scrubbing=logfire.ScrubbingOptions(
+                extra_patterns=["api_key", "access_token", "authorization", "sk-"]
+            ),
+            console=False,
         )
-        # 排除高频轮询路径：GET 状态查询不产生 span，状态变化由 statelog 单独记录
-        # （正则按 URL 排除，不影响同路径的 POST 创建 / cancel）
-        logfire.instrument_fastapi(
-            app,
-            excluded_urls=r"^/healthz$|^/readyz$|^/[^/]+/v1/(tasks|videos)/[^/]+$",
-        )
-        # 不做全局 instrument_httpx：控制面客户端在 services/httpc.py 里按需埋点，
-        # 上游探测调用高频不埋点
-        logfire.instrument_sqlalchemy(engine=engine.sync_engine)
-        log.info("logfire enabled")
+        logfire.instrument_fastapi(app)
     except Exception:
-        log.exception("logfire init failed, continue without it")
+        log.warning("logfire setup failed, continue without it", exc_info=True)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    registry.load_file()
-    refresher = asyncio.create_task(registry.refresh_loop())
-    log.info("gateway api started (async tasks run in taskiq worker/scheduler processes)")
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """退出清理：关上游连接池/DB。
+
+    启动无需加载任何路由文件——上游配置（base_url/路径/覆盖/凭证）全部在
+    keypool 渠道元数据里，随租约实时下发（app.services.registry）。
+    """
     try:
         yield
     finally:
-        refresher.cancel()
-        await asyncio.gather(refresher, return_exceptions=True)
         await upstream.close_all()
-        await r.aclose()
-        await engine.dispose()
+        await close_db()
 
 
-app = FastAPI(title="async-gateway", lifespan=lifespan)
-_init_logfire(app)
+def create_app() -> FastAPI:
+    """应用工厂：观测初始化 → 异常处理器 → 路由注册（顺序不可换）。"""
+    app = FastAPI(title="atask-service", lifespan=lifespan)
+
+    _setup_logfire(app)
+    register_exception_handlers(app)
+
+    from app.healthz import router as health_router
+    from app.routers.callback import router as callback_router
+    from app.routers.ops import router as ops_router
+    from app.routers.proxy import router as proxy_router
+    from app.routers.tasks import router as tasks_router
+    from app.routers.videos import router as videos_router
+
+    app.include_router(health_router)     # /healthz/live /healthz/ready
+    app.include_router(callback_router)   # /callback/{biz}/{task_id}（上游 webhook）
+    app.include_router(ops_router)        # /ops/*（队列观测与补号）
+    app.include_router(tasks_router)      # /{biz}/v1/tasks（通用任务形态）
+    app.include_router(videos_router)     # /{biz}/v1/videos（new-api 兼容形态）
+    app.include_router(proxy_router)      # ANY /{biz}/{path:path} —— 永远最后
+    return app
 
 
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok"}
-
-
-@app.get("/readyz")
-async def readyz():
-    from sqlalchemy import text
-
-    async with engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
-    await r.ping()
-    return {"status": "ready"}
-
-
-# 注册顺序即匹配优先级：固定形态在前，通配透传最后
-app.include_router(callback.router)
-app.include_router(ops.router)
-app.include_router(tasks.router)
-app.include_router(videos.router)
-app.include_router(proxy.router)
+app = create_app()

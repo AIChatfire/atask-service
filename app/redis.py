@@ -18,8 +18,6 @@ K_CONC = "gw:conc:{token_hash}"              # 并发任务占用
 K_CB = "gw:cb:{biz}:{event_id}"              # 回调去重（72h）
 K_PRICING = "gw:pricing:{biz}:{metric}"      # 计费规则缓存
 K_BREAKER = "gw:breaker:{biz}"               # 上游熔断失败计数
-K_CONFIG_VER = "gw:config_ver"               # 配置版本号（热更新）
-K_ROUTES_OVERRIDE = "gw:routes:override"     # 路由热覆盖 hash：field=biz, value=json
 S_DLQ = "gw:events:dlq"                      # 死信（taskiq 任务超限后落信）
 
 # ---- 滑动窗口限流 ----

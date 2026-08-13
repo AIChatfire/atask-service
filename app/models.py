@@ -12,7 +12,7 @@
 （身份由 billing 服务的 /api/v1/auth/inspect 提供）。
 """
 
-from sqlalchemy import BigInteger, Column, JSON, String, Text
+from sqlalchemy import JSON, BigInteger, Column, String, Text
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
