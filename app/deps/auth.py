@@ -24,6 +24,8 @@ class TokenCtx:
 
 
 def extract_token(authorization: str | None) -> TokenCtx:
+    if isinstance(authorization, Header):  ### 临时规避
+        authorization = None
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing or invalid Authorization header")
     raw = authorization[7:].strip()

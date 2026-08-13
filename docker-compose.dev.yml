@@ -14,12 +14,18 @@
 
 services:
   gateway:
-    image: ghcr.io/aichatfire/atask-service:latest   # 预构建镜像，直接拉取
+    build: .
     command: gunicorn -c gunicorn.conf.py app.main:app
     env_file: .env
+    environment: &gwenv
+      GW_DATABASE_URL: mysql+asyncmy://${MYSQL_USER:-gw}:${MYSQL_PASSWORD:-devonly}@mysql:3306/new_api?charset=utf8mb4
+      GW_REDIS_URL: redis://redis:6379/0
+      GUNICORN_WORKERS: "3"
     ports:
       - "8000:8000"
     depends_on:
+      mysql:
+        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -33,10 +39,13 @@ services:
     restart: unless-stopped
 
   worker:   # 探测/结算/通知任务执行器；多副本直接加 --max-async-tasks 或 replicas
-    image: ghcr.io/aichatfire/atask-service:latest   # 预构建镜像，直接拉取
+    build: .
     command: taskiq worker app.queue:broker --max-async-tasks 100
     env_file: .env
+    environment: *gwenv
     depends_on:
+      mysql:
+        condition: service_healthy
       redis:
         condition: service_healthy
       gateway:
@@ -44,9 +53,10 @@ services:
     restart: unless-stopped
 
   scheduler:  # 延迟任务派发（探测退避/重试退避）+ 每分钟 sweep 补数巡检
-    image: ghcr.io/aichatfire/atask-service:latest   # 预构建镜像，直接拉取
+    build: .
     command: taskiq scheduler app.queue:scheduler
     env_file: .env
+    environment: *gwenv
     depends_on:
       redis:
         condition: service_healthy
@@ -54,15 +64,37 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  mysql:
+    image: mysql:8.0
+    # 本地开发默认口令 devonly（仅本地，勿用于生产）；生产在 .env 覆盖
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-devonly}
+      MYSQL_DATABASE: new_api
+      MYSQL_USER: ${MYSQL_USER:-gw}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-devonly}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-devonly}"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 12
+
   redis:
-    image: redis:latest
+    image: redis:7
     # Redis 承接自有状态（taskiq 队列/延迟任务、幂等键、令牌会话、熔断计数、
     # 路由热覆盖）：必须 AOF everysec（丢失窗口 ≤1s，残差由 sweep 巡检收敛）
     command: redis-server --appendonly yes --appendfsync everysec
     volumes:
       - redis-data:/data
     ports:
-      - "6380:6379"
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -70,4 +102,5 @@ services:
       retries: 12
 
 volumes:
+  mysql-data:
   redis-data:
