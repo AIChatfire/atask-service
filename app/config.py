@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     )
     db_pool_size: int = 20
     db_max_overflow: int = 10
+    db_pool_recycle: int = 1800          # 必须小于 MySQL wait_timeout
+    db_pool_pre_ping: bool = True
     redis_url: str = "redis://127.0.0.1:6379/0"
 
     # ---- 微服务：newapi-billing-service（身份内省 + 冻结/结算/取消）----

@@ -44,7 +44,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
             if task:
                 return JSONResponse(status_code=202, content=flow.public_view(task))
         route = pf.route
-        assert route is not None
+        assert route is not None and pf.identity is not None and pf.key is not None
         await taskstore.create(
             task_id=pf.task_id,
             user_id=pf.identity.user_id,

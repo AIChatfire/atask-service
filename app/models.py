@@ -13,9 +13,11 @@
 """
 
 from sqlalchemy import JSON, BigInteger, Column, String, Text
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    """声明式基类（SQLAlchemy 2.0 形态；仅映射说明用，网关不建表）。"""
 
 
 class Task(Base):

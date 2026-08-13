@@ -109,6 +109,10 @@
   计费事件（billing 幂等，重发安全）、队列积压/死信告警，`/ops/dlq/replay` 补号。
 - **熔断与上报**：每 biz 失败计数熔断（30s/10 次）；上游 4xx/5xx 结果实时
   上报 keypool 驱动坏 key 自动禁用。
+- **观测**：`GW_LOGFIRE_ENABLED=true` 接入 logfire（web 由 main 装配，taskiq
+  worker 由队列中间件装配）；**状态变化唯一记录点**是 statelog——Redis 去重，
+  只在任务状态变化时发一条 `task_status_changed`（运行中连探多轮零事件）；
+  队列中间件成功路径静默、失败才发 `taskiq_task_failed`（绝不带任务参数）。
 
 ## 本地开发
 

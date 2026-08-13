@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from taskiq import Context, TaskiqDepends, TaskiqScheduler
+from taskiq import Context, TaskiqDepends, TaskiqMessage, TaskiqResult, TaskiqScheduler
+from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_redis import ListQueueBroker, RedisScheduleSource
 
@@ -37,9 +40,94 @@ log = logging.getLogger("gateway.queue")
 QUEUE_NAME = "gw:taskiq"
 SCHED_PREFIX = "gw:sched"
 
+
+def _logfire_event(level: str, event: str, **fields: Any) -> None:
+    """logfire 事件发射点（GW_LOGFIRE_ENABLED 时才真正发出；测试可替换）。"""
+    if not settings.logfire_enabled:
+        return
+    try:
+        import logfire
+
+        getattr(logfire, level)(event, **fields)
+    except Exception:
+        pass
+
+
+class ObservabilityMiddleware(TaskiqMiddleware):
+    """taskiq 执行观测中间件（worker 进程的 logfire 装配点）。
+
+    降噪纪律：
+    - **成功路径只记 DEBUG**——poll_task 每几秒一轮，任务状态变化的唯一
+      logfire 记录点是 ``app.services.statelog``（Redis 去重，只在状态变化
+      时发射），队列层不重复刷事件；
+    - **失败路径记 ERROR + logfire.error**（异常即信号，含 task/attempts/耗时；
+      绝不带 args——billing 任务参数含用户令牌）。
+    """
+
+    def __init__(self) -> None:
+        self._started: dict[str, float] = {}
+
+    async def startup(self) -> None:
+        """worker 进程启动：配置 logfire（web 进程由 app.main 装配）。"""
+        if not settings.logfire_enabled:
+            return
+        try:
+            import logfire
+
+            logfire.configure(
+                service_name="atask-worker",
+                service_version=settings.app_version,
+                environment=settings.app_env,
+                token=settings.logfire_token,
+                send_to_logfire="if-token-present",
+                scrubbing=logfire.ScrubbingOptions(
+                    extra_patterns=["api_key", "access_token", "authorization", "sk-"]
+                ),
+                console=False,
+            )
+        except Exception:
+            log.warning("logfire setup failed in worker", exc_info=True)
+
+    async def pre_execute(self, message: TaskiqMessage) -> TaskiqMessage:
+        self._started[message.task_id] = time.monotonic()
+        return message
+
+    def _duration(self, message: TaskiqMessage, result: TaskiqResult[Any]) -> float:
+        started = self._started.pop(message.task_id, None)
+        if started is None:
+            return float(result.execution_time or 0.0)
+        return time.monotonic() - started
+
+    async def post_execute(self, message: TaskiqMessage,
+                           result: TaskiqResult[Any]) -> None:
+        duration = self._duration(message, result)
+        if result.is_err:
+            self._emit_failure(message, result.error, duration)
+        else:
+            log.debug("taskiq %s ok in %.2fs", message.task_name, duration)
+
+    async def on_error(self, message: TaskiqMessage, result: TaskiqResult[Any],
+                       exception: BaseException) -> None:
+        self._emit_failure(message, exception, self._duration(message, result))
+
+    @staticmethod
+    def _emit_failure(message: TaskiqMessage, error: BaseException | None,
+                      duration: float) -> None:
+        attempts = int(message.labels.get("attempts", 0)) if message.labels else 0
+        log.error("taskiq %s failed in %.2fs (attempts=%s): %s",
+                  message.task_name, duration, attempts, error)
+        _logfire_event(
+            "error", "taskiq_task_failed",
+            task_name=message.task_name, task_id=message.task_id,
+            attempts=attempts, duration_s=round(duration, 3),
+            error=str(error)[:300],
+        )
+
+
 broker = ListQueueBroker(settings.redis_url, queue_name=QUEUE_NAME)
 schedule_source = RedisScheduleSource(settings.redis_url, prefix=SCHED_PREFIX)
 scheduler = TaskiqScheduler(broker, sources=[LabelScheduleSource(broker), schedule_source])
+broker.add_middlewares(ObservabilityMiddleware())
 
 
 def _at(delay_seconds: float) -> datetime:
@@ -182,7 +270,7 @@ async def queue_stats() -> dict:
     }
 
 
-_DLQ_TASKS = {
+_DLQ_TASKS: dict[str, Any] = {
     "BILLING_SETTLE": billing_settle_task,
     "BILLING_CANCEL": billing_cancel_task,
     "NOTIFY": notify_task,

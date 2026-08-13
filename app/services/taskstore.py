@@ -7,8 +7,9 @@
 import json
 import logging
 import time
+from typing import Any, cast
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import CursorResult, bindparam, text
 
 from app.config import settings
 from app.db import get_session_factory
@@ -94,7 +95,8 @@ async def cas(
         """
     ).bindparams(bindparam("froms", expanding=True))
     async with get_session_factory()() as db:
-        res = await db.execute(
+        # DML 返回 CursorResult（带 rowcount）；execute() 标注为 Result 需收窄
+        res = cast("CursorResult[Any]", await db.execute(
             stmt,
             {
                 "to": to_status,
@@ -106,7 +108,7 @@ async def cas(
                 "tid": task_id,
                 "froms": from_statuses,
             },
-        )
+        ))
         await db.commit()
         return res.rowcount == 1
 
