@@ -17,12 +17,14 @@ from app.deps.preflight import Preflight
 from app.schemas import ACTIVE, FAILURE, QUEUED, SUCCESS, TERMINAL
 from app.services import (
     idem,
+    pricing,
     providers,
     statelog,
     taskstore,
     tokensession,
     upstream,
 )
+from app.services.providers import PricingError
 
 log = logging.getLogger("gateway.flow")
 
@@ -169,7 +171,8 @@ async def _settle_amount(route, task: dict, raw: dict) -> tuple[float, dict[str,
 
     ① ``actual_amount_path``：上游直接给出实收金额（最可信）；
     ② ``settle_usage_map``：终态报文提取实际用量覆盖原始请求体，重跑
-       pricing 规则得出实收（如 duration ← task.usage.output_seconds）；
+       渠道计费规则（随租约下发的 billing.rule）得出实收
+       （如 duration ← task.usage.output_seconds）；
     ③ 回退冻结金额（顶格预估即实收，多退少补语义退化为不补不退）。
     """
     data = task.get("data") or {}
@@ -190,9 +193,9 @@ async def _settle_amount(route, task: dict, raw: dict) -> tuple[float, dict[str,
                 usage[field] = value
         if usage:
             try:
-                quote = await providers.pricing.quote(str(data.get("model") or ""), request_body)
+                quote = pricing.quote_from_route(route, request_body)
                 return quote.amount, usage
-            except Exception:
+            except PricingError:
                 # 重估失败绝不静默多扣/少扣：回退冻结额并告警（sweeper 可对账）
                 log.exception("settle re-quote failed, fallback to freeze amount: %s",
                               task.get("task_id"))

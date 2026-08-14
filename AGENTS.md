@@ -2,17 +2,17 @@
 
 ## 这是什么
 异步 AI 网关（atask-service）：异步任务型模型（视频生成等）的统一接入网关，
-与 new-api 生态共用用户体系、钱包（users.quota）与渠道配置。外部协同只有三个微服务：
+与 new-api 生态共用用户体系、钱包（users.quota）与渠道配置。外部协同只有两个微服务：
 
-- **keypool-service**（上游凭证 + 渠道全量元数据 + 路由提取配置的唯一事实源）
-- **pricing-service**（模型元数据 + billing.rule 计费规则）
+- **keypool-service**（上游凭证 + 渠道全量元数据 + 路由提取配置 + billing.rule
+  计费规则的唯一事实源；计费规则随租约下发，网关本地沙箱求值，见 app/services/pricing.py）
 - **newapi-billing-service**（身份内省 + freeze/settle/cancel 资金操作）
 
 ## 目录结构
 - app/routers/   HTTP 入口（tasks/videos/callback/ops/proxy 通配透传）
 - app/deps/      请求预检（鉴权内省、限流、preflight 报价+租约+冻结）
 - app/services/  编排层：flow（生命周期）/ upstream（上游引擎）/ polling / reconcile
-- app/services/providers/  三微服务适配层（端口 Protocol + 实现，换实现改 *_PROVIDER）
+- app/services/providers/  两微服务适配层（端口 Protocol + 实现，换实现改 *_PROVIDER）
 - app/services/registry.py 路由构建：keypool 渠道 setting.gateway → RouteConfig
 - app/queue.py   taskiq 任务定义与发布门面（settle/cancel/notify/poll/sweep）
 - app/schemas.py 共享契约（状态常量、KeyLease、RouteConfig、Quote、UserIdentity）
@@ -33,10 +33,11 @@
   URL `/{biz}/` 只是入口标签。网关提取配置块可放 `header_override.upstream`
   或 `setting.gateway`（三处等价、优先级从高到低；装配请求头时自动剥离嵌套块，
   不透出为 HTTP 头）：submit_path/probe_path/status_path/result_path/
-  settle_usage_map…。接入新模型 = 渠道挂进分组 + 配 pricing 规则，不改代码。
+  settle_usage_map、billing（rule/type/discount_rate）…。接入新模型 =
+  渠道挂进分组 + 配 gateway 块 billing 计费规则，不改代码。
 - **渠道覆盖三层叠加**：route.default_params < 用户 body < channel.param_override；
   model_mapping 改写 model；用户自带 callback_url/webhook 一律摘除（用户回调由网关签名投递）。
-- **计费纪律**：freeze 用 pricing 规则顶格预估；settle 三档（actual_amount_path →
+- **计费纪律**：freeze 用渠道 billing.rule 顶格预估；settle 三档（actual_amount_path →
   settle_usage_map 重估 → 冻结兜底），绝不静默按 0 结算；settle/cancel 用**用户令牌**。
 - 错误响应统一 `{"error": {...}}`（app/errors.py 注册点）；内部状态常量以 app/schemas.py 为准。
 - 配置全部环境变量 `GW_` 前缀（app/config.py；.env.example 为全量样例）。

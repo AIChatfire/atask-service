@@ -1,5 +1,6 @@
 """创建类请求的预检（依赖注入）：
-限流 → 路由配置 → 并行(身份内省 ∥ 模型报价 ∥ key租约) → freeze → 令牌暂存。
+限流 → 并行(身份内省 ∥ key租约) → 路由配置+本地报价（规则随租约下发）→
+freeze → 令牌暂存。
 微服务调用全部走 providers 适配层；freeze 是唯一必须同步的资金操作，request_id = task_id。
 """
 
@@ -17,10 +18,10 @@ from app.deps import ratelimit
 from app.deps.auth import TokenCtx, extract_token, resolve_identity
 from app.schemas import KeyLease, Quote, RouteConfig, UserIdentity
 from app.services import providers, tokensession
+from app.services.pricing import quote_from_route
 from app.services.providers import (
     BillingError,
     KeyLeaseError,
-    ModelUnavailableError,
     PricingError,
 )
 from app.services.registry import registry, route_from_lease
@@ -66,7 +67,7 @@ async def preflight(
         except Exception:
             body = {}
 
-    # 计费模型：body.model / body.model_name（pricing 报价与 keypool 选渠道都需要）
+    # 计费模型：body.model / body.model_name（keypool 选渠道需要）
     model = body.get("model") or body.get("model_name")
 
     # 幂等重放短路必须在 freeze 之前：同 Idempotency-Key 直接回放首个任务，
@@ -84,26 +85,27 @@ async def preflight(
     if not model:
         raise HTTPException(400, "missing model")
 
-    # 无依赖的远程调用全部并行，省 2~3 个 RTT；统一分组（GW_KEY_GROUP）+ model 选渠道
+    # 无依赖的远程调用全部并行：身份内省 ∥ key 租约（统一分组 GW_KEY_GROUP +
+    # model 选渠道）；计费规则随租约下发，报价在路由构建后本地沙箱求值
     try:
-        identity, quote, key = await asyncio.gather(
+        identity, key = await asyncio.gather(
             resolve_identity(token),
-            providers.pricing.quote(model, body),
             providers.keys.lease(biz, model=model),
         )
     except HTTPException:
         raise
-    except ModelUnavailableError as exc:
-        raise HTTPException(400, str(exc)) from exc  # 模型不可用：客户端错误
     except BillingError as exc:
         raise HTTPException(exc.status, exc.message) from exc
-    except PricingError as exc:
-        raise HTTPException(503, str(exc)) from exc
     except KeyLeaseError as exc:
         raise HTTPException(503, str(exc)) from exc
 
-    # 路由配置随租约从渠道元数据构建（零本地路由文件）并回填进程缓存
+    # 路由配置随租约从渠道元数据构建（零本地路由文件）并回填进程缓存；
+    # 报价 = 渠道 gateway 块 billing.rule 本地求值（规则唯一事实源 = keypool）
     route = registry.remember(route_from_lease(biz, key))
+    try:
+        quote = quote_from_route(route, body)
+    except PricingError as exc:
+        raise HTTPException(500, f"billing rule error: {exc}") from exc
 
     task_id = uuid.uuid4().hex
 

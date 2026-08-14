@@ -182,21 +182,12 @@ async def _seed_task(task_store, route, *, freeze_amount=0.13, callback_url=None
 
 
 async def test_finalize_success_settle_requote(
-    monkeypatch, route_factory, patch_redis, task_store, queue_events,
+    route_factory, patch_redis, task_store, queue_events,
 ):
-    """成功终态：settle_usage_map 提取实际秒数 → 重跑 pricing → 多退少补。"""
-    route = route_factory()
+    """成功终态：settle_usage_map 提取实际秒数 → 重跑渠道计费规则 → 多退少补。"""
+    route = route_factory(billing_rule="duration * 0.026", billing_type="second")
     task_id = await _seed_task(task_store, route, callback_url="https://user.test/hook")
     await tokensession.store(task_id, "sk-user-1")
-
-    seen: dict[str, Any] = {}
-
-    async def _quote(model, request):
-        seen["model"] = model
-        seen["request"] = dict(request)
-        return Quote(amount=0.104, metric="second")
-
-    monkeypatch.setattr(providers, "pricing", SimpleNamespace(quote=_quote))
 
     task = await task_store.get(task_id)
     raw = {"task": {"status": "succeeded",
@@ -205,10 +196,9 @@ async def test_finalize_success_settle_requote(
     ok = await flow.finalize_task(task, SUCCESS, raw, route=route)
 
     assert ok is True
-    # 重估请求：duration 被实际产出秒数覆盖（5 → 4）
-    assert seen["request"]["duration"] == 4
+    # 重估：duration 被实际产出秒数覆盖（5 → 4），4 × 0.026 = 0.104
     assert queue_events["settle"] == [{
-        "request_id": task_id, "actual_amount": 0.104, "user_sk": "sk-user-1",
+        "request_id": task_id, "actual_amount": pytest.approx(0.104), "user_sk": "sk-user-1",
         "units": 4, "attrs": {"biz": "minimax", "model": "MiniMax-H3", "duration": 4},
     }]
     # 结果 URL 落库 + 用户回调通知 + 令牌会话清除
@@ -221,17 +211,13 @@ async def test_finalize_success_settle_requote(
 
 
 async def test_finalize_settle_fallback_to_freeze_amount(
-    monkeypatch, route_factory, patch_redis, task_store, queue_events,
+    route_factory, patch_redis, task_store, queue_events,
 ):
-    """终态报文缺用量字段：回退冻结金额（绝不静默按 0 结算）。"""
-    route = route_factory()
+    """终态报文缺用量字段：回退冻结金额（绝不静默按 0 结算，不重估）。"""
+    route = route_factory(billing_rule="duration * 0.026", billing_type="second")
     task_id = await _seed_task(task_store, route)
     await tokensession.store(task_id, "sk-user-1")
 
-    async def _quote(model, request):
-        raise AssertionError("无用量覆盖时不应触发重估")
-
-    monkeypatch.setattr(providers, "pricing", SimpleNamespace(quote=_quote))
     task = await task_store.get(task_id)
     raw = {"task": {"status": "succeeded", "content": {"url": "http://v"}}}
     await flow.finalize_task(task, SUCCESS, raw, route=route)
@@ -239,22 +225,34 @@ async def test_finalize_settle_fallback_to_freeze_amount(
 
 
 async def test_finalize_actual_amount_path_priority(
-    monkeypatch, route_factory, patch_redis, task_store, queue_events,
+    route_factory, patch_redis, task_store, queue_events,
 ):
     """上游直接给出实收金额（actual_amount_path）→ 最高优先，不重估。"""
-    route = route_factory(actual_amount_path="task.billing.amount")
+    route = route_factory(actual_amount_path="task.billing.amount",
+                          billing_rule="duration * 0.026")
     task_id = await _seed_task(task_store, route)
     await tokensession.store(task_id, "sk-user-1")
 
-    async def _quote(model, request):
-        raise AssertionError("actual_amount_path 命中时不应重估")
-
-    monkeypatch.setattr(providers, "pricing", SimpleNamespace(quote=_quote))
     task = await task_store.get(task_id)
     raw = {"task": {"status": "succeeded", "content": {"url": "http://v"},
                     "billing": {"amount": 0.09}}}
     await flow.finalize_task(task, SUCCESS, raw, route=route)
     assert queue_events["settle"][0]["actual_amount"] == 0.09
+
+
+async def test_finalize_rule_error_fallback_to_freeze(
+    route_factory, patch_redis, task_store, queue_events,
+):
+    """渠道计费规则本身坏了（求值抛错）：回退冻结金额并告警，绝不按 0 结算。"""
+    route = route_factory(billing_rule="duration *", billing_type="second")  # 语法错误
+    task_id = await _seed_task(task_store, route)
+    await tokensession.store(task_id, "sk-user-1")
+
+    task = await task_store.get(task_id)
+    raw = {"task": {"status": "succeeded", "content": {"url": "http://v"},
+                    "usage": {"output_seconds": 4}}}
+    await flow.finalize_task(task, SUCCESS, raw, route=route)
+    assert queue_events["settle"][0]["actual_amount"] == 0.13   # 冻结兜底
 
 
 async def test_finalize_failure_cancels_freeze(

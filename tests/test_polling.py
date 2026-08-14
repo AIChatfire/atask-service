@@ -23,6 +23,10 @@ KEYPOOL_SELECT = {
                 "status_path": "task.status",
                 "result_path": "task.content.url",
                 "settle_usage_map": {"duration": "task.usage.output_seconds"},
+                "billing": {
+                    "rule": "def calulate(request):\n    return float(request.get('duration') or 5) * 0.026",
+                    "type": "second",
+                },
             }},
         },
     },
@@ -131,14 +135,7 @@ async def test_poll_terminal_success_finalizes(respx_router, test_settings, patc
     )
     task_id = _seed(task_store)
     await tokensession.store(task_id, "sk-user-1")
-    # 结算重估走真实 pricing provider？——这里定价服务挂 respx
-    respx_router.get("http://pricing.test/v1/models/MiniMax-H3").mock(
-        return_value=httpx.Response(200, json={
-            "id": "MiniMax-H3", "status": 0, "discountRate": 1,
-            "billing": {"rule": "def calulate(request):\n    return float(request.get('duration') or 5) * 0.026",
-                        "type": "second", "price": []},
-        })
-    )
+    # 结算重估：规则随 keypool 租约下发（KEYPOOL_SELECT 渠道 billing 块），零出站调用
     await poll_one(task_id)
     row = task_store.rows[task_id]
     assert row["status"] == SUCCESS

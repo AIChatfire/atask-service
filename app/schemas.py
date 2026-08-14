@@ -49,7 +49,11 @@ class UserIdentity(BaseModel):
 
 
 class Quote(BaseModel):
-    """pricing 服务报价：``amount`` 为冻结金额（USD，已乘 discountRate）。"""
+    """计费报价：``amount`` 为冻结金额（USD，已乘 discount_rate）。
+
+    规则唯一事实源 = keypool 渠道元数据（gateway 块 ``billing.rule``），
+    随租约下发，网关本地沙箱求值（见 ``app.services.pricing``）。
+    """
 
     amount: float
     metric: str = "default"   # billing.type（second/call/token...）
@@ -139,7 +143,7 @@ class RouteConfig(BaseModel):
     actual_amount_path: str = ""       # 上游直接给出实收金额（结算最高优先）
     settle_usage_map: dict[str, str] = Field(default_factory=dict)
     """结算重估映射 ``{请求体字段: 终态报文路径}``：用终态实际用量覆盖原始
-    请求体重跑 pricing 规则得出实收金额（如
+    请求体重跑渠道计费规则得出实收金额（如
     ``duration: task.usage.output_seconds``）。空且 actual_amount_path 空时
     按冻结金额结算。"""
     ok_check: dict[str, Any] | None = None
@@ -152,8 +156,11 @@ class RouteConfig(BaseModel):
     callback_secret: str | None = None     # 入站验签密钥（None = 不验签，仅内网）
     callback_sig_header: str = "X-Signature"
 
-    # ---- 计费 ----
+    # ---- 计费（规则唯一事实源 = 本渠道 gateway 块 billing，随租约下发）----
     pricing_biz_type: str = ""         # freeze 的 biz_type；缺省用 biz
+    billing_rule: str = ""             # billing.rule：asteval 沙箱求值，入参完整请求体
+    billing_type: str = "default"      # billing.type（second/call/token...）→ freeze metric
+    discount_rate: float = 1.0         # billing.discount_rate / discountRate（折扣必乘）
     status_map: dict[str, str] = Field(default_factory=dict)
     """显式状态映射（最高优先级，见 app.services.statusmap）：上游状态 →
     SUBMITTED/QUEUED/IN_PROGRESS/SUCCESS/FAILURE/CANCELED。"""

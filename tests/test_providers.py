@@ -1,11 +1,12 @@
-"""三微服务 provider 契约测试（respx 拦截，对齐真实服务 API）。
+"""两微服务 provider 契约测试（respx 拦截，对齐真实服务 API）。
 
-- keypool: POST /v1/keys/select（统一包络 + include_channel 渠道全量元数据）
+- keypool: POST /v1/keys/select（统一包络 + include_channel 渠道全量元数据，
+           含 gateway 块 billing 计费规则）
            POST /v1/keys/report（Idempotency-Key，fire-and-forget）
-- pricing: GET /v1/models/{model}（rule 沙箱求值 × discountRate；status 闸门；
-           Redis 缓存 + stale 兜底）
 - billing: /api/v1/auth/inspect、/billing/freeze、/billing/settle、/billing/cancel
            （settle/cancel 携带**用户令牌**——billing 只认令牌身份）
+
+计费规则求值（asteval 沙箱）见 tests/test_pricing.py。
 """
 
 from __future__ import annotations
@@ -19,8 +20,6 @@ import pytest
 from app.services.providers import (
     BillingError,
     KeyLeaseError,
-    ModelUnavailableError,
-    PricingError,
 )
 
 # ---------------------------------------------------------------------------
@@ -169,97 +168,6 @@ async def test_keypool_header_override_strips_nested_upstream(respx_router, test
     route = route_from_lease("minimax", lease)
     assert route.biz == "minimax"
     assert route.submit_path == "/v2/video_generation"
-
-
-# ---------------------------------------------------------------------------
-# pricing
-# ---------------------------------------------------------------------------
-
-
-def _model_payload(**overrides):
-    payload = {
-        "id": "MiniMax-H3", "provider": "minimax", "status": 0,
-        "discountRate": 1,
-        "billing": {
-            "rule": "def calulate(request):\n    return float(request.get('duration') or 5) * 0.026",
-            "type": "second", "price": [],
-        },
-    }
-    payload.update(overrides)
-    return payload
-
-
-async def test_pricing_quote_rule_function(respx_router, test_settings, patch_redis):
-    from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-
-    respx_router.get("http://pricing.test/v1/models/MiniMax-H3").mock(
-        return_value=httpx.Response(200, json=_model_payload())
-    )
-    quote = await ModelMetaPricingProvider().quote("MiniMax-H3", {"duration": 5})
-    assert quote.amount == pytest.approx(0.13)
-    assert quote.metric == "second"
-
-
-async def test_pricing_quote_discount_rate(respx_router, test_settings, patch_redis):
-    from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-
-    respx_router.get("http://pricing.test/v1/models/m").mock(
-        return_value=httpx.Response(200, json=_model_payload(discountRate=0.9))
-    )
-    quote = await ModelMetaPricingProvider().quote("m", {"duration": 10})
-    assert quote.amount == pytest.approx(0.26 * 0.9)
-
-
-async def test_pricing_quote_expression_fallback(respx_router, test_settings, patch_redis):
-    from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-
-    respx_router.get("http://pricing.test/v1/models/m").mock(
-        return_value=httpx.Response(
-            200, json=_model_payload(
-                billing={"rule": "duration * 0.5", "type": "second", "price": []}))
-    )
-    quote = await ModelMetaPricingProvider().quote("m", {"duration": 4})
-    assert quote.amount == pytest.approx(2.0)
-
-
-async def test_pricing_model_unavailable(respx_router, test_settings, patch_redis):
-    from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-
-    respx_router.get("http://pricing.test/v1/models/m").mock(
-        return_value=httpx.Response(200, json=_model_payload(status=2))
-    )
-    with pytest.raises(ModelUnavailableError):
-        await ModelMetaPricingProvider().quote("m", {})
-
-
-async def test_pricing_cache_and_stale_fallback(respx_router, test_settings, patch_redis):
-    from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-
-    route = respx_router.get("http://pricing.test/v1/models/m").mock(
-        return_value=httpx.Response(200, json=_model_payload())
-    )
-    provider = ModelMetaPricingProvider()
-    await provider.quote("m", {"duration": 5})
-    await provider.quote("m", {"duration": 5})
-    assert len(route.calls) == 1             # 第二次命中 Redis 缓存
-
-    # pricing 故障：有 stale 兜底时不抛错，用最后一份规则
-    respx_router.get("http://pricing.test/v1/models/m").mock(
-        return_value=httpx.Response(500)
-    )
-    await patch_redis.delete("gw:pricing:m:model")
-    quote = await provider.quote("m", {"duration": 5})
-    assert quote.amount == pytest.approx(0.13)
-
-
-async def test_pricing_hard_failure_without_stale(respx_router, test_settings, patch_redis):
-    from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-
-    respx_router.get("http://pricing.test/v1/models/never").mock(
-        return_value=httpx.Response(500)
-    )
-    with pytest.raises(PricingError):
-        await ModelMetaPricingProvider().quote("never", {})
 
 
 # ---------------------------------------------------------------------------

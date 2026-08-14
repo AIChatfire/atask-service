@@ -1,19 +1,21 @@
 """微服务适配层 —— 端口（Protocol）与实现分离。
 
-调用方只依赖这里的三个端口对象：billing / pricing / keys。
-切换实现只需改配置：GW_BILLING_PROVIDER / GW_PRICING_PROVIDER / GW_KEY_PROVIDER。
+调用方只依赖这里的两个端口对象：billing / keys。
+切换实现只需改配置：GW_BILLING_PROVIDER / GW_KEY_PROVIDER。
 新增 provider = 本目录新增实现类 + 在下方工厂注册一个名字，调用方零改动。
+
+计费规则不走独立微服务：唯一事实源是 keypool 渠道元数据（gateway 块
+``billing.rule``），随租约下发后由 ``app.services.pricing`` 本地沙箱求值。
 
 契约来源（实现以真实服务为准，勿凭记忆改字段）：
 - billing: https://github.com/AIChatfire/newapi-billing-service
-- pricing: https://github.com/AIChatfire/pricing-service
 - keys:    https://github.com/AIChatfire/keypool-service
 """
 
 from typing import Any, Protocol
 
 from app.config import settings
-from app.schemas import KeyLease, Quote, UserIdentity
+from app.schemas import KeyLease, UserIdentity
 
 # ---------------- 异常 ----------------
 
@@ -37,11 +39,7 @@ class BillingError(ProviderError):
 
 
 class PricingError(ProviderError):
-    """pricing 服务不可用/规则求值失败（503 语义）。"""
-
-
-class ModelUnavailableError(PricingError):
-    """模型在 pricing 服务中 status != 0（400 语义：模型不可用）。"""
+    """渠道计费规则求值失败（500 语义：配置错误，绝不静默按 0 计费）。"""
 
 
 class KeyLeaseError(ProviderError):
@@ -65,17 +63,8 @@ class BillingProvider(Protocol):
     async def cancel(self, *, raw_token: str, request_id: str) -> None: ...
 
 
-class PricingProvider(Protocol):
-    """定价端口：按模型报价（取规则 + 沙箱求值都在实现内完成）。
-
-    ``request`` 为完整请求体（freeze 时为用户提交体；settle 重估时为
-    合并了实际用量的请求体），规则函数 ``calulate(request)`` 自由取用。"""
-
-    async def quote(self, model: str, request: dict) -> Quote: ...
-
-
 class KeyProvider(Protocol):
-    """上游密钥端口：租约（含渠道全量覆盖配置）+ 用量/错误上报。"""
+    """上游密钥端口：租约（含渠道全量覆盖配置与 billing 计费规则块）+ 用量/错误上报。"""
 
     async def lease(self, biz: str, model: str = "", key_id: int | None = None,
                     group: str = "") -> KeyLease: ...
@@ -93,13 +82,6 @@ def _build_billing() -> BillingProvider:
     raise ProviderError(f"unknown billing provider: {settings.billing_provider}")
 
 
-def _build_pricing() -> PricingProvider:
-    if settings.pricing_provider == "model-meta":
-        from app.services.providers.modelmeta_pricing import ModelMetaPricingProvider
-        return ModelMetaPricingProvider()
-    raise ProviderError(f"unknown pricing provider: {settings.pricing_provider}")
-
-
 def _build_keys() -> KeyProvider:
     if settings.key_provider == "keypool":
         from app.services.providers.keypool import KeypoolProvider
@@ -108,5 +90,4 @@ def _build_keys() -> KeyProvider:
 
 
 billing: BillingProvider = _build_billing()
-pricing: PricingProvider = _build_pricing()
 keys: KeyProvider = _build_keys()

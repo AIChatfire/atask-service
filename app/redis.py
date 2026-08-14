@@ -16,7 +16,6 @@ K_IDEM = "gw:idem:{token_hash}:{key}"        # 幂等键 -> task_id（24h）
 K_RL = "gw:rl:{subject}"                     # 滑动窗口限流（subject=token_hash 或 ip）
 K_CONC = "gw:conc:{token_hash}"              # 并发任务占用
 K_CB = "gw:cb:{biz}:{event_id}"              # 回调去重（72h）
-K_PRICING = "gw:pricing:{biz}:{metric}"      # 计费规则缓存
 K_BREAKER = "gw:breaker:{biz}"               # 上游熔断失败计数
 S_DLQ = "gw:events:dlq"                      # 死信（taskiq 任务超限后落信）
 

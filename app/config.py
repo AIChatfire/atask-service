@@ -51,12 +51,7 @@ class Settings(BaseSettings):
     billing_provider: str = "newapi-billing"
     billing_svc_url: str = "http://127.0.0.1:8080"
 
-    # ---- 微服务：pricing-service（模型元数据 + 计费规则）----
-    pricing_provider: str = "model-meta"
-    pricing_svc_url: str = "http://127.0.0.1:9001"
-    pricing_cache_ttl: int = 300          # 模型计费规则缓存（秒），另有无 TTL stale 兜底
-
-    # ---- 微服务：keypool-service（上游 key/base_url/渠道覆盖/路由提取配置）----
+    # ---- 微服务：keypool-service（上游 key/base_url/渠道覆盖/路由提取配置/计费规则）----
     key_provider: str = "keypool"
     key_svc_url: str = "http://127.0.0.1:8081"
     key_svc_token: str = "change-me"

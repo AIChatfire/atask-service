@@ -25,12 +25,20 @@ router = APIRouter()
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailer", "transfer-encoding", "upgrade", "host",
+    "authorization",   # 用户 sk 令牌绝不透传给上游
 }
 BUFFER_LIMIT = 256 * 1024   # 小响应缓冲上限，用于提取 upstream_task_id
 
 
 def _forward_headers(request: Request, extra: dict) -> dict:
-    return {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP} | extra
+    # extra（渠道凭证等注入头）统一小写归一，并按小写名剔除客户端同义头，
+    # 保证每个头恰好出现一次（extra 优先），杜绝大小写碰撞产生重复鉴权头
+    extra_lc = {k.lower(): v for k, v in extra.items()}
+    base = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP and k.lower() not in extra_lc
+    }
+    return base | extra_lc
 
 
 @router.api_route("/{biz}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

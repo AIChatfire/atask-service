@@ -24,11 +24,9 @@ class TokenCtx:
 
 
 def extract_token(authorization: str | None) -> TokenCtx:
-
-    # if not authorization or not authorization.startswith("Bearer "):
-    #     raise HTTPException(401, "missing or invalid Authorization header")
-    # raw = authorization[7:].strip()
-    raw = "临时"
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing or invalid Authorization header")
+    raw = authorization[7:].strip()
     if not raw:
         raise HTTPException(401, "empty token")
     return TokenCtx(raw=raw, hash=hashlib.sha256(raw.encode()).hexdigest())

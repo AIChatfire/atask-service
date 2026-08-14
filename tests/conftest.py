@@ -167,7 +167,6 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
     import app.services.statelog
     import app.services.tokensession
     import app.services.upstream
-    from app.services.providers import modelmeta_pricing
 
     for module in (
         app.deps.auth,
@@ -178,7 +177,6 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
         app.services.statelog,
         app.services.tokensession,
         app.services.upstream,
-        modelmeta_pricing,
     ):
         monkeypatch.setattr(module, "r", fake_redis)
     return fake_redis
@@ -207,7 +205,6 @@ def test_settings(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(settings, "key_svc_url", "http://keypool.test")
     monkeypatch.setattr(settings, "key_svc_token", "kp-token")
-    monkeypatch.setattr(settings, "pricing_svc_url", "http://pricing.test")
     monkeypatch.setattr(settings, "billing_svc_url", "http://billing.test")
     monkeypatch.setattr(settings, "gateway_public_base_url", "https://gw.test")
     monkeypatch.setattr(settings, "logfire_enabled", False)

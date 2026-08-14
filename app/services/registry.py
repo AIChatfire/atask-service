@@ -47,6 +47,9 @@ _GATEWAY_DEFAULTS: dict[str, Any] = {
     "callback_secret": None,
     "callback_sig_header": "X-Signature",
     "pricing_biz_type": "",
+    "billing_rule": "",
+    "billing_type": "default",
+    "discount_rate": 1.0,
     "status_map": {},
 }
 
@@ -76,8 +79,18 @@ def route_from_channel(biz_hint: str, channel: dict[str, Any] | None) -> RouteCo
         other.get("gateway"),
     ):
         if isinstance(candidate, dict) and candidate:
-            gw = candidate
+            gw = dict(candidate)
             break
+    # 计费规则块：billing.rule / billing.type / billing.discount_rate（discountRate）
+    # 摊平为 RouteConfig 字段；billing 为字符串时直接视为规则本体
+    billing = gw.pop("billing", None)
+    if isinstance(billing, str):
+        gw.setdefault("billing_rule", billing)
+    elif isinstance(billing, dict):
+        gw.setdefault("billing_rule", str(billing.get("rule") or ""))
+        gw.setdefault("billing_type", str(billing.get("type") or "default"))
+        gw.setdefault("discount_rate",
+                      float(billing.get("discount_rate", billing.get("discountRate", 1.0)) or 1.0))
     merged = {**_GATEWAY_DEFAULTS, **gw}
     # biz 从渠道取：gateway.biz → 渠道 name → URL 段兜底（pop 防与 RouteConfig.biz 冲突）
     biz = str(merged.pop("biz", "") or channel.get("name") or biz_hint)

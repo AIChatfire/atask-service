@@ -1,10 +1,10 @@
 """MiniMax-H3 端到端完整性测试（AI_TODO.md 适配任务验收）。
 
-全链路真实代码路径：HTTP 入口 → preflight（鉴权内省 ∥ pricing 报价 ∥ keypool
-租约）→ freeze → 渠道覆盖提交 → 落库 → 探测推进（processing → succeeded）→
-pricing 重估结算（多退少补）→ 用户回调通知 → 任务查询视图。
+全链路真实代码路径：HTTP 入口 → preflight（鉴权内省 ∥ keypool 租约，计费规则
+随租约下发本地报价）→ freeze → 渠道覆盖提交 → 落库 → 探测推进（processing →
+succeeded）→ 渠道规则重估结算（多退少补）→ 用户回调通知 → 任务查询视图。
 
-外部边界全部 fake/mock：三微服务与上游走 respx，Redis/taskstore/queue 走
+外部边界全部 fake/mock：两微服务与上游走 respx，Redis/taskstore/queue 走
 内存实现；**网关内部链路零 mock**。
 """
 
@@ -35,16 +35,12 @@ MINIMAX_CHANNEL = {
             "error_path": "task.error",
             "settle_usage_map": {"duration": "task.usage.output_seconds"},
             "pricing_biz_type": "video_generation",
+            # 计费规则（唯一事实源）：平台价 $0.026/秒，按请求 duration 顶格预估
+            "billing": {
+                "rule": "def calulate(request):\n    return round(float(request.get('duration') or 5) * 0.026, 6)",
+                "type": "second",
+            },
         },
-    },
-}
-
-PRICING_MODEL = {
-    "id": "MiniMax-H3", "provider": "minimax", "status": 0, "discountRate": 1,
-    "billing": {
-        # 平台价 $0.026/秒（2K $0.13/s 的示例折算）：按请求 duration 顶格预估
-        "rule": "def calulate(request):\n    return round(float(request.get('duration') or 5) * 0.026, 6)",
-        "type": "second", "price": [],
     },
 }
 
@@ -72,9 +68,6 @@ def e2e_mocks(respx_router):
     )
     m.freeze = respx_router.post("http://billing.test/api/v1/billing/freeze").mock(
         return_value=httpx.Response(200, json={"data": {"status": "frozen"}})
-    )
-    m.pricing = respx_router.get("http://pricing.test/v1/models/MiniMax-H3").mock(
-        return_value=httpx.Response(200, json=PRICING_MODEL)
     )
     m.select = respx_router.post("http://keypool.test/v1/keys/select").mock(
         return_value=httpx.Response(200, json={
@@ -245,9 +238,6 @@ async def test_unknown_biz_503_with_error_shape(
     """未接入的 biz（keypool 无渠道）→ 503 + OpenAI 风格错误体。"""
     respx_router.post("http://billing.test/api/v1/auth/inspect").mock(
         return_value=httpx.Response(200, json={"valid": True, "user_id": 1, "token_id": 1})
-    )
-    respx_router.get("http://pricing.test/v1/models/MiniMax-H3").mock(
-        return_value=httpx.Response(200, json=PRICING_MODEL)
     )
     respx_router.post("http://keypool.test/v1/keys/select").mock(
         return_value=httpx.Response(503, json={"code": 40001, "message": "no available key",
