@@ -24,7 +24,8 @@
 - 安装：`.venv/bin/pip install -e ".[dev]"`
 - 本地依赖：`docker compose up -d mysql redis`
 - 运行：网关 `gunicorn -c gunicorn.conf.py app.main:app`；
-  后台 `taskiq worker app.queue:broker` + `taskiq scheduler app.queue:scheduler`
+  后台 `sh -c "taskiq scheduler app.queue:scheduler & exec taskiq worker app.queue:broker"`
+  （scheduler 合并进 worker，必须单副本；worker 扩副本时拆回独立 scheduler）
 
 ## 关键约定
 - **零路由文件**：上游配置全部在 keypool 渠道；全部渠道挂在统一分组

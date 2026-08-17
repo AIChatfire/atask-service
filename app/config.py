@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"               # loguru 出口级别（排障时调 DEBUG）
     logfire_enabled: bool = False
     logfire_token: str | None = None
+    logfire_excluded_urls: str = (        # logfire 噪音路由排除（逗号分隔路径/前缀）
+        "/healthz/live,/healthz/ready,/ops/queue,/ops/requeue,/ops/dlq/replay,/ops/tasks"
+    )
 
     # ---- 数据层（与 new-api 共享 MySQL 实例；网关零建表职责）----
     database_url: str = (
@@ -68,6 +71,9 @@ class Settings(BaseSettings):
     # ---- 计费闭环 ----
     freeze_ttl_seconds: int = 1800        # 预冻结 TTL（billing sweeper 过期自动解冻兜底）
     sk_session_ttl_seconds: int = 172800  # 用户令牌 Redis 暂存 TTL（终态 settle/cancel 用，48h）
+    freeze_renew_margin_seconds: int = 600    # 冻结临期续期阈值（剩余 < 10min 才续）
+    freeze_renew_batch: int = 100             # 每轮 sweep 续期上限
+    hold_max_age_seconds: int = 14400         # HELD 挂起上限（4h，≤ 冻结续期可维持窗口）
 
     # ---- 鉴权/幂等/限流 ----
     auth_cache_ttl: int = 30              # billing /auth/inspect 结果缓存
@@ -84,13 +90,32 @@ class Settings(BaseSettings):
     poll_max_age_seconds: int = 86400     # 任务最大在途时长（超时转 FAILURE）
     task_stale_seconds: int = 300         # 非终态任务超过该时长未更新则 sweeper 重投探测
 
+    # ---- 提交重试（仅换 key 可能改变结果的确定性拒绝；模糊失败绝不重试防双重创建）----
+    submit_max_attempts: int = 3          # 含首次提交
+    submit_retryable_status_codes: Annotated[tuple[int, ...], NoDecode] = (401, 403, 429)
+    # 默认只含 key 级（401/403）与限流（429）：换 key/渠道才可能改变结果；
+    # 任务级 4xx（如 400 内容审核）重打同一报文无意义，不默认重试（可按厂商条款追加）
+
+    # ---- 不亏本兜底（孤儿收口 / 反向对账）----
+    orphan_grace_seconds: int = 600       # 非终态且无 upstream_task_id 超此时长 → 孤儿收口
+    reverse_reconcile_batch: int = 20     # 反向对账每轮抽查上限
+    reverse_reconcile_window_seconds: int = 86400   # 只抽查近 24h 的 FAILURE
+    reverse_reconcile_recheck_seconds: int = 3600   # 单任务核对间隔（在途上游每小时复查）
+
     # ---- 队列（taskiq）----
     event_max_attempts: int = 8           # 事件任务重试上限，超限落死信
     queue_warn_depth: int = 500           # 积压告警阈值
+    taskiq_admin_url: str = ""            # taskiq-admin 看板地址（空 = 不上报）
+    taskiq_admin_api_token: str = ""      # 看板 API access-token
 
     @field_validator("poll_ladder_seconds", mode="before")
     @classmethod
     def _ladder(cls, value: Any) -> Any:
+        return _parse_seconds_ladder(value)
+
+    @field_validator("submit_retryable_status_codes", mode="before")
+    @classmethod
+    def _codes(cls, value: Any) -> Any:
         return _parse_seconds_ladder(value)
 
 

@@ -30,9 +30,16 @@ async def ip_rate_limit(request: Request) -> None:
     await check_rate(f"ip:{client_ip(request)}")
 
 
+async def conc_try_acquire(token_hash: str) -> bool:
+    """非抛出式并发占用（HELD 恢复重提交等异步路径用）：拿到 True，超限 False。"""
+    return bool(await r.eval(
+        LUA_CONC_ACQUIRE, 1, K_CONC.format(token_hash=token_hash),
+        settings.max_concurrent_tasks,
+    ))
+
+
 async def conc_acquire(token_hash: str) -> None:
-    ok = await r.eval(LUA_CONC_ACQUIRE, 1, K_CONC.format(token_hash=token_hash), settings.max_concurrent_tasks)
-    if not ok:
+    if not await conc_try_acquire(token_hash):
         raise HTTPException(429, "too many concurrent tasks", headers={"Retry-After": "30"})
 
 

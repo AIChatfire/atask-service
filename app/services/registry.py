@@ -45,11 +45,15 @@ _GATEWAY_DEFAULTS: dict[str, Any] = {
     "callback_param": "callback_url",
     "callback_secret": None,
     "callback_sig_header": "X-Signature",
+    "failed_billing": "absorb",
+    "cancel_path": "",
+    "client_request_id_param": "",
     "pricing_biz_type": "",
     "billing_rule": "",
     "billing_type": "default",
     "discount_rate": 1.0,
     "status_map": {},
+    "error_classify": {},
 }
 
 
@@ -95,6 +99,7 @@ def route_from_channel(biz_hint: str, channel: dict[str, Any] | None) -> RouteCo
         biz=biz,
         enabled=True,
         display_name=str(channel.get("name") or ""),
+        channel_id=int(channel.get("id") or 0),
         upstream_base_url=str(channel.get("base_url") or ""),
         **merged,
     )

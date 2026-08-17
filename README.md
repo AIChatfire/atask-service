@@ -106,10 +106,23 @@
   TTL 到期自动解冻兜底——资金不会锁死。
 - **推进双通道**：上游支持 webhook 走回调（验签+去重），否则 taskiq 延迟探测
   （退避升档 5s→120s）；超 `GW_POLL_MAX_AGE_SECONDS` 转 FAILURE 并解冻。
+- **提交有限重试**：仅换 key 可能改变结果的确定性拒绝（默认 401/403/429，
+  `GW_SUBMIT_RETRYABLE_STATUS_CODES` 可配）换租约重打（≤3 次，只冻结一次）；
+  模糊失败（超时/5xx）绝不重试（防双重创建双扣费）；任务级 4xx 立即判死。
+- **HELD 挂起**：账户级故障（欠费/封禁，渠道 `error_classify` 显式配置才判定）
+  → 任务挂起保留冻结、202 照常返回；sweep 续期保活（billing renew 只推
+  expires_at 不动钱），补费后金丝雀排空（重新租约不钉渠道，1m→5m→15m 退避），
+  超 `GW_HOLD_MAX_AGE_SECONDS`（默认 4h）判死解冻。
+- **不亏本兜底**：孤儿任务（非终态且无 upstream_task_id 超 10min）sweep 收口
+  解冻；反向对账抽查"本地 FAILURE/已退 但上游 SUCCESS"告警台账；失败单按渠道
+  `failed_billing: charge|absorb` 策略结算或解冻；渠道配 `cancel_path` 时取消/
+  超时尽力调上游取消端点源头止损。
 - **兜底收敛**：每分钟 sweep 巡检——在途任务停滞重投探测、终态未结算重发
-  计费事件（billing 幂等，重发安全）、队列积压/死信告警，`/ops/dlq/replay` 补号。
-- **熔断与上报**：每 biz 失败计数熔断（30s/10 次）；上游 4xx/5xx 结果实时
-  上报 keypool 驱动坏 key 自动禁用。
+  计费事件（billing 幂等，重发安全）、冻结临期续期、HELD 维护、队列积压/死信
+  告警，`/ops/dlq/replay` 补号。
+- **熔断与上报**：每 biz 失败计数熔断（30s/10 次）；探测按错误分类表接线——
+  key 级失效上报 keypool 驱动换 key、429 按 Retry-After 拉长退避、账户级只告警
+  不误报；提交 4xx/5xx 结果实时上报驱动坏 key 自动禁用。
 - **观测**：日志统一走 loguru（`app/logging.py` 装配 stderr sink 并桥接
   stdlib，`GW_LOG_LEVEL` 控制级别，排障调 DEBUG 即可看全链路；令牌/上游
   key 绝不进日志）。`GET /ops/tasks/{task_id}` 提供任务诊断视图（含
@@ -117,7 +130,10 @@
   `GW_LOGFIRE_ENABLED=true` 接入 logfire（web 由 main 装配，taskiq
   worker 由队列中间件装配）；**状态变化唯一记录点**是 statelog——Redis 去重，
   只在任务状态变化时发一条 `task_status_changed`（运行中连探多轮零事件）；
-  队列中间件成功路径静默、失败才发 `taskiq_task_failed`（绝不带任务参数）。
+  队列中间件成功路径静默、失败才发 `taskiq_task_failed`（绝不带任务参数）；
+  探测连续失败按 1/5/20 档升档告警（statelog 失败计数，成功清零）；
+  `GW_TASKIQ_ADMIN_URL`/`GW_TASKIQ_ADMIN_API_TOKEN` 配好后 taskiq-admin
+  看板（compose 内 `127.0.0.1:3000`）展示任务执行层（args 脱敏不上报）。
 
 ## 本地开发
 

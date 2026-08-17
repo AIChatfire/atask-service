@@ -8,9 +8,11 @@
 - 可观测：queue_stats() 队列深度/延迟任务数/死信数/任务状态分布，供 /ops/queue 与巡检告警
 - 死信：Redis Stream gw:events:dlq，/ops/dlq/replay 可重放
 
-运行：
-  taskiq worker    app.queue:broker --max-async-tasks 100
-  taskiq scheduler app.queue:scheduler
+运行（scheduler 已合并进 worker 进程；**scheduler 必须单副本**，worker 扩
+多副本时把 scheduler 拆回独立服务）：
+  sh -c "taskiq scheduler app.queue:scheduler & exec taskiq worker app.queue:broker --max-async-tasks 100"
+看板：配置 GW_TASKIQ_ADMIN_URL / GW_TASKIQ_ADMIN_API_TOKEN 后 worker 自动
+  挂接 TaskiqAdminReportMiddleware（args 脱敏不上报）；面板服务见 compose。
 
 计费事件纪律（资金收口）：
 - settle/cancel 携带**用户令牌**（billing 只认令牌身份，跨用户 403）；
@@ -26,10 +28,11 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from taskiq import Context, TaskiqDepends, TaskiqMessage, TaskiqResult, TaskiqScheduler
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.schedule_sources import LabelScheduleSource
-from taskiq_redis import ListQueueBroker, RedisScheduleSource
+from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend, RedisScheduleSource
 
 from app.config import settings
 from app.logging import log, setup_logging
@@ -124,9 +127,63 @@ class ObservabilityMiddleware(TaskiqMiddleware):
 
 
 broker = ListQueueBroker(settings.redis_url, queue_name=QUEUE_NAME)
+# 结果后端（taskiq-admin 看板依赖；result_ex_time 兜底 TTL 24h 防膨胀——
+# 任务均返回 None，无敏感数据）
+broker = broker.with_result_backend(
+    RedisAsyncResultBackend(settings.redis_url, result_ex_time=86400)
+)
 schedule_source = RedisScheduleSource(settings.redis_url, prefix=SCHED_PREFIX)
 scheduler = TaskiqScheduler(broker, sources=[LabelScheduleSource(broker), schedule_source])
 broker.add_middlewares(ObservabilityMiddleware())
+
+
+class TaskiqAdminReportMiddleware(TaskiqMiddleware):
+    """taskiq-admin 看板上报中间件（官方中间件未随 taskiq 0.11 的 pip 包分发，
+    按官方 API 契约自实现）：worker 把任务 started/executed 事件 POST 到看板。
+
+    红线：**args/kwargs 一律脱敏不上报**（billing 任务参数含用户令牌）；
+    上报失败只记 DEBUG，绝不影响任务执行。未配置 GW_TASKIQ_ADMIN_URL 不挂接。
+    """
+
+    def __init__(self, url: str, api_token: str, broker_name: str = "atask-worker"):
+        super().__init__()
+        self._url = url.rstrip("/")
+        self._token = api_token
+        self._broker_name = broker_name
+
+    async def _post(self, path: str, payload: dict) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(
+                    f"{self._url}{path}",
+                    headers={"access-token": self._token},
+                    json=payload,
+                )
+        except Exception:
+            log.opt(exception=True).debug("taskiq-admin report failed")
+
+    async def pre_execute(self, message: TaskiqMessage) -> TaskiqMessage:
+        await self._post(f"/api/tasks/{message.task_id}/started", {
+            "args": [], "kwargs": {},          # 脱敏：绝不上报任务参数
+            "taskName": message.task_name,
+            "worker": self._broker_name,
+            "startedAt": datetime.now(UTC).isoformat(),
+        })
+        return message
+
+    async def post_execute(self, message: TaskiqMessage,
+                           result: TaskiqResult[Any]) -> None:
+        await self._post(f"/api/tasks/{message.task_id}/executed", {
+            "error": None if result.error is None else repr(result.error)[:300],
+            "executionTime": result.execution_time,
+            "returnValue": {"return_value": None},
+            "finishedAt": datetime.now(UTC).isoformat(),
+        })
+
+
+if settings.taskiq_admin_url and settings.taskiq_admin_api_token:
+    broker.add_middlewares(TaskiqAdminReportMiddleware(
+        settings.taskiq_admin_url, settings.taskiq_admin_api_token))
 
 
 def _at(delay_seconds: float) -> datetime:
@@ -226,6 +283,17 @@ async def poll_task(task_id: str, context: Context = TaskiqDepends()) -> None:
         await _retry_or_dlq("POLL", poll_task.kicker(), context, (task_id,))
 
 
+@broker.task
+async def resume_held_task(context: Context = TaskiqDepends()) -> None:
+    """HELD 金丝雀排空（每次最老一只；详见 app.services.held）。"""
+    from app.services.held import resume_held_once  # 延迟 import 防循环
+    try:
+        await resume_held_once()
+    except Exception:
+        log.exception("resume held failed")
+        await _retry_or_dlq("RESUME_HELD", resume_held_task.kicker(), context, ())
+
+
 @broker.task(schedule=[{"cron": "*/1 * * * *"}])     # 每分钟补数巡检
 async def sweep_task() -> None:
     from app.services.reconcile import sweep_once  # 延迟 import 防循环
@@ -256,6 +324,12 @@ async def schedule_poll(task_id: str, delay: int | float) -> None:
     await poll_task.kicker().schedule_by_time(schedule_source, _at(delay), task_id)
 
 
+async def schedule_resume_held(delay: int | float) -> None:
+    """调度 HELD 金丝雀排空（账户级故障恢复后按节奏重提交）。"""
+    log.debug("schedule resume_held in {}s", delay)
+    await resume_held_task.kicker().schedule_by_time(schedule_source, _at(delay))
+
+
 # ---------------- 可观测与补号 ----------------
 
 async def queue_stats() -> dict:
@@ -280,6 +354,7 @@ _DLQ_TASKS: dict[str, Any] = {
     "BILLING_CANCEL": billing_cancel_task,
     "NOTIFY": notify_task,
     "POLL": poll_task,
+    "RESUME_HELD": resume_held_task,
 }
 
 

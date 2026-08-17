@@ -38,13 +38,16 @@ _clients: dict[tuple[str, str, str], httpx.AsyncClient] = {}
 class UpstreamError(Exception):
     """上游调用失败。``status`` 为（经渠道 status_code_mapping 重写后的）HTTP
     状态码；信封业务错误为 200 + ``envelope=True``（上报 keypool 时不按 HTTP
-    失败分类，仅记录消息）。"""
+    失败分类，仅记录消息）。``retry_after_ms`` 为上游限流给出的建议退避
+    （Retry-After 头，仅 429 时解析），供探测重投拉长退避。"""
 
-    def __init__(self, biz: str, status: int, body: str, *, envelope: bool = False):
+    def __init__(self, biz: str, status: int, body: str, *, envelope: bool = False,
+                 retry_after_ms: int | None = None):
         super().__init__(f"{biz} upstream {status}: {body[:200]}")
         self.status = status
         self.body = body
         self.envelope = envelope
+        self.retry_after_ms = retry_after_ms
 
 
 class BreakerOpenError(Exception):
@@ -105,11 +108,14 @@ def auth_headers(route: RouteConfig, key: KeyLease) -> dict:
 
 
 def build_submit_body(route: RouteConfig, key: KeyLease, body: dict,
-                      callback_url: str | None = None) -> dict:
+                      callback_url: str | None = None,
+                      client_request_id: str | None = None) -> dict:
     """用户 body 为基底，按路由/渠道配置塑形（见模块 docstring 叠加顺序）。
 
     用户自带的 ``callback_url``/``webhook`` 一律摘除——用户回调由网关在终态
     经 notify 签名投递，绝不直接透给上游（上游回调地址只能由网关注入）。
+    ``client_request_id``：渠道配了 ``client_request_id_param`` 时把网关
+    task_id 注入提交体（上游幂等反查，孤儿任务崩溃后可补挂）。
     """
     payload = dict(body)
     payload.pop("callback_url", None)
@@ -123,6 +129,8 @@ def build_submit_body(route: RouteConfig, key: KeyLease, body: dict,
         merged["model"] = key.model_mapping[model]   # 渠道模型名映射（如 gpt-4o → gpt-4o-2024-08-06）
     if callback_url and route.supports_callback:
         merged[route.callback_param] = callback_url  # 网关注入回调，用户回调由 notify 透传
+    if route.client_request_id_param and client_request_id:
+        merged[route.client_request_id_param] = client_request_id
     return merged
 
 
@@ -165,6 +173,19 @@ def _mapped_status(key: KeyLease, status_code: int) -> int:
         return status_code
 
 
+def _retry_after_ms(resp: httpx.Response, status: int) -> int | None:
+    """429 限流时解析 Retry-After 头（秒，容忍小数），供探测拉长退避。"""
+    if status != 429:
+        return None
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0, int(float(raw) * 1000))
+    except ValueError:
+        return None
+
+
 def _check_envelope(route: RouteConfig, data: Any) -> None:
     """可选信封校验：HTTP 2xx 但业务码不匹配 → UpstreamError(envelope=True)。"""
     check = route.ok_check
@@ -197,7 +218,8 @@ async def submit(route: RouteConfig, key: KeyLease, payload: dict) -> dict:
     status = _mapped_status(key, resp.status_code)
     await breaker_report(route.biz, ok=status < 500)
     if status >= 400:
-        raise UpstreamError(route.biz, status, resp.text)
+        raise UpstreamError(route.biz, status, resp.text,
+                            retry_after_ms=_retry_after_ms(resp, status))
     data = resp.json()
     _check_envelope(route, data)
     return data
@@ -216,10 +238,32 @@ async def probe(route: RouteConfig, key: KeyLease, upstream_task_id: str) -> dic
     status = _mapped_status(key, resp.status_code)
     await breaker_report(route.biz, ok=status < 500)
     if status >= 400:
-        raise UpstreamError(route.biz, status, resp.text)
+        raise UpstreamError(route.biz, status, resp.text,
+                            retry_after_ms=_retry_after_ms(resp, status))
     data = resp.json()
     _check_envelope(route, data)
     return data
+
+
+async def cancel_task_remote(route: RouteConfig, key: KeyLease,
+                             upstream_task_id: str) -> bool:
+    """尽力调上游取消端点（渠道配 ``cancel_path`` 才有动作）：源头止损。
+    成功 True；上游拒绝/网络失败仅告警返回 False，绝不阻塞本地收口。"""
+    if not route.cancel_path:
+        return False
+    client = client_for(route, key)
+    path = route.cancel_path.format(upstream_task_id=upstream_task_id)
+    try:
+        resp = await client.post(path, headers=auth_headers(route, key))
+    except httpx.HTTPError as exc:
+        log.warning("upstream cancel call failed: biz={} task={} err={}",
+                    route.biz, upstream_task_id, exc)
+        return False
+    if resp.status_code >= 400:
+        log.warning("upstream cancel rejected: biz={} task={} status={}",
+                    route.biz, upstream_task_id, resp.status_code)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

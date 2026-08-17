@@ -43,7 +43,7 @@ def _setup_logfire(app: FastAPI) -> None:
             ),
             console=False,
         )
-        logfire.instrument_fastapi(app)
+        logfire.instrument_fastapi(app, excluded_urls=settings.logfire_excluded_urls)
     except Exception:
         log.opt(exception=True).warning("logfire setup failed, continue without it")
 

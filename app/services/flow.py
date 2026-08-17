@@ -14,8 +14,9 @@ from app.config import settings
 from app.deps import ratelimit
 from app.deps.preflight import Preflight
 from app.logging import log
-from app.schemas import ACTIVE, FAILURE, QUEUED, SUCCESS, TERMINAL
+from app.schemas import ACTIVE, FAILURE, HELD, QUEUED, SUCCESS, TERMINAL
 from app.services import (
+    errclass,
     idem,
     pricing,
     providers,
@@ -24,15 +25,18 @@ from app.services import (
     tokensession,
     upstream,
 )
-from app.services.providers import PricingError
+from app.services.providers import KeyLeaseError, PricingError
+from app.services.registry import registry, route_from_lease
 
 
 def public_view(task: dict) -> dict:
-    """对外视图：不暴露 key/freeze/token_hash 等内部字段；task_id 即凭证，无需鉴权"""
+    """对外视图：不暴露 key/freeze/token_hash 等内部字段；task_id 即凭证，无需鉴权。
+    HELD（账户级挂起）对外映射为 QUEUED——调用方无需理解挂起语义。"""
     data = task.get("data") or {}
+    status = task["status"]
     return {
         "task_id": task["task_id"],
-        "status": task["status"],
+        "status": QUEUED if status == HELD else status,
         "progress": task.get("progress", "0%"),
         "fail_reason": task.get("fail_reason") or "",
         "result": data.get("result"),
@@ -77,8 +81,9 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         else None
     )
     # 提交体在路由侧一次塑形：default_params < 用户 body < 渠道 param_override，
-    # model_mapping 改写 + 回调注入（详见 upstream.build_submit_body）
-    submit_body = upstream.build_submit_body(route, pf.key, body, callback_url)
+    # model_mapping 改写 + 回调注入 + client_request_id（详见 upstream.build_submit_body）
+    submit_body = upstream.build_submit_body(route, pf.key, body, callback_url,
+                                             client_request_id=pf.task_id)
 
     data = {
         "biz": route.biz,                     # 权威 biz 来自渠道元数据（非 URL 段）
@@ -91,6 +96,7 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         "settled": pf.amount <= 0,          # 免费任务无需结算闭环
         "key_id": pf.key.key_id,
         "key_index": pf.key.key_index,
+        "freeze_expires_at": pf.freeze_expires_at,
         # 原始请求快照：终态结算重估的基底（settle_usage_map 覆盖实际用量）
         "request_body": body,
     }
@@ -103,25 +109,92 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
             data=data,
         )
 
-        # 3) 提交上游（创建类操作绝不重试，失败走取消冻结）
-        started = time.monotonic()
-        try:
-            resp = await upstream.submit(route, pf.key, submit_body)
-        except upstream.UpstreamError as exc:
+        # 3) 提交上游：仅换 key 可能改变结果的确定性拒绝（默认 401/403/429，
+        #    GW_SUBMIT_RETRYABLE_STATUS_CODES 可配）重打——确定性拒绝 =
+        #    上游明确未接单（未创建任务/未扣费），重打安全；模糊失败
+        #    （超时/5xx/连接中断）维持绝不重试（防双重创建双扣费）；
+        #    任务级 4xx（如 400 内容审核）重打同一报文无意义，不在默认集合。
+        #    key 级拒绝随重打先 report 驱动 keypool 禁用坏 key，重新 lease 即得
+        #    健康 key（keypool 无 exclude 参数，剔除靠 report 闭环）。
+        key = pf.key
+        resp: dict | None = None
+        last_exc: upstream.UpstreamError | None = None
+        for attempt in range(1, settings.submit_max_attempts + 1):
+            started = time.monotonic()
+            try:
+                resp = await upstream.submit(route, key, submit_body)
+                break
+            except upstream.UpstreamError as exc:
+                last_exc = exc
+                category = errclass.classify(route, exc)
+                retryable = (
+                    attempt < settings.submit_max_attempts
+                    and not exc.envelope
+                    and exc.status in settings.submit_retryable_status_codes
+                )
+                if not retryable:
+                    break
+                if category == errclass.KEY_LEVEL:
+                    await providers.keys.report(
+                        key, ok=False, status_code=exc.status, error=str(exc)[:200])
+                log.warning(
+                    "submit rejected ({}), retry with fresh lease: task_id={} attempt={}/{}",
+                    category, pf.task_id, attempt, settings.submit_max_attempts,
+                )
+                try:
+                    key = await providers.keys.lease(biz, model=pf.model)
+                except KeyLeaseError as lease_exc:
+                    log.warning("submit retry re-lease failed: {}", lease_exc)
+                    break
+                # 渠道覆盖按新租约重建（model_mapping/param_override 逐渠道生效）
+                route = registry.remember(route_from_lease(biz, key))
+                submit_body = upstream.build_submit_body(route, key, body, callback_url,
+                                                         client_request_id=pf.task_id)
+        if resp is None:
+            assert last_exc is not None
+            exc = last_exc
+            category = errclass.classify(route, exc)
+            if category == errclass.ACCOUNT_LEVEL:
+                # 账户级故障（欠费/封禁）：挂起而非判死——HELD 保留冻结，
+                # sweep 续期保活，补费后 resume_held 金丝雀排空（恢复时不钉渠道）。
+                # 挂起即释放并发槽；账户级不上报 keypool（不是单个 key 坏了）。
+                await taskstore.cas(pf.task_id, ACTIVE, HELD, fail_reason=str(exc)[:500])
+                await ratelimit.conc_release(pf.token.hash)
+                if pf.idem_key:
+                    await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
+                await statelog.record_if_changed(pf.task_id, HELD, detail="submit")
+                log.warning("task HELD (account-level failure): task_id={} biz={} err={}",
+                            pf.task_id, route.biz, str(exc)[:200])
+                if settings.logfire_enabled:
+                    try:
+                        import logfire
+
+                        logfire.warn("task_held", task_id=pf.task_id, biz=route.biz,
+                                     error=str(exc)[:200])
+                    except Exception:
+                        pass
+                await queue.schedule_resume_held(60)
+                return {"task_id": pf.task_id, "status": QUEUED}   # 202，对外 queued
             await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(exc)[:500])
             if pf.amount > 0:
                 await queue.publish_cancel(pf.task_id, pf.token.raw)
             await ratelimit.conc_release(pf.token.hash)
             await providers.keys.report(
-                pf.key, ok=False,
+                key, ok=False,
                 status_code=0 if exc.envelope else exc.status,
                 error=str(exc)[:200],
             )
-            log.warning("upstream rejected at submit: task_id={} biz={} err={}",
-                        pf.task_id, route.biz, str(exc)[:200])
+            log.warning("upstream rejected at submit: task_id={} biz={} class={} err={}",
+                        pf.task_id, route.biz, category, str(exc)[:200])
             raise HTTPException(502, f"upstream rejected: {exc}") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
-        await providers.keys.report(pf.key, ok=True, latency_ms=latency_ms)
+        await providers.keys.report(key, ok=True, latency_ms=latency_ms)
+        if key.key_id != pf.key.key_id:
+            # 重打落到别的渠道：探测钉回与对账口径以实际渠道为准
+            await taskstore.patch_data(
+                pf.task_id, {"key_id": key.key_id, "key_index": key.key_index},
+                channel_id=key.key_id,
+            )
 
         upstream_task_id = upstream.extract_path(resp, route.task_id_path)
         if not upstream_task_id:
@@ -219,8 +292,6 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
     route_task_id = task["task_id"]
     data = task.get("data") or {}
     if route is None:
-        from app.services.registry import registry
-
         route = registry.get_cached(data.get("biz", ""))
     patch = {"upstream_status": upstream.extract_path(raw, route.status_path) if route else None}
     if to_status == SUCCESS and route and route.result_path:
@@ -252,6 +323,18 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
                 units=next(iter(usage.values()), None),
                 attrs={"biz": data.get("biz"), "model": data.get("model"), **usage},
             )
+        elif to_status == FAILURE and route and route.failed_billing == "charge":
+            # 失败单计费策略 charge（厂商条款失败也收费）：先查 actual_amount_path
+            # 实收 → settle_usage_map 重估 → 冻结额兜底（与成功单同一三档）
+            actual, usage = await _settle_amount(route, task, raw)
+            log.warning("failed task charged per channel policy: task_id={} amount={}",
+                        route_task_id, actual)
+            await queue.publish_settle(
+                route_task_id, actual, user_sk,
+                units=next(iter(usage.values()), None),
+                attrs={"biz": data.get("biz"), "model": data.get("model"),
+                       "failed_charge": True, **usage},
+            )
         else:
             await queue.publish_cancel(route_task_id, user_sk)
         if user_sk:
@@ -265,6 +348,27 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
     return True
 
 
+async def try_upstream_cancel(task: dict, route=None) -> None:
+    """尽力调上游取消端点止损（渠道配 ``cancel_path`` 才动作）。
+    用户取消 / 探测超时收口时调用；任何失败只告警，绝不阻塞本地收口。"""
+    data = task.get("data") or {}
+    upstream_task_id = data.get("upstream_task_id")
+    biz = str(data.get("biz") or "")
+    if route is None:
+        route = registry.get_cached(biz)
+    if route is None or not route.cancel_path or not upstream_task_id:
+        return
+    try:
+        key = await providers.keys.lease(biz, model=str(data.get("model") or ""),
+                                         key_id=data.get("key_id"))
+        if await upstream.cancel_task_remote(route, key, str(upstream_task_id)):
+            log.info("upstream cancel ok: task_id={} upstream_task_id={}",
+                     task["task_id"], upstream_task_id)
+    except Exception as exc:
+        log.warning("upstream cancel attempt failed: task_id={} err={}",
+                    task["task_id"], exc)
+
+
 async def cancel_task(task_id: str) -> dict:
     """按 task_id 取消（持有即凭证，与 GET 同一安全假设）"""
     task = await taskstore.get(task_id)
@@ -273,6 +377,7 @@ async def cancel_task(task_id: str) -> dict:
     if task["status"] in TERMINAL:
         return public_view(task)
     await finalize_task(task, "CANCELED", {}, fail_reason="canceled by user")
-    # TODO: 如上游支持取消，调用上游取消端点
+    # 渠道配了 cancel_path 时尽力源头止损（失败不阻塞，本地已收口）
+    await try_upstream_cancel(task)
     fresh = await taskstore.get(task_id)
     return public_view(fresh or task)

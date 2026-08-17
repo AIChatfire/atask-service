@@ -7,6 +7,7 @@ freeze → 令牌暂存。
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -43,6 +44,9 @@ class Preflight:
     # 幂等重放短路：同 token + Idempotency-Key 已有任务时置位，
     # preflight 在 freeze 前返回（绝不重复冻结），flow 直接回放首个任务视图
     replay_task_id: str | None = None
+    # 冻结到期时刻（billing freeze 响应 expires_at；缺省 now+ttl）：
+    # 落 tasks.data，sweep 续期扫描依此判定临期
+    freeze_expires_at: int = 0
 
 
 async def preflight(
@@ -95,7 +99,11 @@ async def preflight(
     except BillingError as exc:
         raise HTTPException(exc.status, exc.message) from exc
     except KeyLeaseError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        # 无可用 key：透传 keypool 建议退避为 Retry-After 响应头（秒，至少 1）
+        headers = None
+        if exc.retry_after_ms:
+            headers = {"Retry-After": str(max(1, (exc.retry_after_ms + 999) // 1000))}
+        raise HTTPException(503, str(exc), headers=headers) from exc
 
     # 路由配置随租约从渠道元数据构建（零本地路由文件）并回填进程缓存；
     # 报价 = 渠道 gateway 块 billing.rule 本地求值（规则唯一事实源 = keypool）
@@ -111,9 +119,10 @@ async def preflight(
               route.biz, model, identity.user_id, key.key_id, quote.amount, quote.metric)
 
     # 同步预冻结（金额 > 0 才计费；freeze 即第二重身份校验）
+    freeze_expires_at = 0
     if quote.amount > 0:
         try:
-            await providers.billing.freeze(
+            frozen = await providers.billing.freeze(
                 raw_token=token.raw,
                 request_id=task_id,
                 biz_type=route.pricing_biz_type or biz,
@@ -128,8 +137,12 @@ async def preflight(
         # 轮询不带 sk）——按 task_id 暂存 Redis 作为唯一的 taskid→token 查询处
         # （终态清除；冻结 TTL 是资金兜底）
         await tokensession.store(task_id, token.raw)
+        # 冻结到期时刻落 tasks.data：sweep 续期扫描（HELD/长任务防过期）依此判定
+        freeze_expires_at = int(frozen.get("expires_at") or 0) \
+            or int(time.time()) + settings.freeze_ttl_seconds
 
     return Preflight(
         biz=biz, route=route, token=token, identity=identity, quote=quote, key=key,
-        model=model, amount=quote.amount, task_id=task_id, idem_key=idempotency_key, body=body,
+        model=model, amount=quote.amount, task_id=task_id, idem_key=idempotency_key,
+        body=body, freeze_expires_at=freeze_expires_at,
     )

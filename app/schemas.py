@@ -26,12 +26,14 @@ from pydantic import BaseModel, Field
 SUBMITTED = "SUBMITTED"
 QUEUED = "QUEUED"            # 网关自写：已提交上游、等待推进
 IN_PROGRESS = "IN_PROGRESS"
+HELD = "HELD"                # 网关自写：账户级故障（欠费/封禁）挂起，补费后金丝雀排空
 SUCCESS = "SUCCESS"
 FAILURE = "FAILURE"
 CANCELED = "CANCELED"
 
 #: 活跃（非终态）状态集合——CAS 迁移的合法起点
-ACTIVE: tuple[str, ...] = (SUBMITTED, QUEUED, IN_PROGRESS)
+#: （HELD 在列：挂起持有冻结，可被判死收口或被 resume 重新提交）
+ACTIVE: tuple[str, ...] = (SUBMITTED, QUEUED, IN_PROGRESS, HELD)
 #: 终态集合——不可逆，迟到快照丢弃
 TERMINAL: tuple[str, ...] = (SUCCESS, FAILURE, CANCELED)
 
@@ -121,6 +123,7 @@ class RouteConfig(BaseModel):
     biz: str
     enabled: bool = True
     display_name: str = ""
+    channel_id: int = 0                # 构建来源渠道 id（免费 GET 钉渠道反查用）
 
     # ---- 上游端点 ----
     upstream_base_url: str = ""        # 渠道 base_url 兜底；租约 base_url 字段优先
@@ -156,6 +159,17 @@ class RouteConfig(BaseModel):
     callback_secret: str | None = None     # 入站验签密钥（None = 不验签，仅内网）
     callback_sig_header: str = "X-Signature"
 
+    # ---- 止损（不亏本纪律的渠道级配置）----
+    failed_billing: str = "absorb"
+    """失败单计费策略（按厂商商务条款逐渠道配）：``absorb``（默认）失败全额解冻；
+    ``charge`` 失败也收费——先查 ``actual_amount_path`` 实收 → ``settle_usage_map``
+    重估 → 冻结额兜底。"""
+    cancel_path: str = ""
+    """上游取消端点（``{upstream_task_id}`` 占位；空 = 上游不支持取消）。
+    用户取消 / 探测超时收口时尽力调用（失败仅告警，不阻塞本地收口）。"""
+    client_request_id_param: str = ""
+    """提交体注入网关 task_id 的参数名（上游幂等反查/孤儿任务根治；空 = 不注入）。"""
+
     # ---- 计费（规则唯一事实源 = 本渠道 gateway 块 billing，随租约下发）----
     pricing_biz_type: str = ""         # freeze 的 biz_type；缺省用 biz
     billing_rule: str = ""             # billing.rule：asteval 沙箱求值，入参完整请求体
@@ -164,6 +178,10 @@ class RouteConfig(BaseModel):
     status_map: dict[str, str] = Field(default_factory=dict)
     """显式状态映射（最高优先级，见 app.services.statusmap）：上游状态 →
     SUBMITTED/QUEUED/IN_PROGRESS/SUCCESS/FAILURE/CANCELED。"""
+    error_classify: dict[str, list] = Field(default_factory=dict)
+    """错误分类覆盖位（见 app.services.errclass）：``{"key_level": [401],
+    "account_level": [403], "account_level_messages": [...], ...}``；
+    空 = 内置默认表（401/403→key 级、429→限流、其余 4xx→任务级、5xx→模糊）。"""
 
     def callback_url_for(self, public_base: str, task_id: str) -> str:
         """注入上游的回调地址（task_id 即凭证；验签靠 callback_secret）。"""
@@ -174,6 +192,7 @@ __all__ = [
     "ACTIVE",
     "CANCELED",
     "FAILURE",
+    "HELD",
     "IN_PROGRESS",
     "QUEUED",
     "SUBMITTED",

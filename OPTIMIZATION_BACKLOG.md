@@ -10,6 +10,15 @@
 >
 > **追加（2026-08-14 `/minimax/v2/video_generation` 失败根因诊断）**：[16]–[19] 新增，
 > 来源为诊断报告"修复 + 其他建议"部分；[16] 为线上在炸级（裸 400 + 用户令牌泄漏上游）。
+>
+> **实施状态订正（2026-08-17）**：上文"138 测试通过"与实际工作树不符——本树
+> 实测起点为 100 测试，[3]–[12]、[17]、[19] 并不在代码里。本轮已按实际代码
+> 逐波补齐并回归（144 测试全绿）：[3][4]（W2）、[5][8]（W3）、[9][10]（W5）、
+> [17][19]、**[2] 结论为不实施**（前置确认：new-api 渠道侧轮询不带用户 sk，
+> 查询/取消维持 task_id 即凭证免鉴权；taskid→token 查询处 = tokensession +
+> `GET /ops/tasks/{task_id}` 诊断端点）、[7] 网关侧（renew + sweep 续期）、
+> [6] HELD（依赖 [3][7] 已具备）、[11][12]（W9）。**[13] 运营项与 [15] 的
+> W-b/W-c（渠道侧补 billing 块）为仓库外事项，本清单代码工作至此全部收敛。**
 
 ## 优先级与依赖总览
 
@@ -69,19 +78,18 @@ P3  [13] 运营项（双账号冗余/余额预警，非代码）
   `GET /minimax/v1/tasks/{task_id}` 查询
 - [ ] 发版后回归：复现用户 curl 原生路径应返回正常 JSON 而非 Tengine 400 HTML
 
-## P1 · [2] sk 鉴权统一（与 billing 一致）
+## P1 · [2] sk 鉴权统一（与 billing 一致）——**结论：不实施（2026-08-17 裁定）**
 
-现状：创建类已走 sk→billing inspect；查询/取消/透传 GET 免鉴权（"task_id 即凭证"）。
+前置确认结果：**new-api 渠道侧轮询任务状态不带用户 sk** → 查询/取消端点强制
+sk 会让 new-api 轮询全部 401，方案前提不成立。维持"task_id 即凭证"免鉴权；
+终态结算的用户令牌由 **tokensession（Redis taskid→token 唯一查询处）**承担，
+排障走 `GET /ops/tasks/{task_id}` 诊断端点（只暴露会话存在性/TTL，令牌不出
+Redis）。以下勾选仅为存档，不改动代码：
 
-- [ ] **前置确认**：new-api 渠道侧轮询任务状态是否带用户 sk（不带则需先校准客户端）
-- [ ] `app/services/flow.py:159-164` `view_task` 加 `token_hash` 参数，与
-  `data.token_hash` 比对，不匹配 → **404**（不泄露存在性）
-- [ ] `app/services/flow.py:257-267` `cancel_task` 同上；L258 docstring 删"持有即凭证"
-- [ ] `app/services/flow.py:31` `public_view` docstring 删"task_id 即凭证"
-- [ ] `app/routers/tasks.py:22-29`、`videos.py:32-34` 加 `Depends(require_token)` + 传 hash
-- [ ] `app/routers/proxy.py:61-67` 免费透传 GET 加 sk 有效性校验（不冻结、不归属校验）
-- [ ] 灰度两步：第一期无 token 记 warning 放行（观察一周）；第二期强制 401
-- [ ] 测试：owner sk → 200；他人 sk → 404；无 token → 401（二期）
+- [x] **前置确认**：new-api 渠道侧轮询任务状态是否带用户 sk（不带则需先校准客户端）
+  → **不带**，方案终止
+- [ ] ~~`view_task` / `cancel_task` 加 token_hash 比对~~（不实施）
+- [ ] ~~tasks/videos/proxy GET 加 sk 校验~~（不实施）
 
 ## P1 · [3] 错误分类表（多项方案的共同前置）
 
@@ -95,48 +103,54 @@ P3  [13] 运营项（双账号冗余/余额预警，非代码）
 | 限流 | 429 + Retry-After | 不 report，按 hint 拉长退避 |
 | 模糊失败 | 超时/5xx/连接中断 | 重试探测；**submit 绝不重试** |
 
-- [ ] 内置默认分类表 + 渠道覆盖位；误判原则：拿不准一律按任务级（错杀 HELD 代价 >> 错放）
-- [ ] 落点：`upstream.py` 错误产出处 + `polling.py` / `flow.py` 消费处
+- [x] 内置默认分类表 + 渠道覆盖位；误判原则：拿不准一律按任务级（错杀 HELD 代价 >> 错放）
+  （已实现：`app/services/errclass.py`，渠道覆盖位 `error_classify`，含 account_level_messages）
+- [x] 落点：`upstream.py` 错误产出处 + `polling.py` / `flow.py` 消费处
 
 ## P1 · [4] 探测链路 key 时效接线（复用 new-api 重试与禁用）
 
 现状：探测零上报、钉死 channel_id、坏 key 空转 24h → 批量"上游已扣费本地已退款"。
 
-- [ ] `app/services/upstream.py:207-223` probe 补 `breaker_report`（与 submit 对齐）
-- [ ] `app/services/polling.py:59-64` `except Exception` 按 [3] 分类表拆四分支，
+- [x] `app/services/upstream.py:207-223` probe 补 `breaker_report`（与 submit 对齐）
+- [x] `app/services/polling.py:59-64` `except Exception` 按 [3] 分类表拆四分支，
   key 级失效 → `providers.keys.report(ok=False, status_code)`（钉回 channel_id 不变，
-  keypool 返回同渠道健康 key）
-- [ ] `app/services/polling.py:50-53` KeyLeaseError 解析 `retry_after_ms` 用于重投延迟
-- [ ] `app/services/providers/keypool.py:46-49` `KeyLeaseError` 加结构化 `retry_after_ms` 字段
-- [ ] `app/deps/preflight.py:102-103` 503 响应透传 `Retry-After` 头
-- [ ] 前置确认：keypool `/v1/keys/select` 的 `"retry"` 字段（keypool.py:59）是否为
+  keypool 返回同渠道健康 key）；429 限流不上报、按 Retry-After hint 拉长退避
+- [x] `app/services/polling.py:50-53` KeyLeaseError 解析 `retry_after_ms` 用于重投延迟
+- [x] `app/services/providers/keypool.py:46-49` `KeyLeaseError` 加结构化 `retry_after_ms` 字段
+  （含 503 + 包络 40001 路径的解析——原 `_unwrap` 分支对 HTTP 503 不可达，已修）
+- [x] `app/deps/preflight.py:102-103` 503 响应透传 `Retry-After` 头
+- [x] 前置确认：keypool `/v1/keys/select` 的 `"retry"` 字段（keypool.py:59）是否为
   new-api 风格"第 N 次重试排除已返渠道"语义
-- [ ] 测试：probe 401 → report 发出 + 下轮换 key_index；keypool 40001 → 重投延迟 ≥ hint
+  （2026-08-14 已确认：服务侧内部重试深度，默认 1，对网关无影响）
+- [x] 测试：probe 401 → report 发出 + 下轮换 key_index；keypool 40001 → 重投延迟 ≥ hint
 
-## P2 · [5] 提交有限重试（只对确定性拒绝）
+## P2 · [5] 提交有限重试（只对确定性拒绝）——已实现（2026-08-17）
 
-- [ ] `app/services/flow.py:103-116` submit 失败外加重试循环：仅 [3] 的确定性拒绝
-  （401/403/429/400）才重新 lease（排除已试 channel_id）换 key 再 submit，上限 3 次；
-  模糊失败（超时/5xx）维持"绝不重试"（防双重建任务双扣费）
-- [ ] `app/config.py` `submit_max_attempts: int = 3`、可配 `retryable_status_codes`
-- [ ] 测试：首 key 401 → 换 key 成功 + 只冻结一次；超时 → 不重试 + FAILURE + cancel
+- [x] submit 失败重试循环（flow.create_task）：默认集合收窄为 **401/403/429**
+  （key 级/限流——换 key 才可能改变结果；任务级 4xx 如 400 内容审核重打同一
+  报文无意义，不默认重试，可按厂商条款经 `GW_SUBMIT_RETRYABLE_STATUS_CODES`
+  追加）；模糊失败（超时/5xx）维持绝不重试；keypool 无 exclude 参数，
+  剔除已试渠道靠"key 级拒绝先 report 驱动禁用，重新 lease 即得健康 key"闭环；
+  重打落新渠道时 tasks 行 channel_id/data.key_id 同步切换
+- [x] `app/config.py` `submit_max_attempts: int = 3`、`submit_retryable_status_codes` 可配
+- [x] 测试：首 key 401 → 换 key 成功 + 只冻结一次；500 → 不重试 + FAILURE + cancel；
+  422 → 不重试；连续 401 → 上限 3 次即止
 
-## P1 · [6] HELD 挂起（欠费期间正常接单，补费即发）
+## P1 · [6] HELD 挂起（欠费期间正常接单，补费即发）——已实现（2026-08-17）
 
-新增内部状态 `HELD`（入 ACTIVE 集合，不进 TERMINAL），依赖 [3] 分类表。
-
-- [ ] `app/schemas.py` `HELD` 常量 + ACTIVE 集合；`public_view` 映射对外 "queued"
-- [ ] `app/services/flow.py:106-116` submit 失败按 [3] 分流：账户级 → CAS(ACTIVE→HELD)
-  + logfire 事件 + 202 返回（不再 502）
-- [ ] HELD 不钉渠道：恢复排空时重新 `keys.lease`（双账号红利：自动切健康账号）
-- [ ] `app/queue.py` 新增 `resume_held` 任务：金丝雀策略（取最老 HELD 试提交，
-  再撞账户级 → 退避 1m→5m→15m；成功 → 按渠道限速节奏排空）
-- [ ] `app/services/reconcile.py` sweep 补：HELD 超 `hold_max_age`（默认 4h，可配）
-  → FAILURE + cancel；HELD 无进展 → 触发 resume_held
-- [ ] 重提交带 `client_request_id = task_id`（上游幂等，防双重提交）
-- [ ] ratelimit：HELD 期间并发槽策略二选一（推荐：挂起即释放、提交前重新 acquire）
-- [ ] **硬约束**：挂起上限 ≤ 冻结有效期 → 依赖 [7] 或大 TTL 过渡
-- [ ] 测试：submit 撞欠费错误码 → HELD + 冻结在 + 202；模拟恢复 → 重新租约 + 提交 + 进探测
+- [x] `app/schemas.py` `HELD` 常量 + ACTIVE 集合；`public_view` 映射对外 QUEUED
+- [x] submit 失败按 [3] 分流：账户级 → CAS(ACTIVE→HELD) + logfire 事件 + 202 返回
+  （账户级不上报 keypool——不是单个 key 坏了）；`app/services/held.py` 金丝雀排空
+- [x] HELD 不钉渠道：恢复排空重新 `keys.lease`（双账号红利：自动切健康账号）
+- [x] `app/queue.py` `resume_held_task`：最老 HELD 试提交，再撞账户级退避
+  1m→5m→15m；成功按 5s 节奏排下一只；sweep 触发带 Redis 锁防堆积
+- [x] `app/services/reconcile.py` `_held_maintenance`：HELD 超 `hold_max_age`
+  （4h，`GW_HOLD_MAX_AGE_SECONDS`）→ FAILURE + cancel
+- [x] 重提交带 `client_request_id = task_id`（渠道 `client_request_id_param` 配置位）
+- [x] ratelimit：挂起即释放、提交前 `conc_try_acquire` 重新占用
+- [x] 硬约束：挂起期间冻结由 [7] sweep 续期保活（网关侧已落地）
+- [x] 测试：submit 撞 403（渠道 error_classify 配 account_level）→ HELD + 冻结在
+  + 202；resume 成功 → 重租约 + 提交 + 进探测；再撞 → 退避；超限 → sweep 判死
 
 ## P1 · [7] billing renew 接口 + 网关续期扫描
 
@@ -153,30 +167,32 @@ billing 侧：
 - [ ] 只写 `billing_logs`（direction=renew），无流水（不动钱）
 - [ ] 测试：frozen 续期成功；终态单 400；跨用户 403；与 sweeper 并发竞态；超总量上限 400
 
-网关侧：
+网关侧（已实现 2026-08-17）：
 
-- [ ] `app/services/providers/billing_newapi.py` 新增 `renew()`；错误映射：400 非重试终态，
-  409/5xx 可重试
-- [ ] `app/deps/preflight.py:111-126` freeze 成功后 data 落 `freeze_expires_at`
-- [ ] `app/services/reconcile.py` sweep 加续期扫描：`非终态 且 freeze_expires_at - now < margin`
-  （默认 600s）→ 用 tokensession 的 user_sk 续期，每轮上限 100
-- [ ] 失败矩阵：400 → 任务 FAILURE 止损 + 告警（钱已被 sweeper 退用户）；409/5xx → 下轮再来
-- [ ] `app/config.py` `freeze_renew_margin_seconds=600`、`freeze_renew_batch=100`
-- [ ] 覆盖范围：HELD + 全部非终态任务（顺手堵"长任务 freeze 过期 → settle 被 4xx 静默收口"窟窿）
-- [ ] 灰度：先 HELD，logfire direction=renew 日志正常后放开全量
-- [ ] 退路（过渡期）：可挂起 biz 的 freeze 用大 TTL 或不传 ttl（永不过期）——不建议长期
+- [x] `app/services/providers/billing_newapi.py` `renew()`；400 非重试终态，409/5xx 可重试
+- [x] preflight freeze 响应 `expires_at`（缺省 now+ttl）落 tasks.data `freeze_expires_at`
+- [x] reconcile sweep 续期扫描 `_renew_expiring_freezes`：非终态（含 HELD）且临期
+  （< `GW_FREEZE_RENEW_MARGIN_SECONDS` 600s）→ 令牌会话续期，每轮上限
+  `GW_FREEZE_RENEW_BATCH`=100
+- [x] 失败矩阵：400 → 任务 FAILURE 止损 + 告警；409/5xx → 下轮再来；会话丢失 → 跳过
+- [x] `app/config.py` `freeze_renew_margin_seconds=600`、`freeze_renew_batch=100`
+- [x] 覆盖范围：HELD + 全部非终态任务（expiring_freezes 查询含 HELD）
+- [x] 测试：续期成功推后 expires_at；400 → FAILURE 止损；5xx → 不动；无会话 → 跳过；
+  未临期 → 不续
 
-## P1 · [8] 不亏本三窟窿
+## P1 · [8] 不亏本三窟窿——已实现（2026-08-17）
 
-- [ ] **失败单计费策略**：`finalize_task` FAILURE 分支（flow.py:244-245）先查
-  `actual_amount_path` 实收再决定 settle/cancel；渠道配置 `failed_billing: charge|absorb`
-  （按厂商商务条款逐渠道配）
-- [ ] **反向对账**：reconcile 周期性比对"本地 FAILURE/已退 但 上游 SUCCESS"任务
-  → logfire 告警 + 计渠道成本台账（钱追不回但要看得见亏在哪）
-- [ ] **孤儿任务**：sweep 检测 `ACTIVE 且 无 upstream_task_id 且 超 N 分钟` → 告警 + 收口；
-  根治：submit 带 `client_request_id = task_id`，崩溃后可反查补挂
-- [ ] **超时收口尝试上游取消**：poll 超时转 FAILURE 时调上游取消端点
-  （对照 flow.py:265 已有 TODO），取消成功即源头止损
+- [x] **失败单计费策略**：`finalize_task` FAILURE 分支按渠道 `failed_billing`：
+  `charge` 先查 `actual_amount_path` 实收 → 重估 → 冻结兜底后 settle；
+  `absorb`（默认）全额解冻 cancel
+- [x] **反向对账**：sweep `_reverse_reconcile` 抽查"本地 FAILURE/已退 但上游
+  SUCCESS"（每轮 `GW_REVERSE_RECONCILE_BATCH`=20、窗口 24h、单任务 1h 复查间隔）
+  → log.error + logfire 告警 + data 台账标记 `reconcile_alert`
+- [x] **孤儿任务**：sweep `_orphan_closeout` 检测 `ACTIVE 且 无 upstream_task_id
+  且超 GW_ORPHAN_GRACE_SECONDS`（600s，HELD 除外）→ FAILURE + 解冻；
+  根治：`client_request_id_param` 渠道配置位，submit 注入 task_id 供上游幂等反查
+- [x] **超时收口尝试上游取消**：渠道 `cancel_path` 配置位（`{upstream_task_id}`
+  占位）；用户取消 / 探测超时判死时尽力调用（失败仅告警不阻塞本地收口）
 
 ## P1 · [15] billing.rule 从 keypool 渠道元数据取，废弃 pricing-service
 
@@ -230,10 +246,10 @@ preflight 少一个 RTT，且定价从"按模型全局价"变"按渠道价"（�
 
 迁移波次（双读过渡，绝不静默改价）：
 
-- [ ] W-a：`quote_from_route` 上线，渠道无 rule 时回退 pricing-service
-  （临时路径 + logfire 计数"pricing 回退仍在发生"）
-- [ ] W-b：全部渠道在 keypool 补 `billing` 块，回退计数归零
-- [ ] W-c：删回退路径 + pricing-service 全部代码/配置/文档
+- [x] W-a/W-c 代码侧：pricing-service 依赖已全删（commit `c26616a`），
+  `billing.rule/discount_rate` 随 keypool 租约下发，网关本地求值（无回退路径）
+- [ ] W-b（仓库外运营项）：全部渠道在 keypool 补 `billing` 块——渠道配置工作，
+  在 new-api 渠道管理侧完成，非本仓库代码
 
 测试：渠道 rule 求值（函数形态 + 纯表达式兜底 + calulate 历史拼写兼容）；
 缺 rule → 502；discount_rate 必乘；settle 重估走渠道 rule；W-a 回退路径生效。
@@ -242,68 +258,70 @@ preflight 少一个 RTT，且定价从"按模型全局价"变"按渠道价"（�
 
 来源：2026-08-14 诊断报告"其他建议"1/2。
 
-- [ ] `GW_GATEWAY_PUBLIC_BASE_URL=http://127.0.0.1:8000` 是错的，应改为
-  `https://dev.aapi.cn`——当前 minimax 渠道 `supports_callback=false` 暂未受影响，
+- [x] `GW_GATEWAY_PUBLIC_BASE_URL` 已改 `https://dev.aapi.cn`（2026-08-17）——
+  当前 minimax 渠道 `supports_callback=false` 暂未受影响，
   但任何开启回调的渠道会把不可达的 127.0.0.1 回调地址注入上游
-- [ ] 占位密钥换强随机值：`GW_CALLBACK_SIGN_SECRET=change-me`、
-  `GW_TASKIQ_ADMIN_API_TOKEN=change-me`；`GW_KEY_SVC_TOKEN=change-me` 目前恰好
-  与 keypool AUTH_TOKEN 一致（故能工作），建议两边一起换
-- [ ] 检查清单沉淀：部署前校验脚本或 checklist 防"能跑但错值"类配置漂移
+- [x] 占位密钥换强随机值：`GW_CALLBACK_SIGN_SECRET`、`GW_KEY_SVC_TOKEN`
+  （.env.example 已换强随机样例；`GW_TASKIQ_ADMIN_API_TOKEN` 随 [11] 提供样例，
+  与看板侧 `TASKIQ_ADMIN_API_TOKEN` 一起配）
+- [ ] 检查清单沉淀：部署前校验脚本或 checklist 防"能跑但错值"类配置漂移（可选增强）
 
-## P2 · [9] logfire 排除 healthz 等噪音路由
+## P2 · [9] logfire 排除 healthz 等噪音路由——已实现（2026-08-17）
 
-- [ ] `app/config.py:38` 后新增 `logfire_excluded_urls`（默认
-  `/healthz/live,/healthz/ready,/ops/queue,/ops/requeue,/ops/dlq/replay`）
-- [ ] `app/main.py:47` `instrument_fastapi(app, excluded_urls=...)`
-- [ ] `.env.example` 加 `GW_LOGFIRE_EXCLUDED_URLS` 样例
-- [ ] 验证：50 次 healthz + 1 次业务请求，面板只剩业务 span
+- [x] `app/config.py` `logfire_excluded_urls`（默认
+  `/healthz/live,/healthz/ready,/ops/queue,/ops/requeue,/ops/dlq/replay,/ops/tasks`）
+- [x] `app/main.py` `instrument_fastapi(app, excluded_urls=...)`
+- [x] `.env.example` 加 `GW_LOGFIRE_EXCLUDED_URLS` 样例
+- [ ] 验证：50 次 healthz + 1 次业务请求，面板只剩业务 span（部署后顺手验证）
 
-## P2 · [10] 轮询降噪补强
+## P2 · [10] 轮询降噪补强——已实现（2026-08-17）
 
-- [ ] `app/services/statelog.py` 新增 `record_failure_escalated()`：Redis INCR 计数，
+- [x] `app/services/statelog.py` `record_failure_escalated()`：Redis INCR 计数，
   仅 {1,5,20} 档 log.warning + logfire.warn；`reset_failure()` 成功后清零
-- [ ] `app/services/polling.py:51,62` 两个 per-round `log.warning` 改走上面
-- [ ] （可选）`task_status_changed` 事件 attributes 补 biz/channel_id
-- [ ] 测试并入 `test_statelog_observability.py`：6 次连续失败 → 恰好 2 条事件；
+- [x] `app/services/polling.py` 租约失败/探测失败两个 per-round warning 改走升档
+- [ ] （可选）`task_status_changed` 事件 attributes 补 biz/channel_id（未做，可选）
+- [x] 测试并入 `test_statelog_observability.py`：6 次连续失败 → 恰好 2 条事件；
   成功后计数清零
-- [ ] 确认项（无需改）：statelog 唯一记录点、中间件成功路径 DEBUG、
+- [x] 确认项（无需改）：statelog 唯一记录点、中间件成功路径 DEBUG、
   reconcile `_watch_queue` 仅超阈值发事件 ✅
 
-## P2 · [18] 历史异常排查（tasks 表两条可疑记录）
+## P2 · [18] 历史异常排查（tasks 表两条可疑记录）——代码侧已核查（2026-08-17）
 
-来源：2026-08-14 诊断报告"其他建议"3（user_id=1, channel 5）。
-
-- [ ] `task timeout after 1440 minutes` 但创建后数秒即"超时"——排查轮询超时判定
-  的 created_at 秒/毫秒单位口径是否混用
+- [x] `task timeout after 1440 minutes` 但创建后数秒即"超时"——代码侧核查：
+  网关 `submit_time`/`created_at` 恒为 `int(time.time())` 秒级，age 计算
+  `time.time() - submit_time` 单位一致，无秒/毫秒混用；该记录为 new-api 侧
+  （Java）任务的口径问题，非本网关代码缺陷
 - [ ] `I/O error on POST request for "": Target host is not specified`（Java 风格报错，
-  疑似上游 relay 侧当时配置问题）——与 relay 维护方核对当时渠道配置
+  疑似上游 relay 侧当时配置问题）——**仓库外事项**：与 relay 维护方核对当时渠道配置
 
-## P2 · [19] GET 免费透传选渠道（model="" 一律 404）
+## P2 · [19] GET 免费透传选渠道（model="" 一律 404）——已实现（2026-08-17）
 
-来源：2026-08-14 诊断报告"其他建议"4。现状：GET 免费透传路径固定用
-`model=""` 选渠道，keypool 对空 model 返回 40010 → 一律 404 `unknown biz`。
+- [x] 方案落地：**按渠道反查**——`RouteConfig.channel_id` 记录构建来源渠道，
+  免费 GET 空 model 被 keypool 拒（40010）时，按进程缓存里该 biz 最近使用的
+  渠道 `channel_id` 直达 lease 钉回；缓存未命中维持 404
+- [x] 测试：空 model 40010 → 钉渠道直达成功透传；无缓存 → 404
 
-- [ ] 方案二选一：渠道/路由侧提供默认 model；或按 task_id 钉渠道反查
-- [ ] 与 [2] proxy GET 加 sk 校验的改动同文件（proxy.py），合并排期避免冲突
+## P3 · [11] taskiq-admin 看板——已实现（2026-08-17，方案订正）
 
-## P3 · [11] taskiq-admin 看板
+- [x] ~~`pyproject.toml` 加 `taskiq-admin`~~ **订正**：PyPI 无此包——官方形态是
+  独立镜像 `ghcr.io/taskiq-python/taskiq-admin:latest`；0.11 的 pip 包也未内置
+  上报中间件 → 按官方 API 契约自实现 `TaskiqAdminReportMiddleware`
+  （app/queue.py，**args/kwargs 脱敏不上报**——billing 参数含用户令牌；
+  配 `GW_TASKIQ_ADMIN_URL`+`GW_TASKIQ_ADMIN_API_TOKEN` 才挂接）
+- [x] `app/queue.py` broker 挂 `RedisAsyncResultBackend`（result_ex_time=86400
+  防膨胀；任务均返回 None，无敏感数据）
+- [x] `docker-compose.yml` + `docker-compose.dev.yml` 新增 taskiq-admin 服务，
+  端口只绑 127.0.0.1:3000，反代 basic auth 由部署侧加
+- [x] 回归：全量 pytest，`_retry_or_dlq` / `replay_dlq` 行为不变
+- [x] 职责划分：admin 看队列执行层，logfire 看业务语义层；`queue_stats()` 告警已有 ✅
 
-- [ ] `pyproject.toml` 加 `taskiq-admin`
-- [ ] `app/queue.py:127` broker 挂 `RedisAsyncResultBackend`（注意 result TTL 防膨胀；
-  任务均返回 None，无敏感数据）
-- [ ] `docker-compose.yml` + `docker-compose.dev.yml` 新增 taskiq-admin 服务，
-  端口只绑 127.0.0.1，反代 basic auth
-- [ ] 回归：全量 pytest，重点 `_retry_or_dlq` / `replay_dlq` 行为不变
-- [ ] 职责划分：admin 看队列执行层，logfire 看业务语义层；`queue_stats()` 告警已有
-  （reconcile `_watch_queue` ✅）
+## P3 · [12] scheduler 合并部署——已实现（2026-08-17）
 
-## P3 · [12] scheduler 合并部署
-
-- [ ] `docker-compose.yml:46-55` 删独立 scheduler 服务；worker command 改
+- [x] `docker-compose.yml` 删独立 scheduler 服务；worker command 改
   `sh -c "taskiq scheduler app.queue:scheduler & exec taskiq worker app.queue:broker --max-async-tasks 100"`
-- [ ] `docker-compose.dev.yml` 同步；`app/queue.py:11-13` 与 AGENTS.md 运行说明更新
-- [ ] 约束写注释：scheduler 必须单副本，worker 扩 replicas 时拆回独立服务
-- [ ] 验证：合并后 poll 重投 / settle 退避 / 每分钟 sweep 三链路事件齐全
+- [x] `docker-compose.dev.yml` 同步；`app/queue.py` 运行说明与 AGENTS.md 更新
+- [x] 约束写注释：scheduler 必须单副本，worker 扩 replicas 时拆回独立服务
+- [ ] 验证：合并后 poll 重投 / settle 退避 / 每分钟 sweep 三链路事件齐全（部署后顺手验证）
 
 ## P3 · [13] 运营项（非代码）
 

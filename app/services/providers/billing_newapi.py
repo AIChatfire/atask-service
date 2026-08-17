@@ -112,3 +112,22 @@ class NewapiBillingProvider:
                         request_id, resp.status_code, _err_body(resp))
             raise BillingError(resp.status_code, f"cancel {request_id}: {_err_body(resp)}")
         log.info("billing cancel ok: request_id={}", request_id)
+
+    async def renew(self, *, raw_token: str, request_id: str,
+                    ttl_seconds: int) -> dict:
+        """冻结续期：只推 expires_at 不动钱。返回 data（含新 expires_at）。"""
+        async with self._client() as client:
+            resp = await client.post(
+                "/api/v1/billing/renew",
+                headers={"Authorization": f"Bearer {raw_token}"},
+                json={"request_id": request_id, "ttl_seconds": ttl_seconds},
+            )
+        if resp.status_code != 200:
+            log.warning("billing renew rejected: request_id={} status={} body={}",
+                        request_id, resp.status_code, _err_body(resp))
+            raise BillingError(resp.status_code, f"renew {request_id}: {_err_body(resp)}")
+        data = resp.json()
+        payload = data.get("data", data)
+        log.info("billing renew ok: request_id={} expires_at={}",
+                 request_id, payload.get("expires_at") if isinstance(payload, dict) else None)
+        return payload if isinstance(payload, dict) else {}

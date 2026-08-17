@@ -49,8 +49,12 @@ class KeypoolProvider:
             return resp_json.get("data") or {}
         message = str(resp_json.get("message") or "keypool error")
         if code == 40001:
-            retry_ms = (resp_json.get("data") or {}).get("retry_after_ms")
-            raise KeyLeaseError(f"no available key ({ctx}); retry_after_ms={retry_ms}")
+            raw_ms = (resp_json.get("data") or {}).get("retry_after_ms")
+            retry_ms = int(raw_ms) if isinstance(raw_ms, int | float) else None
+            raise KeyLeaseError(
+                f"no available key ({ctx}); retry_after_ms={retry_ms}",
+                retry_after_ms=retry_ms,
+            )
         raise KeyLeaseError(f"keypool {ctx} failed: code={code} {message}")
 
     async def lease(self, biz: str, model: str = "", key_id: int | None = None,
@@ -76,7 +80,21 @@ class KeypoolProvider:
         if resp.status_code == 401:
             raise KeyLeaseError("keypool auth failed (check GW_KEY_SVC_TOKEN)")
         if resp.status_code != 200:
-            raise KeyLeaseError(f"keypool select failed: {resp.status_code} {resp.text[:200]}")
+            # 错误响应仍是统一包络（如 503 + code=40001 无可用 key）——解出
+            # data.retry_after_ms 作为结构化退避 hint（探测重投 / Retry-After 头）
+            retry_ms: int | None = None
+            try:
+                err_env = resp.json()
+            except Exception:
+                err_env = {}
+            if isinstance(err_env, dict):
+                raw_ms = (err_env.get("data") or {}).get("retry_after_ms")
+                if isinstance(raw_ms, int | float):
+                    retry_ms = int(raw_ms)
+            raise KeyLeaseError(
+                f"keypool select failed: {resp.status_code} {resp.text[:200]}",
+                retry_after_ms=retry_ms,
+            )
         data = self._unwrap(resp.json(), "select")
 
         key = data.get("key") or ""

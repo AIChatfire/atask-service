@@ -115,3 +115,37 @@ async def test_middleware_on_error_path(monkeypatch):
     await mw.pre_execute(msg)
     await mw.on_error(msg, _result(), ValueError("boom"))
     assert len(events) == 1 and events[0]["fields"]["error"] == "boom"
+
+
+# ---------------------------------------------------------------------------
+# 失败升档计数（轮询降噪补强）：仅 1/5/20 档产出事件，成功清零
+# ---------------------------------------------------------------------------
+
+
+async def test_failure_escalation_only_on_rungs(patch_redis, monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setitem(sys.modules, "logfire", _fake_logfire(calls))
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "logfire_enabled", True)
+
+    # 连续 6 次失败：恰好 2 条事件（count=1 与 count=5 两档）
+    for expected in range(1, 7):
+        count = await statelog.record_failure_escalated("poll:t-9", "probe boom")
+        assert count == expected
+    assert [c["fields"]["count"] for c in calls] == [1, 5]
+    assert all(c["event"] == "failure_escalated" for c in calls)
+
+    # 成功后清零：下一次失败从第 1 档重新升档
+    await statelog.reset_failure("poll:t-9")
+    count = await statelog.record_failure_escalated("poll:t-9", "probe boom again")
+    assert count == 1
+    assert len(calls) == 3
+
+
+async def test_failure_escalation_disabled_logfire_no_crash(patch_redis, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "logfire_enabled", False)
+    assert await statelog.record_failure_escalated("poll:t-10", "x") == 1
+    await statelog.reset_failure("poll:t-10")

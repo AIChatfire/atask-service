@@ -80,6 +80,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
                 "callback_url": None,
                 "freeze_amount": pf.amount,
                 "settled": pf.amount <= 0,
+                "freeze_expires_at": pf.freeze_expires_at,
                 "key_id": pf.key.key_id,
                 "key_index": pf.key.key_index,
                 "request_body": pf.body,
@@ -95,8 +96,19 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
         try:
             key_lease = await providers.keys.lease(biz, model="")
         except KeyLeaseError:
-            log.debug("free passthrough with unknown biz: {}", biz)
-            return JSONResponse(status_code=404, content={"error": f"unknown biz: {biz}"})
+            # 免费 GET 不带 model，keypool 空 model 返回 40010：回落为按进程缓存
+            # 里该 biz 最近使用的渠道 channel_id 直达反查（钉渠道）；缓存未命中才 404
+            cached = registry.get_cached(biz)
+            if not cached or not cached.channel_id:
+                log.debug("free passthrough with unknown biz: {}", biz)
+                return JSONResponse(status_code=404, content={"error": f"unknown biz: {biz}"})
+            try:
+                key_lease = await providers.keys.lease(
+                    biz, model="", key_id=cached.channel_id)
+            except KeyLeaseError:
+                log.debug("free passthrough pin-back failed: biz={} channel_id={}",
+                          biz, cached.channel_id)
+                return JSONResponse(status_code=404, content={"error": f"unknown biz: {biz}"})
         route = registry.remember(route_from_lease(biz, key_lease))
 
     client = upstream.client_for(route, key_lease)

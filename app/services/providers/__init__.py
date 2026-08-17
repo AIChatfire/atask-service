@@ -43,7 +43,15 @@ class PricingError(ProviderError):
 
 
 class KeyLeaseError(ProviderError):
-    """keypool 无可用 key / 服务故障（503 语义）。"""
+    """keypool 无可用 key / 服务故障（503 语义）。
+
+    ``retry_after_ms``：keypool 40001（无可用 key）给出的建议退避——探测重投
+    与 503 响应的 ``Retry-After`` 头都以此为 hint（缺省 None = 无建议）。
+    """
+
+    def __init__(self, message: str, *, retry_after_ms: int | None = None):
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
 
 
 # ---------------- 端口定义 ----------------
@@ -61,6 +69,11 @@ class BillingProvider(Protocol):
     async def settle(self, *, raw_token: str, request_id: str, actual_amount: float,
                      units: float | None = None, attrs: dict | None = None) -> None: ...
     async def cancel(self, *, raw_token: str, request_id: str) -> None: ...
+    async def renew(self, *, raw_token: str, request_id: str,
+                    ttl_seconds: int) -> dict:
+        """只推 expires_at、不动钱：冻结续期（HELD/长任务防 freeze 过期）。
+        400 = 冻结已终态/超总量上限（非重试，响应体带当前 status）；409/5xx 可重试。"""
+        ...
 
 
 class KeyProvider(Protocol):

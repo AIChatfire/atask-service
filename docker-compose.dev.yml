@@ -38,9 +38,11 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
 
-  worker:   # 探测/结算/通知任务执行器；多副本直接加 --max-async-tasks 或 replicas
+  worker:   # 探测/结算/通知执行器 + 内嵌 scheduler（延迟派发 + 每分钟 sweep）
     build: .
-    command: taskiq worker app.queue:broker --max-async-tasks 100
+    # scheduler 合并进 worker 进程（小规格形态）；**scheduler 必须单副本**——
+    # worker 扩 replicas 时把 scheduler 拆回独立服务（command: taskiq scheduler app.queue:scheduler）
+    command: sh -c "taskiq scheduler app.queue:scheduler & exec taskiq worker app.queue:broker --max-async-tasks 100"
     env_file: .env
     environment: *gwenv
     depends_on:
@@ -52,14 +54,15 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  scheduler:  # 延迟任务派发（探测退避/重试退避）+ 每分钟 sweep 补数巡检
-    build: .
-    command: taskiq scheduler app.queue:scheduler
-    env_file: .env
-    environment: *gwenv
+  taskiq-admin:  # 队列看板（任务执行层观测；业务语义层走 logfire）：只绑回环
+    image: ghcr.io/taskiq-python/taskiq-admin:latest
+    environment:
+      TASKIQ_ADMIN_API_TOKEN: ${GW_TASKIQ_ADMIN_API_TOKEN:-}
+    volumes:
+      - taskiq-admin-data:/usr/database/
+    ports:
+      - "127.0.0.1:3000:3000"     # 只绑 127.0.0.1；对外暴露请走反代 + basic auth
     depends_on:
-      redis:
-        condition: service_healthy
       worker:
         condition: service_started
     restart: unless-stopped
@@ -104,3 +107,4 @@ services:
 volumes:
   mysql-data:
   redis-data:
+  taskiq-admin-data:

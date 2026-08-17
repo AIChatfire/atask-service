@@ -11,7 +11,7 @@ from app.config import settings
 from app.logging import log
 from app.queue import schedule_poll
 from app.schemas import ACTIVE, FAILURE, TERMINAL
-from app.services import flow, providers, statelog, statusmap, taskstore, upstream
+from app.services import errclass, flow, providers, statelog, statusmap, taskstore, upstream
 from app.services.providers import KeyLeaseError
 from app.services.registry import registry, route_from_lease
 
@@ -39,6 +39,8 @@ async def poll_one(task_id: str) -> None:
     if age > settings.poll_max_age_seconds:
         log.warning("poll timeout, finalize FAILURE: task_id={} age={:.0f}s", task_id, age)
         await flow.finalize_task(task, FAILURE, {}, fail_reason="poll timeout (>24h)")
+        # 超时收口尽力调上游取消端点源头止损（渠道配 cancel_path 才动作）
+        await flow.try_upstream_cancel(task)
         return
 
     try:
@@ -47,8 +49,14 @@ async def poll_one(task_id: str) -> None:
             key_id=data.get("key_id"),
         )
     except KeyLeaseError as exc:
-        log.warning("probe {} key lease failed: {}", task_id, exc)
-        await schedule_poll(task_id, _next_delay(age))                   # 租约失败下轮再来
+        # 无可用 key：keypool 给出 retry_after_ms 时按 hint 拉长重投（退避升档兜底）；
+        # 每轮 warning 走失败升档计数（1/5/20 档才告警，其余 DEBUG）
+        delay = _next_delay(age)
+        if exc.retry_after_ms:
+            delay = max(delay, (exc.retry_after_ms + 999) // 1000)
+        await statelog.record_failure_escalated(
+            f"poll:{task_id}", f"lease failed, retry in {delay}s: {exc}")
+        await schedule_poll(task_id, delay)                            # 租约失败下轮再来
         return
     route = registry.remember(route_from_lease(biz, key))
     if not route.probe_path:
@@ -58,9 +66,24 @@ async def poll_one(task_id: str) -> None:
     try:
         resp = await upstream.probe(route, key, upstream_task_id)
     except Exception as exc:
-        log.warning("probe {} failed: {}", task_id, exc)
-        await schedule_poll(task_id, _next_delay(age))                   # 探测失败下轮再来
+        delay = _next_delay(age)
+        if isinstance(exc, upstream.UpstreamError):
+            category = errclass.classify(route, exc)
+            if category == errclass.KEY_LEVEL:
+                # key 级失效：上报驱动 keypool 禁用坏 key；下轮仍钉回 channel_id，
+                # 由 keypool 返回同渠道健康 key（key 时效轮换由此闭环）
+                await providers.keys.report(
+                    key, ok=False, status_code=exc.status, error=str(exc)[:200])
+            elif category == errclass.RATE_LIMITED and exc.retry_after_ms:
+                # 限流：不上报（不是 key 坏了），按上游 hint 拉长退避
+                delay = max(delay, (exc.retry_after_ms + 999) // 1000)
+            detail = f"{category}, retry in {delay}s: {exc}"
+        else:
+            detail = str(exc)
+        await statelog.record_failure_escalated(f"poll:{task_id}", detail)
+        await schedule_poll(task_id, delay)                            # 探测失败下轮再来
         return
+    await statelog.reset_failure(f"poll:{task_id}")                    # 探测成功清零失败计数
 
     upstream_status = upstream.extract_path(resp, route.status_path)
     mapped = statusmap.map_status(route, upstream_status)
