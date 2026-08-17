@@ -73,7 +73,8 @@ def test_classify_tolerates_malformed_codes(route_factory):
 # ---------------------------------------------------------------------------
 
 
-async def test_probe_429_parses_retry_after(respx_router, route_factory, key_lease_factory):
+async def test_probe_429_parses_retry_after(respx_router, route_factory, key_lease_factory,
+                                            patch_redis):
     from app.services import upstream
 
     route = route_factory()
