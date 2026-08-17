@@ -152,41 +152,41 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
                                                          client_request_id=pf.task_id)
         if resp is None:
             assert last_exc is not None
-            exc = last_exc
-            category = errclass.classify(route, exc)
+            err = last_exc      # except 块的 as 变量出块即被删除，换名引用
+            category = errclass.classify(route, err)
             if category == errclass.ACCOUNT_LEVEL:
                 # 账户级故障（欠费/封禁）：挂起而非判死——HELD 保留冻结，
                 # sweep 续期保活，补费后 resume_held 金丝雀排空（恢复时不钉渠道）。
                 # 挂起即释放并发槽；账户级不上报 keypool（不是单个 key 坏了）。
-                await taskstore.cas(pf.task_id, ACTIVE, HELD, fail_reason=str(exc)[:500])
+                await taskstore.cas(pf.task_id, ACTIVE, HELD, fail_reason=str(err)[:500])
                 await ratelimit.conc_release(pf.token.hash)
                 if pf.idem_key:
                     await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
                 await statelog.record_if_changed(pf.task_id, HELD, detail="submit")
                 log.warning("task HELD (account-level failure): task_id={} biz={} err={}",
-                            pf.task_id, route.biz, str(exc)[:200])
+                            pf.task_id, route.biz, str(err)[:200])
                 if settings.logfire_enabled:
                     try:
                         import logfire
 
                         logfire.warn("task_held", task_id=pf.task_id, biz=route.biz,
-                                     error=str(exc)[:200])
+                                     error=str(err)[:200])
                     except Exception:
                         pass
                 await queue.schedule_resume_held(60)
                 return {"task_id": pf.task_id, "status": QUEUED}   # 202，对外 queued
-            await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(exc)[:500])
+            await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(err)[:500])
             if pf.amount > 0:
                 await queue.publish_cancel(pf.task_id, pf.token.raw)
             await ratelimit.conc_release(pf.token.hash)
             await providers.keys.report(
                 key, ok=False,
-                status_code=0 if exc.envelope else exc.status,
-                error=str(exc)[:200],
+                status_code=0 if err.envelope else err.status,
+                error=str(err)[:200],
             )
             log.warning("upstream rejected at submit: task_id={} biz={} class={} err={}",
-                        pf.task_id, route.biz, category, str(exc)[:200])
-            raise HTTPException(502, f"upstream rejected: {exc}") from exc
+                        pf.task_id, route.biz, category, str(err)[:200])
+            raise HTTPException(502, f"upstream rejected: {err}") from err
         latency_ms = int((time.monotonic() - started) * 1000)
         await providers.keys.report(key, ok=True, latency_ms=latency_ms)
         if key.key_id != pf.key.key_id:

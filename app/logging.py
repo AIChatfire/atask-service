@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from types import FrameType
 
 from loguru import logger
 
@@ -45,7 +46,8 @@ class InterceptHandler(logging.Handler):
         except ValueError:
             level = record.levelno
         # depth=2：跳过 logging 帧，让 loguru 记录真实的调用位置
-        frame, depth = logging.currentframe(), 2
+        frame: FrameType | None = logging.currentframe()
+        depth = 2
         while frame and frame.f_code.co_filename == logging.__file__:
             frame = frame.f_back
             depth += 1
