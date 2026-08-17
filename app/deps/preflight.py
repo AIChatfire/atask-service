@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 
 from fastapi import Header, HTTPException, Request
@@ -138,8 +139,9 @@ async def preflight(
         # （终态清除；冻结 TTL 是资金兜底）
         await tokensession.store(task_id, token.raw)
         # 冻结到期时刻落 tasks.data：sweep 续期扫描（HELD/长任务防过期）依此判定
-        freeze_expires_at = int(frozen.get("expires_at") or 0) \
-            or int(time.time()) + settings.freeze_ttl_seconds
+        s = frozen.get("expires_at")
+        expires_at = int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else 0
+        freeze_expires_at = expires_at or int(time.time()) + settings.freeze_ttl_seconds
 
     return Preflight(
         biz=biz, route=route, token=token, identity=identity, quote=quote, key=key,
