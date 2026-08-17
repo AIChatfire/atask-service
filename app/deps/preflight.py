@@ -140,6 +140,7 @@ async def preflight(
         await tokensession.store(task_id, token.raw)
         # 冻结到期时刻落 tasks.data：sweep 续期扫描（HELD/长任务防过期）依此判定
         s = frozen.get("expires_at")
+        log.debug(s)
         expires_at = int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else 0
         freeze_expires_at = expires_at or int(time.time()) + settings.freeze_ttl_seconds
 
