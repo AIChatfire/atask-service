@@ -147,9 +147,6 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
     fwd_headers = _forward_headers(request, upstream.auth_headers(route, key_lease))
     content = await _request_content(request)
     req = client.build_request(request.method, f"/{path}", headers=fwd_headers, content=content)
-    log.debug(f"{fwd_headers}",)
-    log.debug(f"{content}",)
-    log.debug(f"{req}",)
 
     try:
         resp = await client.send(req, stream=True)
