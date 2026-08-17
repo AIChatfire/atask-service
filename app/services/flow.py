@@ -52,6 +52,10 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         task = await taskstore.get(pf.replay_task_id)
         if task:
             return public_view(task)
+        # 重放目标已不存在（行被清理）：preflight 重放短路未做 freeze/route，
+        # 不能 fall through（route=None 必撞 assert 500），显式 409 让客户端摘键重试
+        raise HTTPException(
+            409, "idempotent replay target missing; retry without Idempotency-Key")
     if pf.idem_key:
         existing = await idem.get_task_id(pf.token.hash, pf.idem_key)
         if existing:

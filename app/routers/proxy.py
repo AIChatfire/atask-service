@@ -8,7 +8,9 @@
 渠道、令牌会话取用对所有入口一视同仁，不为透传形态保留异构兼容路径。
 """
 
+import gzip
 import json
+import zlib
 
 import httpx
 from fastapi import APIRouter, Request
@@ -31,6 +33,7 @@ HOP_BY_HOP = {
     "authorization",   # 用户 sk 令牌绝不透传给上游
 }
 BUFFER_LIMIT = 256 * 1024   # 小响应缓冲上限，用于提取 upstream_task_id
+SMALL_BODY_LIMIT = 1_048_576  # 与 preflight JSON 解析上限一致
 
 
 def _forward_headers(request: Request, extra: dict) -> dict:
@@ -41,7 +44,33 @@ def _forward_headers(request: Request, extra: dict) -> dict:
         k: v for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP and k.lower() not in extra_lc
     }
-    return base | extra_lc
+    # 强制 identity：网关以 aiter_raw 原始字节回填解析（提取 upstream_task_id），
+    # 上游若 gzip 会让 json.loads 静默失败、丢轮询挂载；提交响应本身极小，无压缩收益
+    return base | extra_lc | {"accept-encoding": "identity"}
+
+
+async def _request_content(request: Request):
+    """转发体三态：小体读全带 Content-Length 直达（避免 chunked 被严格上游拒绝；
+    preflight 解析过 JSON 时 starlette 已缓存 body，此处零拷贝）、
+    大体流式（文件上传不进内存）、无体 None（GET 不发空 chunked）。"""
+    content_length = int(request.headers.get("content-length") or 0)
+    if 0 < content_length <= SMALL_BODY_LIMIT:
+        return await request.body()
+    if content_length > SMALL_BODY_LIMIT or "transfer-encoding" in request.headers:
+        return request.stream()
+    return None
+
+
+def _maybe_decompress(body: bytes, content_encoding: str) -> bytes:
+    """防御性解码：已强制 accept-encoding: identity，上游仍压缩时兜底"""
+    try:
+        if content_encoding == "gzip":
+            return gzip.decompress(body)
+        if content_encoding == "deflate":
+            return zlib.decompress(body)
+    except Exception:
+        pass
+    return body
 
 
 @router.api_route("/{biz}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -60,6 +89,10 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
             task = await taskstore.get(pf.replay_task_id)
             if task:
                 return JSONResponse(status_code=202, content=flow.public_view(task))
+            # 重放目标已不存在（行被清理）：preflight 重放短路未做 freeze/route，
+            # 不能 fall through（route=None 必撞 assert 500），显式 409 让客户端摘键重试
+            return JSONResponse(status_code=409, content={
+                "error": "idempotent replay target missing; retry without Idempotency-Key"})
         route = pf.route
         assert route is not None and pf.identity is not None and pf.key is not None
         await taskstore.create(
@@ -89,8 +122,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
         )
         log.info("proxy task created: task_id={} biz={} model={} path=/{}/{}",
                  pf.task_id, route.biz, pf.model, biz, path)
-        key_lease = pf.key
-        assert key_lease is not None
+        key_lease = pf.key   # 上方组合 assert 已收窄非 None
     else:
         await ip_rate_limit(request)
         try:
@@ -113,7 +145,8 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
 
     client = upstream.client_for(route, key_lease)
     fwd_headers = _forward_headers(request, upstream.auth_headers(route, key_lease))
-    req = client.build_request(request.method, f"/{path}", headers=fwd_headers, content=request.stream())
+    content = await _request_content(request)
+    req = client.build_request(request.method, f"/{path}", headers=fwd_headers, content=content)
 
     try:
         resp = await client.send(req, stream=True)
@@ -128,6 +161,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
     await upstream.breaker_report(biz, ok=resp.status_code < 500)
 
     out_headers = {k: v for k, v in resp.headers.items() if k.lower() not in HOP_BY_HOP}
+    content_encoding = resp.headers.get("content-encoding", "")
     buf = bytearray()
 
     async def stream_and_finalize():
@@ -135,18 +169,21 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
         try:
             async for chunk in resp.aiter_raw():
                 if len(buf) < BUFFER_LIMIT:
-                    buf.extend(chunk)
+                    buf.extend(chunk[: BUFFER_LIMIT - len(buf)])
                 yield chunk
         finally:
             await resp.aclose()
             if pf:
-                await _finalize_proxy(biz, route, pf, resp.status_code, bytes(buf))
+                await _finalize_proxy(biz, route, pf, resp.status_code, bytes(buf),
+                                      content_encoding)
 
     return StreamingResponse(stream_and_finalize(), status_code=resp.status_code, headers=out_headers)
 
 
-async def _finalize_proxy(biz, route, pf, status_code: int, body: bytes) -> None:
+async def _finalize_proxy(biz, route, pf, status_code: int, body: bytes,
+                          content_encoding: str = "") -> None:
     """透传结束后的收尾：成功则回填上游任务 ID 并接入状态闭环；失败则取消冻结"""
+    body = _maybe_decompress(body, content_encoding)
     if status_code >= 400:
         log.warning("proxy upstream rejected: task_id={} biz={} status={}",
                     pf.task_id, biz, status_code)
