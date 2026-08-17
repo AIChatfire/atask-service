@@ -1,4 +1,4 @@
-"""HTTP 客户端工厂：控制面（billing/pricing/keyman/配置中心）客户端按需挂 Logfire 埋点。
+"""HTTP 客户端工厂：控制面（billing/keypool 两微服务）客户端按需挂 Logfire 埋点。
 数据面（上游提交/探测）客户端不走这里 —— 探测调用高频，全量 trace 无意义，
 状态变化由 statelog 负责记录。
 """

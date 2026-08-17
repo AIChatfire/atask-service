@@ -2,7 +2,7 @@
 
 - ``get_settings()`` lru_cache 进程内单例；模块内一律
   ``from app.config import settings``，禁止散读 ``os.environ``；
-- 三个外部微服务的地址/凭证全部在这里（keypool / pricing / newapi-billing），
+- 两个外部微服务的地址/凭证全部在这里（keypool / newapi-billing），
   换实现只改 ``*_PROVIDER`` 选择子，见 ``app.services.providers``；
 - 逗号分隔序列字段（探测退避阶梯）兼容 ``5,15,30,120`` 与 JSON 数组两种写法。
 """

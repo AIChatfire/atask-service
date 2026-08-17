@@ -1,5 +1,13 @@
 # SPEC.md — async-gateway 多代理并行实现契约（单一事实源）
 
+> **⚠️ 历史文档（2026-08-17 标注）**：本 SPEC 对应旧 adapter 代架构
+> （`app/adapters/{kling,seedance}` + `callbacks/{dispatcher,receiver}` +
+> `billing/{outbox,renewer}` + pricing-service 缓存），该实现已下线
+> （现存于 `stash@{0}`，见 OPTIMIZATION_BACKLOG.md 头部订正）。
+> **现行同构架构以 README.md / AGENTS.md 为准**：pricing-service 已废弃
+> （计费规则 = keypool 渠道元数据 `billing.rule`，随租约下发本地求值），
+> 全文仅供参考，勿据以实现。
+>
 > 版本 v1.0（2026-08-12）。上游依据：`async_gateway_architecture.md` v2.1（下称「架构文档 §x」）、
 > `research/brief_c_newapi_tasks.md`（下称「简报 C」）、`research/brief_a_billing_and_apis.md`（简报 A）、
 > `research/brief_b_gateway_ha.md`（简报 B）。

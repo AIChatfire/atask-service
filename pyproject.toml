@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "atask-service"
 version = "0.2.0"
-description = "异步 AI 网关：动态路由 + keypool/pricing/newapi-billing 三微服务协同，配置驱动接入任意异步模型"
+description = "异步 AI 网关：动态路由 + keypool/newapi-billing 两微服务协同，配置驱动接入任意异步模型"
 requires-python = ">=3.12"
 dependencies = [
     # Web 框架与 ASGI 服务

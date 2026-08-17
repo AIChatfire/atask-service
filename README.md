@@ -5,14 +5,15 @@
 
 **核心特点**
 
-- **三微服务协同**：上游凭证与渠道配置走
-  [keypool-service](https://github.com/AIChatfire/keypool-service)，计费规则走
-  [pricing-service](https://github.com/AIChatfire/pricing-service)，资金走
+- **两微服务协同**：上游凭证、渠道配置与**计费规则**（渠道 gateway 块
+  `billing.rule`，随租约下发、网关本地沙箱求值）都走
+  [keypool-service](https://github.com/AIChatfire/keypool-service)，资金走
   [newapi-billing-service](https://github.com/AIChatfire/newapi-billing-service)；
   网关本身无状态（自有状态全在 Redis），零自有 MySQL 表（只读写 new-api
-  `tasks` 表）。
-- **傻瓜式模型接入**：接入新模型 = 在 new-api 建一个渠道 + 在 pricing 配一
-  条计费规则，**网关零代码改动、零路由文件**。
+  `tasks` 表）。~~pricing-service~~ 已废弃（定价从"按模型全局价"变
+  "按渠道价"，贴渠道成本）。
+- **傻瓜式模型接入**：接入新模型 = 在 new-api 建一个渠道 + 在渠道 gateway
+  块配 `billing` 计费规则，**网关零代码改动、零路由文件**。
 - **计费闭环**：提交顶格预估 freeze → 终态按实际用量 settle（多退少补）/
   cancel（全额解冻），全链路幂等。
 
@@ -23,9 +24,9 @@
           │  Authorization: Bearer sk-...（new-api 个人令牌）
           │
           ├─► newapi-billing-service   /api/v1/auth/inspect（身份内省）
-          │                            /api/v1/billing/freeze|settle|cancel
-          ├─► pricing-service          GET /v1/models/{model}（billing.rule 沙箱求值）
-          ├─► keypool-service          POST /v1/keys/select（租约+渠道全量元数据）
+          │                            /api/v1/billing/freeze|settle|cancel|renew
+          ├─► keypool-service          POST /v1/keys/select（租约+渠道全量元数据
+          │                            + billing 计费规则，本地沙箱求值零远程调用）
           │                            POST /v1/keys/report（用量/失败上报，驱动自动禁启）
           │
           ├─► 上游（minimax / seedance / kling / …）提交 + 探测/回调
@@ -33,7 +34,8 @@
           ├─► Redis（taskiq 队列、幂等键、令牌会话、熔断、缓存）
           └─► MySQL（new-api tasks 表，任务事实源）
 
-后台：taskiq worker（探测/结算/通知执行）+ taskiq scheduler（延迟派发 + 每分钟 sweep 补数）
+后台：taskiq worker（探测/结算/通知/HELD 排空执行 + 内嵌 scheduler 延迟派发与每分钟
+sweep 补数；scheduler 必须单副本，worker 扩副本时拆回独立服务）
 ```
 
 ## 傻瓜式接入新模型（3 步，网关零改动）
@@ -69,9 +71,18 @@
 }
 ```
 
-**② pricing-service 配计费规则**：`GET /v1/models/MiniMax-H3` 返回
-`billing.rule`（Python 函数 `calulate(request)`，返回 USD 金额）与
-`discountRate`（结算 = 规则值 × 折扣率）。
+**② 渠道配计费规则**：在上面同一块网关配置里加 `billing` 子块（规则唯一
+事实源 = keypool 渠道元数据，随租约下发，网关本地 asteval 沙箱求值，
+零额外远程调用；`rule` 为 Python 函数 `calulate(request)`，返回 USD 金额，
+结算 = 规则值 × `discount_rate`）：
+
+```json
+"billing": {
+  "rule": "def calulate(request):\n    return round(float(request.get('duration') or 5) * 0.026, 6)",
+  "type": "second",
+  "discount_rate": 1.0
+}
+```
 
 **③ 完成**。提交报文以用户请求体为基底原样透传（MiniMax 的
 `content[]` 多模态结构——t2va/i2va/首尾帧/r2va——无需网关理解），网关自动：
@@ -100,7 +111,7 @@
 - **幂等**：客户端 `Idempotency-Key` → 任务级去重（freeze 前短路，绝不重复
   冻结）；billing `request_id = task_id` 唯一约束兜底。
 - **结算三档**：`actual_amount_path`（上游实收）→ `settle_usage_map`
-  （按实际用量重跑 pricing 规则）→ 冻结金额兜底（绝不静默按 0 结算）。
+  （按实际用量重跑渠道计费规则）→ 冻结金额兜底（绝不静默按 0 结算）。
 - **用户令牌结算**：billing 只认用户令牌身份（跨用户 403）；冻结成功后令牌
   按 task_id 暂存 Redis（48h TTL，终态即清），Redis 丢失由 billing 冻结
   TTL 到期自动解冻兜底——资金不会锁死。

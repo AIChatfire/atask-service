@@ -10,7 +10,7 @@
 #   与环境变量。
 # - **零路由文件**：上游配置唯一事实源是 keypool 渠道元数据（group=biz 同名
 #   约定 + 渠道 setting.gateway 提取配置块），随租约实时下发。
-# - 三个外部微服务（keypool/pricing/newapi-billing）地址在 .env 配置。
+# - 两个外部微服务（keypool/newapi-billing）地址在 .env 配置。
 
 services:
   gateway:
@@ -52,7 +52,7 @@ services:
     volumes:
       - taskiq-admin-data:/usr/database/
     ports:
-      - "127.0.0.1:3000:3000"     # 只绑 127.0.0.1；对外暴露请走反代 + basic auth
+      - "127.0.0.1:3003:3000"     # 只绑 127.0.0.1；对外暴露请走反代 + basic auth
     depends_on:
       worker:
         condition: service_started
