@@ -63,9 +63,11 @@ async def test_keypool_lease_parses_full_channel(respx_router, test_settings):
     lease = await KeypoolProvider().lease("minimax", model="gpt-4o")
 
     # 请求契约：统一分组 keypool（GW_KEY_GROUP 默认）+ model + include_channel
+    # retry = keypool 服务侧内部重试深度（默认 1，对网关无影响）
     req_body = json.loads(route.calls.last.request.content)
     assert req_body["group"] == "keypool" and req_body["model"] == "gpt-4o"
     assert req_body["include_channel"] is True
+    assert req_body["retry"] == 1
     assert route.calls.last.request.headers["Authorization"] == "Bearer kp-token"
 
     # 响应契约：key/索引/指纹/租约 + 渠道全量覆盖字段

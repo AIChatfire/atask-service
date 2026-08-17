@@ -31,7 +31,7 @@
   （默认 `keypool`，`GW_KEY_GROUP` 可配）下，选渠道 = `select(group, model)`。
   **biz 从渠道取**（网关配置块 `biz` → 渠道 `name` → URL 段兜底），
   URL `/{biz}/` 只是入口标签。网关提取配置块可放 `header_override.upstream`
-  或 `setting.gateway`（三处等价、优先级从高到低；装配请求头时自动剥离嵌套块，
+  或 `setting.gateway`（两处等价、优先级从高到低；装配请求头时自动剥离嵌套块，
   不透出为 HTTP 头）：submit_path/probe_path/status_path/result_path/
   settle_usage_map、billing（rule/type/discount_rate）…。接入新模型 =
   渠道挂进分组 + 配 gateway 块 billing 计费规则，不改代码。
@@ -40,6 +40,9 @@
 - **计费纪律**：freeze 用渠道 billing.rule 顶格预估；settle 三档（actual_amount_path →
   settle_usage_map 重估 → 冻结兜底），绝不静默按 0 结算；settle/cancel 用**用户令牌**。
 - 错误响应统一 `{"error": {...}}`（app/errors.py 注册点）；内部状态常量以 app/schemas.py 为准。
+- 日志统一 loguru：业务模块 `from app.logging import log`，装配点 app/logging.py
+  （web 在 main、worker 在队列中间件 startup），级别 `GW_LOG_LEVEL`；
+  只支持同构任务（新建任务数据形态唯一），不再兼容旧版配置位/旧任务。
 - 配置全部环境变量 `GW_` 前缀（app/config.py；.env.example 为全量样例）。
 
 ## 红线

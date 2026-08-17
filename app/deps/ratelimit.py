@@ -1,14 +1,12 @@
 """限流（滑动窗口）与并发占用。计数键：计费接口按 token_hash，免费 GET 按 IP。"""
 
-import logging
 import time
 
 from fastapi import HTTPException, Request
 
 from app.config import settings
+from app.logging import log
 from app.redis import K_CONC, K_RL, LUA_CONC_ACQUIRE, LUA_CONC_RELEASE, LUA_RATE_LIMIT, r
-
-log = logging.getLogger("gateway.ratelimit")
 
 
 async def check_rate(subject: str) -> None:
@@ -44,4 +42,4 @@ async def conc_release(token_hash: str | None) -> None:
     try:
         await r.eval(LUA_CONC_RELEASE, 1, K_CONC.format(token_hash=token_hash))
     except Exception:
-        log.warning("conc release failed for %s", token_hash, exc_info=True)
+        log.opt(exception=True).warning("conc release failed for {}", token_hash)

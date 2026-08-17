@@ -9,23 +9,22 @@
   URL 段兜底；URL ``/{biz}/`` 只是入口标签，内部记录（tasks.data、回调
   路径、计费维度）一律用渠道给出的权威 biz。
 - **提取/推进配置也在渠道上**：渠道元数据里放一块网关配置——
-  ``header_override.upstream`` / ``setting.gateway`` / ``other.gateway``
-  三处等价任选（优先级从高到低），keypool 随租约下发
-  （``include_channel=true``），网关据此提交/探测/提取结果。
+  ``header_override.upstream`` / ``setting.gateway`` 两处等价任选
+  （优先级从高到低；只支持当前同构配置位，不再兼容旧版
+  ``other.gateway``），keypool 随租约下发（``include_channel=true``），
+  网关据此提交/探测/提取结果。
 - 进程内 TTL 缓存：每次租约解析后回填（remember）；callback 等无租约上下
   文先读缓存，未命中再按 channel_id 直达租约重建。
 """
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any
 
+from app.logging import log
 from app.schemas import KeyLease, RouteConfig
 from app.services.providers import KeyLeaseError, keys
-
-log = logging.getLogger("gateway.registry")
 
 #: 渠道 setting.gateway 缺省值——大多数 OpenAI-task 风格上游只需配 4 个路径
 _GATEWAY_DEFAULTS: dict[str, Any] = {
@@ -57,12 +56,12 @@ _GATEWAY_DEFAULTS: dict[str, Any] = {
 def route_from_channel(biz_hint: str, channel: dict[str, Any] | None) -> RouteConfig:
     """keypool 渠道元数据 → RouteConfig。
 
-    网关配置块来源（优先级从高到低，三处等价任选其一）：
+    网关配置块来源（优先级从高到低，两处等价任选其一；仅支持同构配置位，
+    不再兼容旧版 ``other.gateway``）：
 
     1. ``channel.header_override.upstream``（嵌套对象；装配请求头时会剥离，
        不会作为 HTTP 头透出，见 providers/keypool.py 与 upstream.auth_headers）；
-    2. ``channel.setting.gateway``；
-    3. ``channel.other.gateway``（旧版配置位兼容）。
+    2. ``channel.setting.gateway``。
 
     **biz 从渠道取**：配置块 ``biz`` 显式指定 → 渠道 ``name`` → ``biz_hint``
     （URL 段）兜底。``channel.base_url`` 作为 RouteConfig.upstream_base_url
@@ -70,13 +69,11 @@ def route_from_channel(biz_hint: str, channel: dict[str, Any] | None) -> RouteCo
     """
     channel = channel or {}
     setting = channel.get("setting") or {}
-    other = channel.get("other") or {}
     header_override = channel.get("header_override") or {}
     gw: dict[str, Any] = {}
     for candidate in (
         header_override.get("upstream"),
         setting.get("gateway"),
-        other.get("gateway"),
     ):
         if isinstance(candidate, dict) and candidate:
             gw = dict(candidate)
@@ -139,7 +136,7 @@ class RouteRegistry:
         try:
             lease = await keys.lease(biz, model=model, key_id=channel_id)
         except KeyLeaseError as exc:
-            log.warning("route resolve via keypool failed: biz=%s %s", biz, exc)
+            log.warning("route resolve via keypool failed: biz={} {}", biz, exc)
             return None
         return self.remember(route_from_lease(biz, lease))
 

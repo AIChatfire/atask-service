@@ -10,12 +10,9 @@ Redis 记录每个任务最近一次已上报的状态，变化才产出一条 t
 - 队列执行层（taskiq 中间件）不重复记录状态语义，只兜执行失败。
 """
 
-import logging
-
 from app.config import settings
+from app.logging import log
 from app.redis import r
-
-log = logging.getLogger("gateway.statelog")
 
 K_SEEN = "gw:status_seen:{task_id}"
 SEEN_TTL = 48 * 3600
@@ -30,7 +27,7 @@ async def record_if_changed(task_id: str, status: str, detail: str = "") -> bool
             return False
         await r.set(key, status, ex=SEEN_TTL)
     except Exception:
-        log.debug("statelog redis error", exc_info=True)
+        log.opt(exception=True).debug("statelog redis error")
         last = None
 
     if settings.logfire_enabled:
@@ -43,5 +40,5 @@ async def record_if_changed(task_id: str, status: str, detail: str = "") -> bool
             )
         except Exception:
             pass
-    log.info("task_status_changed: %s %s -> %s (%s)", task_id, last, status, detail)
+    log.info("task_status_changed: {} {} -> {} ({})", task_id, last, status, detail)
     return True

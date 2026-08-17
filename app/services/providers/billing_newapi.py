@@ -14,14 +14,11 @@ freeze 幂等：request_id 唯一索引，重复提交返回首次结果（不�
 
 from __future__ import annotations
 
-import logging
-
 from app.config import settings
+from app.logging import log
 from app.schemas import UserIdentity
 from app.services import httpc
 from app.services.providers import BillingError
-
-log = logging.getLogger("gateway.provider.billing")
 
 
 def _err_body(resp) -> str:
@@ -43,9 +40,11 @@ class NewapiBillingProvider:
                 headers={"Authorization": f"Bearer {raw_token}"},
             )
         if resp.status_code != 200:
+            log.debug("identity introspection rejected: status={}", resp.status_code)
             return None
         data = resp.json()
         if not data.get("valid"):
+            log.debug("identity introspection invalid token")
             return None
         return UserIdentity(user_id=int(data["user_id"]), token_id=int(data.get("token_id", 0)))
 
@@ -70,7 +69,11 @@ class NewapiBillingProvider:
             )
         if resp.status_code != 200:
             # 402 余额不足 / 409 锁竞争（可重试）/ 4xx 参数错误——状态码原样上抛
+            log.warning("billing freeze rejected: request_id={} status={} body={}",
+                        request_id, resp.status_code, _err_body(resp))
             raise BillingError(resp.status_code, _err_body(resp))
+        log.info("billing freeze ok: request_id={} amount={} metric={}",
+                 request_id, round(amount, 6), metric)
         data = resp.json()
         payload = data.get("data", data)
         if isinstance(payload, dict) and payload.get("error"):
@@ -91,7 +94,11 @@ class NewapiBillingProvider:
                 json=body,
             )
         if resp.status_code != 200:
+            log.warning("billing settle rejected: request_id={} status={} body={}",
+                        request_id, resp.status_code, _err_body(resp))
             raise BillingError(resp.status_code, f"settle {request_id}: {_err_body(resp)}")
+        log.info("billing settle ok: request_id={} actual_amount={}",
+                 request_id, round(actual_amount, 6))
 
     async def cancel(self, *, raw_token: str, request_id: str) -> None:
         async with self._client() as client:
@@ -101,4 +108,7 @@ class NewapiBillingProvider:
                 json={"request_id": request_id},
             )
         if resp.status_code != 200:
+            log.warning("billing cancel rejected: request_id={} status={} body={}",
+                        request_id, resp.status_code, _err_body(resp))
             raise BillingError(resp.status_code, f"cancel {request_id}: {_err_body(resp)}")
+        log.info("billing cancel ok: request_id={}", request_id)

@@ -5,14 +5,12 @@
 import hashlib
 import hmac
 import json
-import logging
 import time
 
 import httpx
 
 from app.config import settings
-
-log = logging.getLogger("gateway.notify")
+from app.logging import log
 
 
 class NotifyError(Exception):
@@ -41,3 +39,4 @@ async def push(url: str, payload: dict) -> None:
         )
     if resp.status_code >= 300:
         raise NotifyError(f"notify {url}: {resp.status_code}")
+    log.debug("notify pushed: {} -> {}", url, resp.status_code)

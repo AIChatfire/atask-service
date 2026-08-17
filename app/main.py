@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -22,9 +21,8 @@ from fastapi import FastAPI
 from app.config import settings
 from app.db import close_db
 from app.errors import register_exception_handlers
+from app.logging import log, setup_logging
 from app.services import upstream
-
-log = logging.getLogger("gateway.main")
 
 
 def _setup_logfire(app: FastAPI) -> None:
@@ -47,7 +45,7 @@ def _setup_logfire(app: FastAPI) -> None:
         )
         logfire.instrument_fastapi(app)
     except Exception:
-        log.warning("logfire setup failed, continue without it", exc_info=True)
+        log.opt(exception=True).warning("logfire setup failed, continue without it")
 
 
 @asynccontextmanager
@@ -65,7 +63,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    """应用工厂：观测初始化 → 异常处理器 → 路由注册（顺序不可换）。"""
+    """应用工厂：日志装配 → 观测初始化 → 异常处理器 → 路由注册（顺序不可换）。"""
+    setup_logging()
     app = FastAPI(title="atask-service", lifespan=lifespan)
 
     _setup_logfire(app)

@@ -24,6 +24,8 @@ dependencies = [
     # 异步任务队列（探测/结算/通知/补数）
     "taskiq==0.11.18",
     "taskiq-redis==1.0.2",
+    # 日志（loguru 统一装配，见 app/logging.py）
+    "loguru==0.7.3",
     # 观测
     "logfire==3.25.0",
     # logfire.instrument_* 依赖的 OTel instrumentation 包（版本对齐 logfire 3.25.0

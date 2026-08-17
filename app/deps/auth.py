@@ -4,17 +4,15 @@
 
 import hashlib
 import json
-import logging
 from dataclasses import dataclass
 
 from fastapi import Header, HTTPException
 
 from app.config import settings
+from app.logging import log
 from app.redis import K_INSPECT, r
 from app.schemas import UserIdentity
 from app.services.providers import billing
-
-log = logging.getLogger("gateway.auth")
 
 
 @dataclass
@@ -46,4 +44,5 @@ async def resolve_identity(ctx: TokenCtx) -> UserIdentity:
     if identity is None:
         raise HTTPException(401, "invalid or expired token")
     await r.set(key, identity.model_dump_json(), ex=settings.auth_cache_ttl)
+    log.debug("identity introspected: user_id={} token_id={}", identity.user_id, identity.token_id)
     return identity

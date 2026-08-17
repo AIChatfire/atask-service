@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,9 +32,8 @@ from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_redis import ListQueueBroker, RedisScheduleSource
 
 from app.config import settings
+from app.logging import log, setup_logging
 from app.redis import S_DLQ, r
-
-log = logging.getLogger("gateway.queue")
 
 QUEUE_NAME = "gw:taskiq"
 SCHED_PREFIX = "gw:sched"
@@ -68,7 +66,8 @@ class ObservabilityMiddleware(TaskiqMiddleware):
         self._started: dict[str, float] = {}
 
     async def startup(self) -> None:
-        """worker 进程启动：配置 logfire（web 进程由 app.main 装配）。"""
+        """worker 进程启动：装配 loguru（web 进程由 app.main 装配）+ logfire。"""
+        setup_logging()
         if not settings.logfire_enabled:
             return
         try:
@@ -86,7 +85,7 @@ class ObservabilityMiddleware(TaskiqMiddleware):
                 console=False,
             )
         except Exception:
-            log.warning("logfire setup failed in worker", exc_info=True)
+            log.opt(exception=True).warning("logfire setup failed in worker")
 
     async def pre_execute(self, message: TaskiqMessage) -> TaskiqMessage:
         self._started[message.task_id] = time.monotonic()
@@ -104,7 +103,7 @@ class ObservabilityMiddleware(TaskiqMiddleware):
         if result.is_err:
             self._emit_failure(message, result.error, duration)
         else:
-            log.debug("taskiq %s ok in %.2fs", message.task_name, duration)
+            log.debug("taskiq {} ok in {:.2f}s", message.task_name, duration)
 
     async def on_error(self, message: TaskiqMessage, result: TaskiqResult[Any],
                        exception: BaseException) -> None:
@@ -114,7 +113,7 @@ class ObservabilityMiddleware(TaskiqMiddleware):
     def _emit_failure(message: TaskiqMessage, error: BaseException | None,
                       duration: float) -> None:
         attempts = int(message.labels.get("attempts", 0)) if message.labels else 0
-        log.error("taskiq %s failed in %.2fs (attempts=%s): %s",
+        log.error("taskiq {} failed in {:.2f}s (attempts={}): {}",
                   message.task_name, duration, attempts, error)
         _logfire_event(
             "error", "taskiq_task_failed",
@@ -146,9 +145,10 @@ async def _retry_or_dlq(name: str, kicker, context: Context, args: tuple) -> Non
             "payload": json.dumps({"args": list(args)}, ensure_ascii=False),
             "attempts": str(attempts),
         })
-        log.error("task %s moved to DLQ: %s", name, args)
+        log.error("task {} moved to DLQ (attempts={})", name, attempts)
         return
-    log.warning("task %s retry #%s: %s", name, attempts, args)
+    # 注意：args 不落日志——billing 任务参数含用户令牌（DLQ payload 存 Redis 供重放）
+    log.warning("task {} retry #{}", name, attempts)
     await kicker.with_labels(attempts=attempts).schedule_by_time(
         schedule_source, _at(_backoff(attempts)), *args,
     )
@@ -171,14 +171,14 @@ async def billing_settle_task(request_id: str, actual_amount: float, user_sk: st
     except BillingError as exc:
         if not exc.retryable:
             # 4xx 确定性失败（冻结已过期/已结算/跨用户）：收口不重试
-            log.error("billing_settle terminal failure %s: %s", request_id, exc.message)
+            log.error("billing_settle terminal failure {}: {}", request_id, exc.message)
             await taskstore.mark_settled(request_id, actual_amount)
             return
-        log.exception("billing_settle failed: %s", request_id)
+        log.exception("billing_settle failed: {}", request_id)
         await _retry_or_dlq("BILLING_SETTLE", billing_settle_task.kicker(), context,
                             (request_id, actual_amount, user_sk, units, attrs))
     except Exception:
-        log.exception("billing_settle failed: %s", request_id)
+        log.exception("billing_settle failed: {}", request_id)
         await _retry_or_dlq("BILLING_SETTLE", billing_settle_task.kicker(), context,
                             (request_id, actual_amount, user_sk, units, attrs))
 
@@ -193,14 +193,14 @@ async def billing_cancel_task(request_id: str, user_sk: str,
         await taskstore.mark_settled(request_id, 0)
     except BillingError as exc:
         if not exc.retryable:
-            log.error("billing_cancel terminal failure %s: %s", request_id, exc.message)
+            log.error("billing_cancel terminal failure {}: {}", request_id, exc.message)
             await taskstore.mark_settled(request_id, 0)
             return
-        log.exception("billing_cancel failed: %s", request_id)
+        log.exception("billing_cancel failed: {}", request_id)
         await _retry_or_dlq("BILLING_CANCEL", billing_cancel_task.kicker(), context,
                             (request_id, user_sk))
     except Exception:
-        log.exception("billing_cancel failed: %s", request_id)
+        log.exception("billing_cancel failed: {}", request_id)
         await _retry_or_dlq("BILLING_CANCEL", billing_cancel_task.kicker(), context,
                             (request_id, user_sk))
 
@@ -212,7 +212,7 @@ async def notify_task(task_id: str, url: str, payload: dict,
     try:
         await notify.push(url, payload)
     except Exception:
-        log.exception("notify failed: %s -> %s", task_id, url)
+        log.exception("notify failed: {} -> {}", task_id, url)
         await _retry_or_dlq("NOTIFY", notify_task.kicker(), context, (task_id, url, payload))
 
 
@@ -222,7 +222,7 @@ async def poll_task(task_id: str, context: Context = TaskiqDepends()) -> None:
     try:
         await poll_one(task_id)
     except Exception:
-        log.exception("poll failed: %s", task_id)
+        log.exception("poll failed: {}", task_id)
         await _retry_or_dlq("POLL", poll_task.kicker(), context, (task_id,))
 
 
@@ -233,21 +233,26 @@ async def sweep_task() -> None:
 
 
 # ---------------- 发布门面（请求路径只依赖这里） ----------------
+# 纪律：user_sk 只作为任务参数传递，绝不进日志。
 
 async def publish_settle(request_id: str, actual_amount: float, user_sk: str,
                          units: float | None = None, attrs: dict | None = None) -> None:
+    log.debug("publish settle: {} amount={} units={}", request_id, actual_amount, units)
     await billing_settle_task.kiq(request_id, actual_amount, user_sk, units, attrs)
 
 
 async def publish_cancel(request_id: str, user_sk: str) -> None:
+    log.debug("publish cancel: {}", request_id)
     await billing_cancel_task.kiq(request_id, user_sk)
 
 
 async def publish_notify(task_id: str, url: str, payload: dict) -> None:
+    log.debug("publish notify: {} -> {}", task_id, url)
     await notify_task.kiq(task_id, url, payload)
 
 
 async def schedule_poll(task_id: str, delay: int | float) -> None:
+    log.debug("schedule poll: {} in {}s", task_id, delay)
     await poll_task.kicker().schedule_by_time(schedule_source, _at(delay), task_id)
 
 
@@ -291,5 +296,5 @@ async def replay_dlq(limit: int = 100) -> int:
         await r.xdel(S_DLQ, msg_id)
         replayed += 1
     if replayed:
-        log.warning("replayed %d DLQ entries", replayed)
+        log.warning("replayed {} DLQ entries", replayed)
     return replayed

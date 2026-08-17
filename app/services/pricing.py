@@ -1,7 +1,7 @@
 """计费规则求值：规则唯一事实源 = **keypool 渠道元数据**。
 
-渠道 gateway 配置块（``header_override.upstream`` / ``setting.gateway`` /
-``other.gateway``，三处等价）携带 ``billing`` 子块::
+渠道 gateway 配置块（``header_override.upstream`` / ``setting.gateway``，
+两处等价）携带 ``billing`` 子块::
 
     "billing": {
         "rule": "def calulate(request):\\n    return float(request.get('duration') or 5) * 0.026",
@@ -22,14 +22,10 @@
 
 from __future__ import annotations
 
-import logging
-
 import asteval
 
 from app.schemas import Quote, RouteConfig
 from app.services.providers import PricingError
-
-log = logging.getLogger("gateway.pricing")
 
 _FN_NAMES = ("calulate", "calculate", "calc", "compute", "price")
 

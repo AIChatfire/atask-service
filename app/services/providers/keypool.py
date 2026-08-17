@@ -7,6 +7,9 @@
   ``channel_id`` 直达）；``include_channel=true`` 让响应附带渠道全量元数据
   （model_mapping/param_override/header_override/status_code_mapping/
   setting.proxy/openai_organization/base_url）——网关零配置消费渠道差异。
+  ``retry`` 为**服务侧内部重试深度**（选 key 失败时 keypool 内部换 key 重试
+  的次数）：默认 1 即可——网关自身另有租约失败重试与探测重投，两层语义
+  互不冲突，该值对网关无影响。
 - ``POST {BASE}/v1/keys/report``：上报调用结果驱动自动禁启；
   ``Idempotency-Key`` 头幂等，重复上报 409 视为成功；fire-and-forget。
 
@@ -17,16 +20,18 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
 from typing import Any
 
 from app.config import settings
+from app.logging import log
 from app.schemas import KeyLease
 from app.services import httpc
 from app.services.providers import KeyLeaseError
 
-log = logging.getLogger("gateway.provider.keypool")
+#: select 内部重试深度（keypool 服务侧换 key 重试次数；网关自身有租约失败
+#: 重试与探测重投，默认 1 对网关无影响，见模块 docstring）
+_SELECT_RETRY = 1
 
 # fire-and-forget 上报任务引用集（防 GC 提前回收，RUF006）
 _BACKGROUND: set[asyncio.Task] = set()
@@ -56,7 +61,7 @@ class KeypoolProvider:
         ``group+model`` 经 abilities 分档加权选择。``group`` 缺省取
         ``GW_KEY_GROUP``（统一分组，默认 "keypool"）。
         """
-        body: dict[str, Any] = {"retry": 0, "include_channel": True}
+        body: dict[str, Any] = {"retry": _SELECT_RETRY, "include_channel": True}
         if key_id:
             body["channel_id"] = key_id
         else:
@@ -78,6 +83,11 @@ class KeypoolProvider:
         if not key:
             raise KeyLeaseError(f"keypool returned no key: {str(data)[:200]}")
         channel = data.get("channel") or {}
+        log.debug(
+            "key lease acquired: biz={} channel_id={} key_index={} base_url={}",
+            biz, data.get("channel_id") or channel.get("id"), data.get("key_index"),
+            data.get("base_url") or channel.get("base_url"),
+        )
         setting = channel.get("setting") or {}
         # header_override 里允许嵌套配置块（upstream 网关配置，见 registry）：
         # 装配 KeyLease 时剥离一切非标量值，保证下游拿到的是纯 HTTP 头
@@ -130,7 +140,7 @@ class KeypoolProvider:
                         json=body,
                     )
             except Exception:
-                log.debug("key report failed", exc_info=True)
+                log.opt(exception=True).debug("key report failed")
 
         task = asyncio.create_task(_send())
         _BACKGROUND.add(task)

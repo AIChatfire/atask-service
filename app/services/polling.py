@@ -5,17 +5,15 @@
 
 from __future__ import annotations
 
-import logging
 import time
 
 from app.config import settings
+from app.logging import log
 from app.queue import schedule_poll
 from app.schemas import ACTIVE, FAILURE, TERMINAL
 from app.services import flow, providers, statelog, statusmap, taskstore, upstream
 from app.services.providers import KeyLeaseError
 from app.services.registry import registry, route_from_lease
-
-log = logging.getLogger("gateway.polling")
 
 
 def _next_delay(age_seconds: float) -> int:
@@ -39,6 +37,7 @@ async def poll_one(task_id: str) -> None:
 
     age = time.time() - (task.get("submit_time") or time.time())
     if age > settings.poll_max_age_seconds:
+        log.warning("poll timeout, finalize FAILURE: task_id={} age={:.0f}s", task_id, age)
         await flow.finalize_task(task, FAILURE, {}, fail_reason="poll timeout (>24h)")
         return
 
@@ -48,23 +47,25 @@ async def poll_one(task_id: str) -> None:
             key_id=data.get("key_id"),
         )
     except KeyLeaseError as exc:
-        log.warning("probe %s key lease failed: %s", task_id, exc)
+        log.warning("probe {} key lease failed: {}", task_id, exc)
         await schedule_poll(task_id, _next_delay(age))                   # 租约失败下轮再来
         return
     route = registry.remember(route_from_lease(biz, key))
     if not route.probe_path:
-        log.error("biz=%s channel setting.gateway.probe_path missing, cannot probe", biz)
+        log.error("biz={} channel setting.gateway.probe_path missing, cannot probe", biz)
         return
 
     try:
         resp = await upstream.probe(route, key, upstream_task_id)
     except Exception as exc:
-        log.warning("probe %s failed: %s", task_id, exc)
+        log.warning("probe {} failed: {}", task_id, exc)
         await schedule_poll(task_id, _next_delay(age))                   # 探测失败下轮再来
         return
 
     upstream_status = upstream.extract_path(resp, route.status_path)
     mapped = statusmap.map_status(route, upstream_status)
+    log.debug("probe result: task_id={} upstream_status={} mapped={}",
+              task_id, upstream_status, mapped)
 
     if mapped is not None:
         await statelog.record_if_changed(task_id, mapped, detail="poll")

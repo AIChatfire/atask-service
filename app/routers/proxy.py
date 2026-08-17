@@ -2,10 +2,13 @@
 - GET/HEAD/OPTIONS：免费透传（按 IP 限流），不产生任务
 - 其余方法：计费透传（preflight），同样落 tasks 行，结算走 callback/poll/sweeper 闭环
 - 全程流式：大文件不进内存；剥离 hop-by-hop 头
+
+同构约定：计费透传落下的 tasks 行与 flow.create_task **同一份数据形态**
+（biz/model/key_index/request_body 全量快照）——终态结算重估、探测钉回
+渠道、令牌会话取用对所有入口一视同仁，不为透传形态保留异构兼容路径。
 """
 
 import json
-import logging
 
 import httpx
 from fastapi import APIRouter, Request
@@ -14,12 +17,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app import queue
 from app.deps.preflight import preflight
 from app.deps.ratelimit import ip_rate_limit
+from app.logging import log
 from app.schemas import ACTIVE, FAILURE, QUEUED
 from app.services import flow, providers, taskstore, upstream
 from app.services.providers import KeyLeaseError
 from app.services.registry import registry, route_from_lease
 
-log = logging.getLogger("gateway.proxy")
 router = APIRouter()
 
 HOP_BY_HOP = {
@@ -46,7 +49,13 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
     billable = request.method not in ("GET", "HEAD", "OPTIONS")
     pf = None
     if billable:
-        pf = await preflight(biz, request)     # 内含鉴权+计费+freeze+key租约+路由构建
+        # 直接调用依赖函数（非 Depends 注入）：Header 默认值必须显式传入，
+        # 否则拿到的是 Header(None) 声明对象而非真实头值
+        pf = await preflight(
+            biz, request,
+            authorization=request.headers.get("authorization"),
+            idempotency_key=request.headers.get("idempotency-key"),
+        )
         if pf.replay_task_id:                  # 幂等重放：直接回放首个任务，不重复透传
             task = await taskstore.get(pf.replay_task_id)
             if task:
@@ -59,11 +68,26 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
             channel_id=pf.key.key_id,
             action="proxy",
             data={
-                "biz": biz, "source": "proxy", "token_hash": pf.token.hash,
-                "freeze_amount": pf.amount, "settled": pf.amount <= 0,
-                "key_id": pf.key.key_id, "proxy_path": path,
+                # 与 flow.create_task 同构的任务记录：权威 biz 取渠道元数据，
+                # model/key_index/request_body 全量落（结算重估与探测钉回的事实源）
+                "biz": route.biz,
+                "source": "proxy",
+                "model": pf.model,
+                "token_hash": pf.token.hash,
+                "idempotency_key": pf.idem_key,
+                # 透传形态不接管用户回调：原始 body 已流式直达上游（含用户
+                # 自带 callback_url），网关再 notify 会重复投递
+                "callback_url": None,
+                "freeze_amount": pf.amount,
+                "settled": pf.amount <= 0,
+                "key_id": pf.key.key_id,
+                "key_index": pf.key.key_index,
+                "request_body": pf.body,
+                "proxy_path": path,
             },
         )
+        log.info("proxy task created: task_id={} biz={} model={} path=/{}/{}",
+                 pf.task_id, route.biz, pf.model, biz, path)
         key_lease = pf.key
         assert key_lease is not None
     else:
@@ -71,6 +95,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
         try:
             key_lease = await providers.keys.lease(biz, model="")
         except KeyLeaseError:
+            log.debug("free passthrough with unknown biz: {}", biz)
             return JSONResponse(status_code=404, content={"error": f"unknown biz: {biz}"})
         route = registry.remember(route_from_lease(biz, key_lease))
 
@@ -82,6 +107,7 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
         resp = await client.send(req, stream=True)
     except httpx.HTTPError as exc:
         await upstream.breaker_report(biz, ok=False)
+        log.warning("proxy upstream unreachable: biz={} path=/{} err={}", biz, path, exc)
         if pf:
             await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(exc)[:500])
             if pf.amount > 0:
@@ -110,6 +136,8 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
 async def _finalize_proxy(biz, route, pf, status_code: int, body: bytes) -> None:
     """透传结束后的收尾：成功则回填上游任务 ID 并接入状态闭环；失败则取消冻结"""
     if status_code >= 400:
+        log.warning("proxy upstream rejected: task_id={} biz={} status={}",
+                    pf.task_id, biz, status_code)
         await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=f"upstream {status_code}: {body[:400]!r}")
         if pf.amount > 0:
             await queue.publish_cancel(pf.task_id, pf.token.raw)
@@ -121,6 +149,8 @@ async def _finalize_proxy(biz, route, pf, status_code: int, body: bytes) -> None
     except json.JSONDecodeError:
         parsed = {}
     await taskstore.patch_data(pf.task_id, {"upstream_task_id": upstream_task_id}, status=QUEUED)
+    log.info("proxy submitted: task_id={} upstream_task_id={} status={}",
+             pf.task_id, upstream_task_id, status_code)
     if not route.supports_callback and upstream_task_id:
         await queue.schedule_poll(pf.task_id, 5)
     # 注意：同步 2xx 不直接 settle —— 视频任务为异步，统一由 callback/poll/sweeper 闭环结算，

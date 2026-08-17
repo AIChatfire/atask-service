@@ -97,11 +97,11 @@ def test_route_from_channel_defaults_when_no_gateway_block():
     assert route.upstream_base_url == "https://api.minimaxi.com"
 
 
-def test_route_from_channel_other_gateway_fallback():
-    """兼容渠道 other.gateway（旧版配置位）。"""
+def test_route_from_channel_other_gateway_ignored():
+    """旧版配置位 other.gateway 不再兼容：同构任务只认两处等价配置源。"""
     route = route_from_channel("minimax", {
         "id": 7, "other": {"gateway": {"submit_path": "/x"}}})
-    assert route.submit_path == "/x"
+    assert route.submit_path == ""
 
 
 # ---- header_override.upstream 配置源（与 setting.gateway 等价，优先级最高）----

@@ -8,19 +8,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.logging import log
 from app.redis import K_CB, r
 from app.schemas import ACTIVE, TERMINAL
 from app.services import flow, providers, statelog, statusmap, taskstore, upstream
 from app.services.providers import KeyLeaseError
 from app.services.registry import registry, route_from_lease
 
-log = logging.getLogger("gateway.callback")
 router = APIRouter()
 
 
@@ -51,12 +50,13 @@ async def receive_callback(biz: str, task_id: str, request: Request):
                 key_id=task.get("channel_id") or None,
             )
         except KeyLeaseError as exc:
-            log.warning("callback route resolve failed: %s", exc)
+            log.warning("callback route resolve failed: {}", exc)
             return JSONResponse(status_code=503, content={"status": "route_unavailable"})
         route = registry.remember(route_from_lease(biz, key))
 
     raw = await request.body()
     if not _verify(route.callback_secret, route.callback_sig_header, request.headers, raw):
+        log.warning("callback invalid signature: biz={} task_id={}", biz, task_id)
         return JSONResponse(status_code=401, content={"status": "invalid_signature"})
     try:
         payload = json.loads(raw or b"{}")
@@ -70,6 +70,8 @@ async def receive_callback(biz: str, task_id: str, request: Request):
 
     upstream_status = upstream.extract_path(payload, route.status_path)
     mapped = statusmap.map_status(route, upstream_status)
+    log.info("callback received: biz={} task_id={} upstream_status={} mapped={}",
+             biz, task_id, upstream_status, mapped)
 
     if mapped is not None:
         await statelog.record_if_changed(task_id, mapped, detail="callback")

@@ -21,15 +21,13 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import httpx
 
+from app.logging import log
 from app.redis import K_BREAKER, r
 from app.schemas import KeyLease, RouteConfig
-
-log = logging.getLogger("gateway.upstream")
 
 BREAKER_THRESHOLD = 10        # 30s 内失败 10 次熔断
 BREAKER_WINDOW = 30
@@ -136,6 +134,7 @@ def build_submit_body(route: RouteConfig, key: KeyLease, body: dict,
 async def breaker_guard(biz: str) -> None:
     failures = await r.get(K_BREAKER.format(biz=biz))
     if failures and int(failures) >= BREAKER_THRESHOLD:
+        log.warning("upstream circuit open: biz={} failures={}", biz, failures)
         raise BreakerOpenError(f"upstream {biz} circuit open")
 
 

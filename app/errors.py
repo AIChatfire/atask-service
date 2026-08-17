@@ -61,9 +61,9 @@ async def validation_exception_handler(_request: Request, exc: Exception) -> JSO
 
 
 async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
-    import logging
+    from app.logging import log
 
-    logging.getLogger("gateway.errors").exception("unhandled: %s", exc)
+    log.exception("unhandled: {}", exc)
     return JSONResponse(
         status_code=500,
         content=error_body("internal server error", "server_error"),

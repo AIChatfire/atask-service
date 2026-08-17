@@ -7,7 +7,6 @@ freeze → 令牌暂存。
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
 from dataclasses import dataclass, field
 
@@ -16,6 +15,7 @@ from fastapi import Header, HTTPException, Request
 from app.config import settings
 from app.deps import ratelimit
 from app.deps.auth import TokenCtx, extract_token, resolve_identity
+from app.logging import log
 from app.schemas import KeyLease, Quote, RouteConfig, UserIdentity
 from app.services import providers, tokensession
 from app.services.pricing import quote_from_route
@@ -25,8 +25,6 @@ from app.services.providers import (
     PricingError,
 )
 from app.services.registry import registry, route_from_lease
-
-log = logging.getLogger("gateway.preflight")
 
 
 @dataclass
@@ -105,9 +103,12 @@ async def preflight(
     try:
         quote = quote_from_route(route, body)
     except PricingError as exc:
+        log.error("billing rule error: biz={} model={} err={}", biz, model, exc)
         raise HTTPException(500, f"billing rule error: {exc}") from exc
 
     task_id = uuid.uuid4().hex
+    log.debug("preflight: biz={} model={} user_id={} channel_id={} quote={} {}",
+              route.biz, model, identity.user_id, key.key_id, quote.amount, quote.metric)
 
     # 同步预冻结（金额 > 0 才计费；freeze 即第二重身份校验）
     if quote.amount > 0:
@@ -123,8 +124,9 @@ async def preflight(
             )
         except BillingError as exc:
             raise HTTPException(exc.status, exc.message) from exc
-        # 终态 settle/cancel 仍须用户令牌（billing 只认令牌身份）：
-        # 按 task_id 暂存 Redis（终态清除；冻结 TTL 是资金兜底）
+        # 终态 settle/cancel 仍须用户令牌（billing 只认令牌身份；new-api 渠道侧
+        # 轮询不带 sk）——按 task_id 暂存 Redis 作为唯一的 taskid→token 查询处
+        # （终态清除；冻结 TTL 是资金兜底）
         await tokensession.store(task_id, token.raw)
 
     return Preflight(

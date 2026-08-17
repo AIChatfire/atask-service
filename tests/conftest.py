@@ -91,6 +91,13 @@ class FakeRedis:
         self._expires[key] = time.time() + seconds
         return True
 
+    async def ttl(self, key: str) -> int:
+        """语义对齐 Redis TTL：不存在 -2；无过期 -1；否则剩余秒数。"""
+        if not self._alive(key):
+            return -2
+        exp = self._expires.get(key)
+        return -1 if exp is None else max(0, int(exp - time.time()))
+
     # ---- STRING ----
 
     async def get(self, key: str) -> str | None:

@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     # ---- 观测 ----
     app_env: str = "dev"
     app_version: str = "dev"
+    log_level: str = "INFO"               # loguru 出口级别（排障时调 DEBUG）
     logfire_enabled: bool = False
     logfire_token: str | None = None
 

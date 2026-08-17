@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any
 
@@ -14,6 +13,7 @@ from app import queue
 from app.config import settings
 from app.deps import ratelimit
 from app.deps.preflight import Preflight
+from app.logging import log
 from app.schemas import ACTIVE, FAILURE, QUEUED, SUCCESS, TERMINAL
 from app.services import (
     idem,
@@ -25,8 +25,6 @@ from app.services import (
     upstream,
 )
 from app.services.providers import PricingError
-
-log = logging.getLogger("gateway.flow")
 
 
 def public_view(task: dict) -> dict:
@@ -69,6 +67,10 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
             502, f"biz {biz!r} upstream not configured "
                  f"(channel setting.gateway.submit_path missing)"
         )
+    log.info(
+        "task creating: task_id={} biz={} model={} user_id={} channel_id={} freeze={}",
+        pf.task_id, route.biz, pf.model, pf.identity.user_id, pf.key.key_id, pf.amount,
+    )
     callback_url = (
         route.callback_url_for(settings.gateway_public_base_url, pf.task_id)
         if route.supports_callback
@@ -115,6 +117,8 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
                 status_code=0 if exc.envelope else exc.status,
                 error=str(exc)[:200],
             )
+            log.warning("upstream rejected at submit: task_id={} biz={} err={}",
+                        pf.task_id, route.biz, str(exc)[:200])
             raise HTTPException(502, f"upstream rejected: {exc}") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
         await providers.keys.report(pf.key, ok=True, latency_ms=latency_ms)
@@ -130,6 +134,8 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
             if pf.amount > 0:
                 await queue.publish_cancel(pf.task_id, pf.token.raw)
             await ratelimit.conc_release(pf.token.hash)
+            log.warning("submit response missing task id: task_id={} biz={} path={!r}",
+                        pf.task_id, route.biz, route.task_id_path)
             raise HTTPException(
                 502, f"upstream response missing task id (task_id_path={route.task_id_path!r})"
             )
@@ -138,6 +144,8 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
             {"upstream_task_id": upstream_task_id},
             status=QUEUED,
         )
+        log.info("task submitted: task_id={} upstream_task_id={} latency_ms={}",
+                 pf.task_id, upstream_task_id, latency_ms)
 
         # 4) 上游不支持回调 → 进延迟探测队列
         if not route.supports_callback:
@@ -197,7 +205,7 @@ async def _settle_amount(route, task: dict, raw: dict) -> tuple[float, dict[str,
                 return quote.amount, usage
             except PricingError:
                 # 重估失败绝不静默多扣/少扣：回退冻结额并告警（sweeper 可对账）
-                log.exception("settle re-quote failed, fallback to freeze amount: %s",
+                log.exception("settle re-quote failed, fallback to freeze amount: {}",
                               task.get("task_id"))
     return freeze_amount, {}
 
@@ -226,7 +234,7 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
 
     # 终态落点：结构化记录 result（日志采集），便于按 task_id 追溯成品直链
     log.info(
-        "task finalized: task_id=%s status=%s result=%s fail_reason=%s",
+        "task finalized: task_id={} status={} result={} fail_reason={}",
         route_task_id, to_status, patch.get("result"), fail_reason[:200],
     )
 
@@ -236,7 +244,7 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
         if not user_sk:
             # 令牌会话丢失（Redis 故障/超 TTL）：billing freeze TTL 到期自动解冻
             # 兜底，这里只告警；settled 保持 False 由 sweeper 持续重试/对账
-            log.error("user token session missing, billing event deferred: %s", route_task_id)
+            log.error("user token session missing, billing event deferred: {}", route_task_id)
         elif to_status == SUCCESS:
             actual, usage = await _settle_amount(route, task, raw)
             await queue.publish_settle(

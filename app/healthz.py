@@ -7,16 +7,14 @@
 
 from __future__ import annotations
 
-import logging
-
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.db import get_session_factory
+from app.logging import log
 from app.redis import r
 
-log = logging.getLogger("gateway.healthz")
 router = APIRouter()
 
 
@@ -36,7 +34,7 @@ async def healthz_ready() -> JSONResponse:
         checks["redis"] = "ok"
     except Exception as exc:
         checks["redis"] = f"fail: {type(exc).__name__}"
-        log.warning("readiness redis check failed: %s", type(exc).__name__)
+        log.warning("readiness redis check failed: {}", type(exc).__name__)
 
     try:
         sf = get_session_factory()
@@ -45,7 +43,7 @@ async def healthz_ready() -> JSONResponse:
         checks["db"] = "ok"
     except Exception as exc:
         checks["db"] = f"fail: {type(exc).__name__}"
-        log.warning("readiness db check failed: %s", type(exc).__name__)
+        log.warning("readiness db check failed: {}", type(exc).__name__)
 
     ok = all(v == "ok" for v in checks.values())
     return JSONResponse(

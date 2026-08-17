@@ -48,8 +48,9 @@
 - 凭证、`base_url`、`model_mapping`、`param_override`、`header_override`、
   `status_code_mapping`、`setting.proxy` 全部在渠道上配；
 - 网关提取配置放渠道的 `header_override.upstream` 嵌套块（与
-  `setting.gateway`、`other.gateway` 三处等价任选，优先级从高到低；
-  装配请求头时会自动剥离，不会作为 HTTP 头透给上游）：
+  `setting.gateway` 两处等价任选，优先级从高到低；仅支持当前同构配置位，
+  不再兼容旧版 `other.gateway`；装配请求头时会自动剥离，不会作为 HTTP 头
+  透给上游）：
 
 ```json
 {
@@ -91,7 +92,7 @@
 | `GET /{biz}/v1/videos/{task_id}` | 视频任务查询 |
 | `POST /callback/{biz}/{task_id}` | 上游 webhook 入站（HMAC 验签 + 去重） |
 | `ANY /{biz}/{原生路径}` | 动态透传（GET 免费按 IP 限流；写方法计费透传） |
-| `GET /ops/queue`、`POST /ops/requeue/{task_id}`、`POST /ops/dlq/replay` | 运维（`X-Admin-Token`） |
+| `GET /ops/queue`、`GET /ops/tasks/{task_id}`、`POST /ops/requeue/{task_id}`、`POST /ops/dlq/replay` | 运维（`X-Admin-Token`） |
 | `GET /healthz/live`、`GET /healthz/ready` | 探针 |
 
 ## 计费闭环与可靠性
@@ -109,7 +110,11 @@
   计费事件（billing 幂等，重发安全）、队列积压/死信告警，`/ops/dlq/replay` 补号。
 - **熔断与上报**：每 biz 失败计数熔断（30s/10 次）；上游 4xx/5xx 结果实时
   上报 keypool 驱动坏 key 自动禁用。
-- **观测**：`GW_LOGFIRE_ENABLED=true` 接入 logfire（web 由 main 装配，taskiq
+- **观测**：日志统一走 loguru（`app/logging.py` 装配 stderr sink 并桥接
+  stdlib，`GW_LOG_LEVEL` 控制级别，排障调 DEBUG 即可看全链路；令牌/上游
+  key 绝不进日志）。`GET /ops/tasks/{task_id}` 提供任务诊断视图（含
+  task_id → 令牌会话存在性/TTL——渠道侧轮询不带 sk 时的查询处）。
+  `GW_LOGFIRE_ENABLED=true` 接入 logfire（web 由 main 装配，taskiq
   worker 由队列中间件装配）；**状态变化唯一记录点**是 statelog——Redis 去重，
   只在任务状态变化时发一条 `task_status_changed`（运行中连探多轮零事件）；
   队列中间件成功路径静默、失败才发 `taskiq_task_failed`（绝不带任务参数）。

@@ -12,9 +12,9 @@
 兼容 "TASK_STATUS_SUCCEED"、"task.succeeded"、"State: Running" 等风格。
 """
 
-import logging
 import re
 
+from app.logging import log
 from app.schemas import (
     CANCELED,
     FAILURE,
@@ -23,8 +23,6 @@ from app.schemas import (
     SUCCESS,
     RouteConfig,
 )
-
-log = logging.getLogger("gateway.statusmap")
 
 # ---- 内置字典（归一化后的精确枚举）----
 _ENUM: dict[str, str] = {
@@ -103,6 +101,6 @@ def map_status(route: RouteConfig | None, raw: object) -> str | None:
 
     if raw_str not in _seen_unknown:
         _seen_unknown.add(raw_str)
-        log.warning("unknown upstream status %r (biz=%s) — 请加入 status_map 或内置字典",
+        log.warning("unknown upstream status {!r} (biz={}) — 请加入 status_map 或内置字典",
                     raw_str, route.biz if route else "?")
     return None

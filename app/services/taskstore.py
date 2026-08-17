@@ -5,7 +5,6 @@
 """
 
 import json
-import logging
 import time
 from typing import Any, cast
 
@@ -14,8 +13,6 @@ from sqlalchemy import CursorResult, bindparam, text
 from app.config import settings
 from app.db import get_session_factory
 from app.schemas import ACTIVE, TERMINAL
-
-log = logging.getLogger("gateway.taskstore")
 
 
 def _now() -> int:
