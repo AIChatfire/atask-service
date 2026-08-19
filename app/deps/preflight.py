@@ -34,7 +34,6 @@ from app.services.providers import (
 )
 from app.services.registry import registry, route_from_lease
 
-
 #: task_id 的 biz 前缀长度上限：{slug}_{uuid4hex} ≤ 20+1+32 = 53 字符，
 #: 留足 tasks.task_id String(64) 余量（唯一索引长度不受影响）
 _TASK_ID_PREFIX_MAX = 20
@@ -69,10 +68,10 @@ class Preflight:
 
 
 async def preflight(
-    biz: str,
-    request: Request,
-    authorization: str | None = Header(None),
-    idempotency_key: str | None = Header(None),
+        biz: str,
+        request: Request,
+        authorization: str | None = Header(None),
+        idempotency_key: str | None = Header(None),
 ) -> Preflight:
     token = extract_token(authorization)
 
@@ -102,7 +101,7 @@ async def preflight(
     content_length = int(request.headers.get("content-length") or 0)
     if content_length <= 1_048_576 and request.headers.get("content-type", "").startswith("application/json"):
         try:
-            parsed = await request.json()   # starlette 会缓存 body，下游可再次读取
+            parsed = await request.json()  # starlette 会缓存 body，下游可再次读取
             if isinstance(parsed, dict):
                 body = parsed
         except Exception:
@@ -193,7 +192,7 @@ async def preflight(
             expires_at = int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else 0
             freeze_expires_at = expires_at or int(time.time()) + settings.freeze_ttl_seconds
     except Exception:
-        if placeholder_owned:
+        if placeholder_owned and idempotency_key is not None:
             await idem.release(token.hash, idempotency_key)
         raise
 
