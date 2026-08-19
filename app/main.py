@@ -22,7 +22,7 @@ from app.config import settings
 from app.db import close_db
 from app.errors import register_exception_handlers
 from app.logging import log, setup_logging
-from app.services import upstream
+from app.services import httpc, upstream
 
 
 def _setup_logfire(app: FastAPI) -> None:
@@ -59,6 +59,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await upstream.close_all()
+        await httpc.close_all()
         await close_db()
 
 

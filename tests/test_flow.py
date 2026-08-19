@@ -132,6 +132,36 @@ async def test_create_task_upstream_rejected_compensates(
     assert key_recorder[0]["ok"] is False and key_recorder[0]["status_code"] == 400
 
 
+async def test_create_task_tail_gather_poll_failure(
+    respx_router, route_factory, key_lease_factory,
+    patch_redis, task_store, queue_events, key_recorder, monkeypatch,
+):
+    """收尾并行化失败语义：schedule_poll 抛错时——
+    ① 异常照常传播到外层补偿（释放并发槽 + 取消冻结）；
+    ② 同 gather 的 idem.set_task_id 不被取消、落键成功
+       （gather 默认不取消兄弟协程，客户端重试可回放）。"""
+    import app.queue as q
+    from unittest.mock import AsyncMock
+
+    respx_router.post("http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(200, json={"task_id": "mm-1"})
+    )
+    monkeypatch.setattr(q, "schedule_poll",
+                        AsyncMock(side_effect=RuntimeError("redis down")))
+    body = {"model": "MiniMax-H3", "duration": 5}
+    pf = _make_preflight(route_factory(), key_lease_factory(),
+                         body=body, idem_key="idem-tail")
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await flow.create_task("minimax", body, pf, action="video", source="videos")
+
+    # 外层补偿：取消冻结（用户令牌）已发布
+    assert queue_events["cancel"] == [{"request_id": pf.task_id, "user_sk": "sk-user-1"}]
+    # 兄弟协程未被取消：幂等键仍落库，重试可回放原任务而非双建双扣
+    from app.services import idem
+    assert await idem.get_task_id(pf.token.hash, "idem-tail") == pf.task_id
+
+
 async def test_create_task_missing_task_id_visible(
     respx_router, route_factory, key_lease_factory,
     patch_redis, task_store, queue_events, key_recorder,

@@ -1,7 +1,8 @@
 """创建类请求的预检（依赖注入）：
-限流 → 并行(身份内省 ∥ key租约) → 路由配置+本地报价（规则随租约下发）→
-freeze → 令牌暂存。
-微服务调用全部走 providers 适配层；freeze 是唯一必须同步的资金操作，request_id = task_id。
+并行(限流 ∥ 幂等重放查询) → 并行(身份内省 ∥ key租约) →
+路由配置+本地报价（规则随租约下发）→ freeze → 令牌暂存。
+微服务调用全部走 providers 适配层（共享连接池，见 app.services.httpc）；
+freeze 是唯一必须同步的资金操作，request_id = task_id。
 """
 
 from __future__ import annotations
@@ -57,7 +58,19 @@ async def preflight(
     idempotency_key: str | None = Header(None),
 ) -> Preflight:
     token = extract_token(authorization)
-    await ratelimit.check_rate(f"tok:{token.hash}")
+
+    # 限流检查与幂等重放查询相互独立（均为无副作用的 Redis 读路径），并行省一个
+    # 串行 RTT；限流超限抛 429 时幂等查询结果直接丢弃（不产生资金/租约副作用）
+    replay_task_id: str | None = None
+    if idempotency_key:
+        from app.services import idem
+
+        _, replay_task_id = await asyncio.gather(
+            ratelimit.check_rate(f"tok:{token.hash}"),
+            idem.get_task_id(token.hash, idempotency_key),
+        )
+    else:
+        await ratelimit.check_rate(f"tok:{token.hash}")
 
     # 大请求体（文件上传透传）不做 JSON 解析，计费模型取 body.model
     body: dict = {}
@@ -75,16 +88,12 @@ async def preflight(
 
     # 幂等重放短路必须在 freeze 之前：同 Idempotency-Key 直接回放首个任务，
     # 不产生第二次冻结/租约/报价（计费重复防线第一重，billing request_id 唯一约束兜底）
-    if idempotency_key:
-        from app.services import idem
-
-        replay_task_id = await idem.get_task_id(token.hash, idempotency_key)
-        if replay_task_id:
-            return Preflight(
-                biz=biz, token=token, model=model or "", amount=0.0,
-                task_id=replay_task_id, idem_key=idempotency_key,
-                body=body, replay_task_id=replay_task_id,
-            )
+    if replay_task_id:
+        return Preflight(
+            biz=biz, token=token, model=model or "", amount=0.0,
+            task_id=replay_task_id, idem_key=idempotency_key,
+            body=body, replay_task_id=replay_task_id,
+        )
     if not model:
         raise HTTPException(400, "missing model")
 
@@ -140,7 +149,6 @@ async def preflight(
         await tokensession.store(task_id, token.raw)
         # 冻结到期时刻落 tasks.data：sweep 续期扫描（HELD/长任务防过期）依此判定
         s = frozen.get("expires_at")
-        log.debug(s)
         expires_at = int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else 0
         freeze_expires_at = expires_at or int(time.time()) + settings.freeze_ttl_seconds
 

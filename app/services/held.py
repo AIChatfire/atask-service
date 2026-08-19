@@ -1,13 +1,16 @@
-"""HELD 挂起排空（[6]）：账户级故障（欠费/封禁）恢复后的金丝雀重提交。
+"""HELD 挂起排空（[6]）：账户级故障（欠费/封禁）与上游限流（429）恢复后的
+金丝雀重提交。
 
 设计纪律：
-- **金丝雀策略**：每次只取最老一个 HELD 任务试提交；再撞账户级 → 退避
-  1m→5m→15m 封顶重投；成功 → 按 5s 节奏排下一只；
+- **金丝雀策略**：每次只取最老一个 HELD 任务试提交；再撞故障 → 退避
+  重投（账户级 1m→5m→15m 阶梯封顶；限流固定 5m，见 ``_resume_delay``）；
+  成功 → 按 5s 节奏排下一只；
 - **不钉渠道**：恢复排空重新 ``keys.lease``（双账号红利：自动切健康账号）；
 - **并发槽**：挂起时已释放（flow.create_task），提交前重新 acquire，
   拿不到下轮再来；
 - **冻结保活**：挂起期间由 sweep 续期扫描（[7]）维持 freeze 不过期；
-  ``hold_max_age``（默认 4h）兜底判死（FAILURE + cancel）；
+  ``hold_max_age``（账户级默认 4h）/ ``hold_max_age_rate_limited``
+  （限流默认 1h）兜底判死（FAILURE + cancel）；
 - **幂等**：重提交带 ``client_request_id = task_id``（渠道配
   ``client_request_id_param`` 时），上游支持幂等可防双重创建。
 """
@@ -32,6 +35,14 @@ _DRAIN_INTERVAL = 5
 
 def _backoff(attempts: int) -> int:
     return _BACKOFF[min(max(attempts - 1, 0), len(_BACKOFF) - 1)]
+
+
+def _resume_delay(data: dict, attempts: int) -> int:
+    """限流挂起（held_reason=rate_limited）固定 5m——限速窗口语义，不走阶梯；
+    账户级维持 1m→5m→15m 阶梯。"""
+    if data.get("held_reason") == errclass.RATE_LIMITED:
+        return settings.held_rate_limited_backoff_seconds
+    return _backoff(attempts)
 
 
 async def resume_held_once() -> None:
@@ -59,7 +70,7 @@ async def resume_held_once() -> None:
         await ratelimit.conc_release(token_hash)
         attempts = int(data.get("held_attempts") or 0) + 1
         await taskstore.patch_data(task_id, {"held_attempts": attempts})
-        delay = _backoff(attempts)
+        delay = _resume_delay(data, attempts)
         log.warning("held resume lease failed, backoff {}s: {} {}", delay, task_id, exc)
         await schedule_resume_held(delay)
         return
@@ -88,7 +99,7 @@ async def resume_held_once() -> None:
             if fresh:
                 await flow.finalize_task(fresh, FAILURE, {}, fail_reason=str(exc)[:500])
             return
-        delay = _backoff(attempts)
+        delay = _resume_delay(data, attempts)
         log.warning("held resume failed ({}), backoff {}s: {}", category, delay, task_id)
         await schedule_resume_held(delay)
         return

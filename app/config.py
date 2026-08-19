@@ -73,7 +73,9 @@ class Settings(BaseSettings):
     sk_session_ttl_seconds: int = 172800  # 用户令牌 Redis 暂存 TTL（终态 settle/cancel 用，48h）
     freeze_renew_margin_seconds: int = 600    # 冻结临期续期阈值（剩余 < 10min 才续）
     freeze_renew_batch: int = 100             # 每轮 sweep 续期上限
-    hold_max_age_seconds: int = 14400         # HELD 挂起上限（4h，≤ 冻结续期可维持窗口）
+    hold_max_age_seconds: int = 14400         # HELD 挂起上限（4h，账户级；≤ 冻结续期可维持窗口）
+    hold_max_age_rate_limited_seconds: int = 3600   # 限流（429）挂起上限（1h，独立更短窗口）
+    held_rate_limited_backoff_seconds: int = 300    # 限流挂起重提交退避（固定 5m，不走阶梯）
 
     # ---- 鉴权/幂等/限流 ----
     auth_cache_ttl: int = 30              # billing /auth/inspect 结果缓存

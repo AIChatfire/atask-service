@@ -135,9 +135,10 @@ async def _renew_expiring_freezes() -> None:
 
 
 async def _held_maintenance() -> None:
-    """HELD 维护：超 hold_max_age 判死（FAILURE + cancel 兜底收口）；
+    """HELD 维护：超上限判死（FAILURE + cancel 兜底收口；账户级 4h / 限流 1h）；
     仍有存活 HELD → 触发金丝雀排空（Redis 锁防每分钟 sweep 堆积调度）。"""
-    for task_id in await taskstore.held_expired(settings.hold_max_age_seconds):
+    for task_id in await taskstore.held_expired(
+            settings.hold_max_age_seconds, settings.hold_max_age_rate_limited_seconds):
         task = await taskstore.get(task_id)
         if not task or task["status"] in TERMINAL:
             continue

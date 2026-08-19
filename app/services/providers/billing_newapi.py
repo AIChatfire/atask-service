@@ -31,14 +31,17 @@ def _err_body(resp) -> str:
 
 class NewapiBillingProvider:
     def _client(self):
-        return httpc.new_client(base_url=settings.billing_svc_url, timeout=settings.http_timeout)
+        # 共享客户端（连接池 keep-alive）：inspect/freeze/settle/cancel 全部复用
+        # 同一池，提交链路不再逐请求付 TCP+TLS 握手
+        return httpc.shared_client(base_url=settings.billing_svc_url,
+                                   timeout=settings.http_timeout)
 
     async def inspect(self, raw_token: str) -> UserIdentity | None:
-        async with self._client() as client:
-            resp = await client.post(
-                "/api/v1/auth/inspect",
-                headers={"Authorization": f"Bearer {raw_token}"},
-            )
+        client = self._client()
+        resp = await client.post(
+            "/api/v1/auth/inspect",
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
         if resp.status_code != 200:
             log.debug("identity introspection rejected: status={}", resp.status_code)
             return None
@@ -61,12 +64,12 @@ class NewapiBillingProvider:
         }
         if units is not None:
             body["units"] = units
-        async with self._client() as client:
-            resp = await client.post(
-                "/api/v1/billing/freeze",
-                headers={"Authorization": f"Bearer {raw_token}"},
-                json=body,
-            )
+        client = self._client()
+        resp = await client.post(
+            "/api/v1/billing/freeze",
+            headers={"Authorization": f"Bearer {raw_token}"},
+            json=body,
+        )
         if resp.status_code != 200:
             # 402 余额不足 / 409 锁竞争（可重试）/ 4xx 参数错误——状态码原样上抛
             log.warning("billing freeze rejected: request_id={} status={} body={}",
@@ -87,12 +90,12 @@ class NewapiBillingProvider:
             body["units"] = units
         if attrs:
             body["attrs"] = attrs
-        async with self._client() as client:
-            resp = await client.post(
-                "/api/v1/billing/settle",
-                headers={"Authorization": f"Bearer {raw_token}"},
-                json=body,
-            )
+        client = self._client()
+        resp = await client.post(
+            "/api/v1/billing/settle",
+            headers={"Authorization": f"Bearer {raw_token}"},
+            json=body,
+        )
         if resp.status_code != 200:
             log.warning("billing settle rejected: request_id={} status={} body={}",
                         request_id, resp.status_code, _err_body(resp))
@@ -101,12 +104,12 @@ class NewapiBillingProvider:
                  request_id, round(actual_amount, 6))
 
     async def cancel(self, *, raw_token: str, request_id: str) -> None:
-        async with self._client() as client:
-            resp = await client.post(
-                "/api/v1/billing/cancel",
-                headers={"Authorization": f"Bearer {raw_token}"},
-                json={"request_id": request_id},
-            )
+        client = self._client()
+        resp = await client.post(
+            "/api/v1/billing/cancel",
+            headers={"Authorization": f"Bearer {raw_token}"},
+            json={"request_id": request_id},
+        )
         if resp.status_code != 200:
             log.warning("billing cancel rejected: request_id={} status={} body={}",
                         request_id, resp.status_code, _err_body(resp))
@@ -116,12 +119,12 @@ class NewapiBillingProvider:
     async def renew(self, *, raw_token: str, request_id: str,
                     ttl_seconds: int) -> dict:
         """冻结续期：只推 expires_at 不动钱。返回 data（含新 expires_at）。"""
-        async with self._client() as client:
-            resp = await client.post(
-                "/api/v1/billing/renew",
-                headers={"Authorization": f"Bearer {raw_token}"},
-                json={"request_id": request_id, "ttl_seconds": ttl_seconds},
-            )
+        client = self._client()
+        resp = await client.post(
+            "/api/v1/billing/renew",
+            headers={"Authorization": f"Bearer {raw_token}"},
+            json={"request_id": request_id, "ttl_seconds": ttl_seconds},
+        )
         if resp.status_code != 200:
             log.warning("billing renew rejected: request_id={} status={} body={}",
                         request_id, resp.status_code, _err_body(resp))

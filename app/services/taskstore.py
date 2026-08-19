@@ -241,20 +241,26 @@ async def oldest_held() -> str | None:
     return row
 
 
-async def held_expired(max_age_seconds: int, limit: int = 100) -> list[str]:
-    """挂起超上限的 HELD 任务（hold_max_age 判死：续期也救不回的挂起收口）。"""
+async def held_expired(max_age_seconds: int, rate_limited_max_age_seconds: int = 3600,
+                       limit: int = 100) -> list[str]:
+    """挂起超上限的 HELD 任务（hold_max_age 判死：续期也救不回的挂起收口）。
+    限流挂起（held_reason=rate_limited）用独立的更短上限（默认 1h）。"""
     cutoff = _now() - max_age_seconds
+    cutoff_rl = _now() - rate_limited_max_age_seconds
     async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(
                     """
                     SELECT task_id FROM tasks
-                    WHERE platform = :p AND status = 'HELD' AND updated_at < :cutoff
+                    WHERE platform = :p AND status = 'HELD' AND updated_at <
+                        CASE WHEN COALESCE(data ->> '$.held_reason', '') = 'rate_limited'
+                             THEN :cutoff_rl ELSE :cutoff END
                     LIMIT :lim
                     """
                 ),
-                {"p": settings.gateway_platform, "cutoff": cutoff, "lim": limit},
+                {"p": settings.gateway_platform, "cutoff": cutoff,
+                 "cutoff_rl": cutoff_rl, "lim": limit},
             )
         ).scalars().all()
     return list(rows)

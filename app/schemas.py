@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 SUBMITTED = "SUBMITTED"
 QUEUED = "QUEUED"            # 网关自写：已提交上游、等待推进
 IN_PROGRESS = "IN_PROGRESS"
-HELD = "HELD"                # 网关自写：账户级故障（欠费/封禁）挂起，补费后金丝雀排空
+HELD = "HELD"                # 网关自写：账户级故障（欠费/封禁）或上游限流（429）挂起，恢复后金丝雀排空
 SUCCESS = "SUCCESS"
 FAILURE = "FAILURE"
 CANCELED = "CANCELED"

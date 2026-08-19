@@ -346,10 +346,19 @@ class InMemoryTaskStore:
             return None
         return min(held, key=lambda t: t["created_at"])["task_id"]
 
-    async def held_expired(self, max_age_seconds: int, limit: int = 100) -> list[str]:
-        cutoff = int(time.time()) - max_age_seconds
-        return [t["task_id"] for t in self.rows.values()
-                if t["status"] == "HELD" and t["updated_at"] < cutoff][:limit]
+    async def held_expired(self, max_age_seconds: int,
+                           rate_limited_max_age_seconds: int = 3600,
+                           limit: int = 100) -> list[str]:
+        now = int(time.time())
+        cutoff, cutoff_rl = now - max_age_seconds, now - rate_limited_max_age_seconds
+        out = []
+        for t in self.rows.values():
+            if t["status"] != "HELD":
+                continue
+            rl = t["data"].get("held_reason") == "rate_limited"
+            if t["updated_at"] < (cutoff_rl if rl else cutoff):
+                out.append(t["task_id"])
+        return out[:limit]
 
     async def reconcile_candidates(self, window_seconds: int, recheck_seconds: int,
                                    limit: int = 20) -> list[dict]:

@@ -55,8 +55,8 @@ def mocks(respx_router):
     return m
 
 
-def _seed_held(task_store, **overrides) -> str:
-    task_id = "h" + "6" * 31
+def _seed_held(task_store, task_id: str | None = None, **overrides) -> str:
+    task_id = task_id or "h" + "6" * 31
     now = int(time.time())
     row = {
         "task_id": task_id, "platform": "gateway", "action": "video",
@@ -95,6 +95,7 @@ async def test_submit_account_level_holds_task(
     task_id = resp.json()["task_id"]
     row = task_store.rows[task_id]
     assert row["status"] == "HELD"
+    assert row["data"]["held_reason"] == "account_level"
     assert queue_events["cancel"] == []               # 冻结保留（不解冻）
     assert queue_events["resume_held"] == [{"delay": 60}]
     assert not mocks.report.calls                     # 账户级不上报 keypool
@@ -153,3 +154,69 @@ async def test_held_expired_sweep_fails_task(
     assert row["status"] == "FAILURE"
     assert "held timeout" in row["fail_reason"]
     assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+
+
+async def test_submit_rate_limited_holds_task(
+    mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """submit 全部重打撞 429 → HELD（held_reason=rate_limited）：202 对外 queued、
+    冻结保留、并发槽释放、按 5m 固定退避调度 resume、不上报坏 key（限流 ≠ key 级）。"""
+    mocks.create = respx_router.post("http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(429, text="rate limit exceeded")
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
+        resp = await client.post(
+            "/minimax/v1/tasks", json=BODY,
+            headers={"Authorization": "Bearer sk-user-42"},
+        )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["status"] == "QUEUED"          # 对外不暴露 HELD
+    task_id = resp.json()["task_id"]
+    row = task_store.rows[task_id]
+    assert row["status"] == "HELD"
+    assert row["data"]["held_reason"] == "rate_limited"
+    assert queue_events["cancel"] == []               # 冻结保留（不解冻）
+    assert queue_events["resume_held"] == [{"delay": 300}]   # 固定 5m 退避
+    assert not mocks.report.calls                     # 限流不上报 keypool
+    assert len(mocks.freeze.calls) == 1
+
+
+async def test_resume_held_rate_limited_fixed_backoff(
+    mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """限流挂起恢复再撞 429 → 固定 5m 退避（不走 1m→5m→15m 阶梯），仍 HELD。"""
+    mocks.create = respx_router.post("http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(429, text="rate limit exceeded")
+    )
+    task_id = _seed_held(task_store)
+    task_store.rows[task_id]["data"]["held_reason"] = "rate_limited"
+
+    await resume_held_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == "HELD"
+    assert row["data"]["held_attempts"] == 1
+    assert queue_events["resume_held"] == [{"delay": 300}]   # 固定 5m，非阶梯 60s
+    assert queue_events["cancel"] == []
+    assert patch_redis._data.get("gw:conc:h") == "0"  # 并发槽已还回
+
+
+async def test_held_rate_limited_expires_earlier(
+    mocks, test_settings, patch_redis, task_store, queue_events,
+):
+    """判死分流：限流挂起超 1h 判死；同龄（2h）账户级挂起保留（上限 4h）。"""
+    two_hours_ago = int(time.time()) - 2 * 3600
+    rl_id = _seed_held(task_store, task_id="h" + "7" * 31, updated_at=two_hours_ago)
+    task_store.rows[rl_id]["data"]["held_reason"] = "rate_limited"
+    acct_id = _seed_held(task_store, task_id="h" + "8" * 31, updated_at=two_hours_ago)
+    task_store.rows[acct_id]["data"]["held_reason"] = "account_level"
+    await tokensession.store(rl_id, "sk-user-1")
+
+    await sweep_once()
+
+    assert task_store.rows[rl_id]["status"] == "FAILURE"
+    assert "held timeout" in task_store.rows[rl_id]["fail_reason"]
+    assert queue_events["cancel"] == [{"request_id": rl_id, "user_sk": "sk-user-1"}]
+    assert task_store.rows[acct_id]["status"] == "HELD"   # 账户级 4h 上限未到

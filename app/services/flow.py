@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -158,17 +159,21 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
             assert last_exc is not None
             err = last_exc      # except 块的 as 变量出块即被删除，换名引用
             category = errclass.classify(route, err)
-            if category == errclass.ACCOUNT_LEVEL:
-                # 账户级故障（欠费/封禁）：挂起而非判死——HELD 保留冻结，
-                # sweep 续期保活，补费后 resume_held 金丝雀排空（恢复时不钉渠道）。
-                # 挂起即释放并发槽；账户级不上报 keypool（不是单个 key 坏了）。
-                await taskstore.cas(pf.task_id, ACTIVE, HELD, fail_reason=str(err)[:500])
+            if category in (errclass.ACCOUNT_LEVEL, errclass.RATE_LIMITED):
+                # 账户级故障（欠费/封禁）或上游限流（429）：挂起而非判死——HELD
+                # 保留冻结，sweep 续期保活，resume_held 金丝雀排空（恢复时不钉渠道）。
+                # 挂起即释放并发槽；账户级/限流都不上报 keypool（不是单个 key 坏了）。
+                # held_reason 区分语义：限流退避固定 5m、1h 兜底判死（held.py /
+                # reconcile 据此分流），账户级维持 1m→5m→15m 阶梯与 4h 上限。
+                await taskstore.cas(pf.task_id, ACTIVE, HELD,
+                                    patch={"held_reason": category},
+                                    fail_reason=str(err)[:500])
                 await ratelimit.conc_release(pf.token.hash)
                 if pf.idem_key:
                     await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
                 await statelog.record_if_changed(pf.task_id, HELD, detail="submit")
-                log.warning("task HELD (account-level failure): task_id={} biz={} err={}",
-                            pf.task_id, route.biz, str(err)[:200])
+                log.warning("task HELD ({}): task_id={} biz={} err={}",
+                            category, pf.task_id, route.biz, str(err)[:200])
                 if settings.logfire_enabled:
                     try:
                         import logfire
@@ -177,7 +182,10 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
                                      error=str(err)[:200])
                     except Exception:
                         pass
-                await queue.schedule_resume_held(60)
+                # 首次排空节奏：限流固定 5m（上游限速窗口语义），账户级 1m 起
+                await queue.schedule_resume_held(
+                    settings.held_rate_limited_backoff_seconds
+                    if category == errclass.RATE_LIMITED else 60)
                 return {"task_id": pf.task_id, "status": QUEUED}   # 202，对外 queued
             await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(err)[:500])
             if pf.amount > 0:
@@ -224,12 +232,15 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         log.info("task submitted: task_id={} upstream_task_id={} latency_ms={}",
                  pf.task_id, upstream_task_id, latency_ms)
 
-        # 4) 上游不支持回调 → 进延迟探测队列
+        # 4) 上游不支持回调 → 进延迟探测队列；幂等键回填与之相互独立
+        #    （均为 Redis 写，无顺序依赖），并行省一个串行 RTT
+        tail = []
         if not route.supports_callback:
-            await queue.schedule_poll(pf.task_id, settings.poll_ladder_seconds[0])
-
+            tail.append(queue.schedule_poll(pf.task_id, settings.poll_ladder_seconds[0]))
         if pf.idem_key:
-            await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
+            tail.append(idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id))
+        if tail:
+            await asyncio.gather(*tail)
 
         view = {"task_id": pf.task_id, "status": QUEUED, "upstream_task_id": upstream_task_id}
         return view

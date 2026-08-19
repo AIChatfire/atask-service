@@ -10,7 +10,8 @@
   （探测钉回 channel_id 不变，keypool 返回同渠道健康 key）；
 - ``ACCOUNT_LEVEL`` 账户级故障：欠费/封禁——**只在渠道显式配置名单内
   才判定**（状态码名单 + body 子串），HELD 挂起（[6]）的前置；
-- ``RATE_LIMITED`` 限流：429（+ Retry-After）→ 不上报，按 hint 拉长退避；
+- ``RATE_LIMITED`` 限流：429（+ Retry-After）→ 不上报 keypool，与账户级同走
+  HELD 挂起 + 金丝雀重提交（固定 5m 退避、1h 判死，见 held.py）；
 - ``AMBIGUOUS`` 模糊失败：超时/5xx/连接中断 → 重试探测；submit 绝不重试。
 
 渠道覆盖位（gateway 块 ``error_classify``，缺省走内置默认表）::

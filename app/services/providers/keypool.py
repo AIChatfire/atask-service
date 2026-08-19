@@ -71,12 +71,14 @@ class KeypoolProvider:
         else:
             body["group"] = group or settings.key_group
             body["model"] = model
-        async with httpc.new_client(timeout=settings.http_timeout) as client:
-            resp = await client.post(
-                f"{settings.key_svc_url}/v1/keys/select",
-                headers=self._headers(),
-                json=body,
-            )
+        # 共享客户端（连接池 keep-alive）：每次新建 client 会让 select 多付
+        # 一次 TCP+TLS 握手，preflight 提交链路会逐请求放大该开销
+        client = httpc.shared_client(timeout=settings.http_timeout)
+        resp = await client.post(
+            f"{settings.key_svc_url}/v1/keys/select",
+            headers=self._headers(),
+            json=body,
+        )
         if resp.status_code == 401:
             raise KeyLeaseError("keypool auth failed (check GW_KEY_SVC_TOKEN)")
         if resp.status_code != 200:
@@ -151,12 +153,12 @@ class KeypoolProvider:
             if usage:
                 body["usage"] = usage
             try:
-                async with httpc.new_client(timeout=5) as client:
-                    await client.post(
-                        f"{settings.key_svc_url}/v1/keys/report",
-                        headers=self._headers({"Idempotency-Key": uuid.uuid4().hex}),
-                        json=body,
-                    )
+                client = httpc.shared_client(timeout=5)
+                await client.post(
+                    f"{settings.key_svc_url}/v1/keys/report",
+                    headers=self._headers({"Idempotency-Key": uuid.uuid4().hex}),
+                    json=body,
+                )
             except Exception:
                 log.opt(exception=True).debug("key report failed")
 
