@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     # ---- 鉴权/幂等/限流 ----
     auth_cache_ttl: int = 30              # billing /auth/inspect 结果缓存
     idem_ttl: int = 86400                 # Idempotency-Key → task_id（24h）
+    idem_pending_ttl_seconds: int = 30    # 幂等占位（pending）TTL：覆盖 preflight→落库回填窗口
+    idem_replay_wait_seconds: float = 25.0  # 同键并发等占位回填上限（超时按 409 冲突处理）
     rate_limit_per_minute: int = 60
     max_concurrent_tasks: int = 5         # 每用户并发任务上限
 
@@ -95,11 +97,17 @@ class Settings(BaseSettings):
     # ---- 提交重试（仅换 key 可能改变结果的确定性拒绝；模糊失败绝不重试防双重创建）----
     submit_max_attempts: int = 3          # 含首次提交
     submit_retryable_status_codes: Annotated[tuple[int, ...], NoDecode] = (401, 403, 429)
+    # 提交互斥锁 TTL = submit_max_attempts × 渠道 timeout_sec + 本余量（动态派生，
+    # 见 app/services/submit.submit_lock_ttl）；余量覆盖租约重建/落库/探测排程
+    submit_lock_buffer_seconds: int = 60
     # 默认只含 key 级（401/403）与限流（429）：换 key/渠道才可能改变结果；
     # 任务级 4xx（如 400 内容审核）重打同一报文无意义，不默认重试（可按厂商条款追加）
 
     # ---- 不亏本兜底（孤儿收口 / 反向对账）----
-    orphan_grace_seconds: int = 600       # 非终态且无 upstream_task_id 超此时长 → 孤儿收口
+    orphan_grace_seconds: int = 1800      # 非终态且无 upstream_task_id 超此时长 → 孤儿收口
+    # 异步提交后必须覆盖「队列积压 + 提交耗时」窗口（stale 每 300s 补投一次 +
+    # 提交最坏 渠道timeout×重打 + 锁余量，锁 TTL 动态派生见 submit_lock_ttl），
+    # 过小会在队列积压时误杀在途任务
     reverse_reconcile_batch: int = 20     # 反向对账每轮抽查上限
     reverse_reconcile_window_seconds: int = 86400   # 只抽查近 24h 的 FAILURE
     reverse_reconcile_recheck_seconds: int = 3600   # 单任务核对间隔（在途上游每小时复查）

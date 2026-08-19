@@ -89,12 +89,16 @@ def diag_mocks(respx_router):
 
 
 async def _submit(client) -> str:
+    from app.services.submit import submit_one
+
     resp = await client.post(
         "/minimax/v1/tasks", json=BODY,
         headers={"Authorization": "Bearer sk-user-42"},
     )
     assert resp.status_code == 202, resp.text
-    return resp.json()["task_id"]
+    task_id = resp.json()["task_id"]
+    await submit_one(task_id)          # 异步提交架构：驱动 worker 侧提交
+    return task_id
 
 
 async def test_ops_task_diagnostics(

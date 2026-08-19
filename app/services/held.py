@@ -87,18 +87,26 @@ async def resume_held_once() -> None:
     try:
         resp = await upstream.submit(route, key, body)
     except upstream.UpstreamError as exc:
-        await ratelimit.conc_release(token_hash)
         category = errclass.classify(route, exc)
         attempts = int(data.get("held_attempts") or 0) + 1
         await taskstore.patch_data(task_id, {"held_attempts": attempts})
         if category == errclass.TASK_LEVEL:
-            # 任务本身被拒（内容审核等）：挂起无意义，判死 + 解冻
+            # 任务本身被拒（内容审核等）：挂起无意义，判死 + 解冻。
+            # 并发槽由 finalize_task 统一释放（提前 release 会双重 DECR 误还
+            # 同用户其他任务的槽）；提交阶段拒绝一律解冻（failed_charge=False，
+            # 与 submit._submit_rejected 同口径）。
             log.warning("held task rejected at task level, finalize FAILURE: {} {}",
                         task_id, str(exc)[:200])
             fresh = await taskstore.get(task_id)
             if fresh:
-                await flow.finalize_task(fresh, FAILURE, {}, fail_reason=str(exc)[:500])
+                await flow.finalize_task(fresh, FAILURE, {}, route=route,
+                                         failed_charge=False,
+                                         fail_reason=str(exc)[:500])
+            else:
+                await ratelimit.conc_release(token_hash)    # 行已消失，兜底还槽
             return
+        # 仍挂起：还回并发槽，退避重投
+        await ratelimit.conc_release(token_hash)
         delay = _resume_delay(data, attempts)
         log.warning("held resume failed ({}), backoff {}s: {}", category, delay, task_id)
         await schedule_resume_held(delay)
@@ -106,13 +114,16 @@ async def resume_held_once() -> None:
 
     upstream_task_id = upstream.extract_path(resp, route.task_id_path)
     if not upstream_task_id:
-        await ratelimit.conc_release(token_hash)
         log.error("held resume missing task id: {} path={!r}", task_id, route.task_id_path)
         fresh = await taskstore.get(task_id)
         if fresh:
+            # 并发槽由 finalize_task 统一释放；提取不到 id = 配置错，上游未
+            # 真正接单，一律解冻（与 submit 路径同口径）
             await flow.finalize_task(
-                fresh, FAILURE, {},
+                fresh, FAILURE, {}, route=route, failed_charge=False,
                 fail_reason=f"upstream response missing task id at path {route.task_id_path!r}")
+        else:
+            await ratelimit.conc_release(token_hash)        # 行已消失，兜底还槽
         return
 
     # 恢复成功：回填上游任务与**实际渠道**（可能换了账号），转 QUEUED 进探测闭环

@@ -69,7 +69,7 @@ async def test_orphan_task_closed_and_refunded(test_settings, patch_redis,
     """非终态且无 upstream_task_id 超宽限期 → FAILURE + cancel 解冻。"""
     task_id = _seed(task_store, status=SUBMITTED,
                     data__upstream_task_id=None,
-                    created_at=int(time.time()) - 900)   # 超 orphan_grace 600s
+                    created_at=int(time.time()) - 2000)  # 超 orphan_grace 1800s
     await tokensession.store(task_id, "sk-user-1")
 
     await sweep_once()
@@ -78,6 +78,28 @@ async def test_orphan_task_closed_and_refunded(test_settings, patch_redis,
     assert row["status"] == FAILURE
     assert "orphan" in row["fail_reason"]
     assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+
+
+async def test_orphan_closeout_ignores_failed_charge_policy(
+    test_settings, patch_redis, task_store, queue_events, route_factory,
+):
+    """孤儿收口（上游从未接单）：即使渠道配 failed_billing=charge 也一律解冻——
+    charge 只覆盖生成失败，不覆盖提交未接单（KI1 计费口径回归）。"""
+    registry._cache.clear()
+    registry.remember(route_factory(failed_billing="charge"))
+    task_id = _seed(task_store, status=SUBMITTED,
+                    data__upstream_task_id=None,
+                    created_at=int(time.time()) - 2000)
+    await tokensession.store(task_id, "sk-user-1")
+
+    await sweep_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == FAILURE
+    assert "orphan" in row["fail_reason"]
+    assert queue_events["settle"] == []
+    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+    registry._cache.clear()
 
 
 async def test_young_task_not_treated_as_orphan(test_settings, patch_redis,
@@ -89,6 +111,42 @@ async def test_young_task_not_treated_as_orphan(test_settings, patch_redis,
     row = next(iter(task_store.rows.values()))
     assert row["status"] == SUBMITTED
     assert queue_events["cancel"] == []
+
+
+async def test_stale_submitted_task_resubmitted(test_settings, patch_redis,
+                                                task_store, queue_events):
+    """异步提交事件丢失（worker 崩溃/Redis 故障）：stale 的 SUBMITTED 任务由
+    sweep 补投提交事件（而非探测）；未到孤儿宽限期不判死、不解冻。"""
+    aged = int(time.time()) - 400         # 超 task_stale_seconds(300) 未及 orphan_grace(1800)
+    task_id = _seed(task_store, status=SUBMITTED, data__upstream_task_id=None,
+                    created_at=aged, updated_at=aged)
+
+    await sweep_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == SUBMITTED                  # 不误杀
+    assert queue_events["submit"] == [task_id]         # 补投提交
+    assert queue_events["poll"] == []                  # 无上游 id 不排探测
+    assert queue_events["cancel"] == []
+
+
+async def test_sweep_skips_resubmit_when_submit_in_flight(test_settings, patch_redis,
+                                                          task_store, queue_events):
+    """KI2：stale SUBMITTED 补投前查锁——锁在 = 有在飞提交，本轮让路，
+    避免补投与在飞提交并发双建（锁 TTL 动态派生之外的第二道防线）。"""
+    from app.redis import K_SUBMIT_LOCK
+
+    aged = int(time.time()) - 400
+    task_id = _seed(task_store, status=SUBMITTED, data__upstream_task_id=None,
+                    created_at=aged, updated_at=aged)
+    await patch_redis.set(K_SUBMIT_LOCK.format(task_id=task_id), "1", ex=300)
+
+    await sweep_once()
+
+    assert queue_events["submit"] == []                # 不补投（让路在飞提交）
+    assert queue_events["poll"] == []
+    assert queue_events["cancel"] == []
+    assert task_store.rows[task_id]["status"] == SUBMITTED
 
 
 # ---------------------------------------------------------------------------

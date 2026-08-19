@@ -17,6 +17,7 @@ K_RL = "gw:rl:{subject}"                     # 滑动窗口限流（subject=toke
 K_CONC = "gw:conc:{token_hash}"              # 并发任务占用
 K_CB = "gw:cb:{biz}:{event_id}"              # 回调去重（72h）
 K_BREAKER = "gw:breaker:{biz}"               # 上游熔断失败计数
+K_SUBMIT_LOCK = "gw:submit_lock:{task_id}"   # 异步提交互斥锁（补投/重放去重；TTL 按路由动态派生）
 S_DLQ = "gw:events:dlq"                      # 死信（taskiq 任务超限后落信）
 
 # ---- 滑动窗口限流 ----
@@ -43,4 +44,12 @@ LUA_CONC_RELEASE = """
 local n = redis.call('DECR', KEYS[1])
 if n < 0 then redis.call('SET', KEYS[1], 0) end
 return 1
+"""
+
+# ---- CAS 删除（值匹配才删）：幂等占位释放专用，防误删并发回填的 task_id ----
+LUA_CAS_DELETE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
 """

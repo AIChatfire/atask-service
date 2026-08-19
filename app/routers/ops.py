@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, HTTPException
 from app import queue
 from app.config import settings
 from app.logging import log
-from app.services import taskstore, tokensession
+from app.services import flow, taskstore, tokensession
 
 router = APIRouter()
 
@@ -47,6 +47,7 @@ async def task_diagnostics(task_id: str, x_admin_token: str | None = Header(None
         "submit_time": task.get("submit_time"),
         "updated_at": task.get("updated_at"),
         "finish_time": task.get("finish_time") or 0,
+        "duration": flow.duration_seconds(task),   # 耗时（秒）：终态-创建，单位已归一
         "fail_reason": task.get("fail_reason") or "",
         "data": {
             "biz": data.get("biz"),

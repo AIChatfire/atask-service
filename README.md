@@ -124,7 +124,7 @@ sweep 补数；scheduler 必须单副本，worker 扩副本时拆回独立服务
   → 任务挂起保留冻结、202 照常返回；sweep 续期保活（billing renew 只推
   expires_at 不动钱），补费后金丝雀排空（重新租约不钉渠道，1m→5m→15m 退避），
   超 `GW_HOLD_MAX_AGE_SECONDS`（默认 4h）判死解冻。
-- **不亏本兜底**：孤儿任务（非终态且无 upstream_task_id 超 10min）sweep 收口
+- **不亏本兜底**：孤儿任务（非终态且无 upstream_task_id 超 30min，`GW_ORPHAN_GRACE_SECONDS`）sweep 收口
   解冻；反向对账抽查"本地 FAILURE/已退 但上游 SUCCESS"告警台账；失败单按渠道
   `failed_billing: charge|absorb` 策略结算或解冻；渠道配 `cancel_path` 时取消/
   超时尽力调上游取消端点源头止损。

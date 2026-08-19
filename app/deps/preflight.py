@@ -1,13 +1,18 @@
 """创建类请求的预检（依赖注入）：
-并行(限流 ∥ 幂等重放查询) → 并行(身份内省 ∥ key租约) →
+并行(限流 ∥ 幂等占位) → 并行(身份内省 ∥ key租约) →
 路由配置+本地报价（规则随租约下发）→ freeze → 令牌暂存。
 微服务调用全部走 providers 适配层（共享连接池，见 app.services.httpc）；
 freeze 是唯一必须同步的资金操作，request_id = task_id。
+
+幂等键为原子占位语义（KI3 根治）：带 Idempotency-Key 的请求先 SET NX
+写占位（pending），同键真并发只有一个请求继续创建链路，其余短轮询等
+占位回填后回放；超时/过期按 409 冲突（不放行重建，防双建双冻结）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from datetime import datetime
@@ -20,7 +25,7 @@ from app.deps import ratelimit
 from app.deps.auth import TokenCtx, extract_token, resolve_identity
 from app.logging import log
 from app.schemas import KeyLease, Quote, RouteConfig, UserIdentity
-from app.services import providers, tokensession
+from app.services import idem, providers, tokensession
 from app.services.pricing import quote_from_route
 from app.services.providers import (
     BillingError,
@@ -28,6 +33,18 @@ from app.services.providers import (
     PricingError,
 )
 from app.services.registry import registry, route_from_lease
+
+
+#: task_id 的 biz 前缀长度上限：{slug}_{uuid4hex} ≤ 20+1+32 = 53 字符，
+#: 留足 tasks.task_id String(64) 余量（唯一索引长度不受影响）
+_TASK_ID_PREFIX_MAX = 20
+
+
+def new_task_id(biz: str) -> str:
+    """本地 task_id：``{biz_slug}_{uuid4hex}``——带 biz 前缀便于识别与分流；
+    slug 化防渠道名含非法字符，全链路（提交响应/GET/回调/tasks 表）同值。"""
+    slug = re.sub(r"[^a-z0-9-]+", "-", biz.lower()).strip("-")[:_TASK_ID_PREFIX_MAX].strip("-")
+    return f"{slug or 'task'}_{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -59,16 +76,24 @@ async def preflight(
 ) -> Preflight:
     token = extract_token(authorization)
 
-    # 限流检查与幂等重放查询相互独立（均为无副作用的 Redis 读路径），并行省一个
-    # 串行 RTT；限流超限抛 429 时幂等查询结果直接丢弃（不产生资金/租约副作用）
+    # 限流检查与幂等占位并行：占位是 SET NX 原子写（KI3 根治——原「先查
+    # 重放、落库后回填」在真并发下双查不到 → 双建双冻结），同键并发只有
+    # 占位者继续创建链路；限流超限拒绝时归还占位（请求未产生任何副作用）
     replay_task_id: str | None = None
+    placeholder_owned = False
     if idempotency_key:
-        from app.services import idem
-
-        _, replay_task_id = await asyncio.gather(
+        rate_res, acq_res = await asyncio.gather(
             ratelimit.check_rate(f"tok:{token.hash}"),
-            idem.get_task_id(token.hash, idempotency_key),
+            idem.acquire(token.hash, idempotency_key),
+            return_exceptions=True,
         )
+        if isinstance(acq_res, BaseException):
+            raise acq_res
+        placeholder_owned, replay_task_id = acq_res
+        if isinstance(rate_res, BaseException):
+            if placeholder_owned:
+                await idem.release(token.hash, idempotency_key)
+            raise rate_res
     else:
         await ratelimit.check_rate(f"tok:{token.hash}")
 
@@ -86,6 +111,17 @@ async def preflight(
     # 计费模型：body.model / body.model_name（keypool 选渠道需要）
     model = body.get("model") or body.get("model_name")
 
+    # 同键并发：他方占位中（创建链路在飞）→ 短轮询等占位回填为真实 task_id
+    # 后回放；超时/占位过期按 409 冲突处理——不放行重建（重建会双建任务双
+    # 冻结；409 让客户端原键重试，资金侧零风险，billing request_id 唯一
+    # 约束仍是最后兜底）
+    if idempotency_key and not placeholder_owned and not replay_task_id:
+        replay_task_id = await idem.wait_task_id(token.hash, idempotency_key)
+        if not replay_task_id:
+            raise HTTPException(
+                409, "Idempotency-Key conflict: another request with the same "
+                     "key is in progress; retry with the same key")
+
     # 幂等重放短路必须在 freeze 之前：同 Idempotency-Key 直接回放首个任务，
     # 不产生第二次冻结/租约/报价（计费重复防线第一重，billing request_id 唯一约束兜底）
     if replay_task_id:
@@ -94,63 +130,72 @@ async def preflight(
             task_id=replay_task_id, idem_key=idempotency_key,
             body=body, replay_task_id=replay_task_id,
         )
-    if not model:
-        raise HTTPException(400, "missing model")
 
-    # 无依赖的远程调用全部并行：身份内省 ∥ key 租约（统一分组 GW_KEY_GROUP +
-    # model 选渠道）；计费规则随租约下发，报价在路由构建后本地沙箱求值
+    # 占位者继续创建链路：此后任何失败（无任务可回填）必须 CAS 归还占位，
+    # 让后续同键请求立即重建，而不是干等占位 TTL
     try:
-        identity, key = await asyncio.gather(
-            resolve_identity(token),
-            providers.keys.lease(biz, model=model),
-        )
-    except HTTPException:
-        raise
-    except BillingError as exc:
-        raise HTTPException(exc.status, exc.message) from exc
-    except KeyLeaseError as exc:
-        # 无可用 key：透传 keypool 建议退避为 Retry-After 响应头（秒，至少 1）
-        headers = None
-        if exc.retry_after_ms:
-            headers = {"Retry-After": str(max(1, (exc.retry_after_ms + 999) // 1000))}
-        raise HTTPException(503, str(exc), headers=headers) from exc
+        if not model:
+            raise HTTPException(400, "missing model")
 
-    # 路由配置随租约从渠道元数据构建（零本地路由文件）并回填进程缓存；
-    # 报价 = 渠道 gateway 块 billing.rule 本地求值（规则唯一事实源 = keypool）
-    route = registry.remember(route_from_lease(biz, key))
-    try:
-        quote = quote_from_route(route, body)
-    except PricingError as exc:
-        log.error("billing rule error: biz={} model={} err={}", biz, model, exc)
-        raise HTTPException(500, f"billing rule error: {exc}") from exc
-
-    task_id = uuid.uuid4().hex
-    log.debug("preflight: biz={} model={} user_id={} channel_id={} quote={} {}",
-              route.biz, model, identity.user_id, key.key_id, quote.amount, quote.metric)
-
-    # 同步预冻结（金额 > 0 才计费；freeze 即第二重身份校验）
-    freeze_expires_at = 0
-    if quote.amount > 0:
+        # 无依赖的远程调用全部并行：身份内省 ∥ key 租约（统一分组 GW_KEY_GROUP +
+        # model 选渠道）；计费规则随租约下发，报价在路由构建后本地沙箱求值
         try:
-            frozen = await providers.billing.freeze(
-                raw_token=token.raw,
-                request_id=task_id,
-                biz_type=route.pricing_biz_type or biz,
-                metric=quote.metric,
-                amount=quote.amount,
-                ttl_seconds=settings.freeze_ttl_seconds,
-                attrs={"gateway": True, "biz": biz, "model": model, "path": str(request.url.path)},
+            identity, key = await asyncio.gather(
+                resolve_identity(token),
+                providers.keys.lease(biz, model=model),
             )
+        except HTTPException:
+            raise
         except BillingError as exc:
             raise HTTPException(exc.status, exc.message) from exc
-        # 终态 settle/cancel 仍须用户令牌（billing 只认令牌身份；new-api 渠道侧
-        # 轮询不带 sk）——按 task_id 暂存 Redis 作为唯一的 taskid→token 查询处
-        # （终态清除；冻结 TTL 是资金兜底）
-        await tokensession.store(task_id, token.raw)
-        # 冻结到期时刻落 tasks.data：sweep 续期扫描（HELD/长任务防过期）依此判定
-        s = frozen.get("expires_at")
-        expires_at = int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else 0
-        freeze_expires_at = expires_at or int(time.time()) + settings.freeze_ttl_seconds
+        except KeyLeaseError as exc:
+            # 无可用 key：透传 keypool 建议退避为 Retry-After 响应头（秒，至少 1）
+            headers = None
+            if exc.retry_after_ms:
+                headers = {"Retry-After": str(max(1, (exc.retry_after_ms + 999) // 1000))}
+            raise HTTPException(503, str(exc), headers=headers) from exc
+
+        # 路由配置随租约从渠道元数据构建（零本地路由文件）并回填进程缓存；
+        # 报价 = 渠道 gateway 块 billing.rule 本地求值（规则唯一事实源 = keypool）
+        route = registry.remember(route_from_lease(biz, key))
+        try:
+            quote = quote_from_route(route, body)
+        except PricingError as exc:
+            log.error("billing rule error: biz={} model={} err={}", biz, model, exc)
+            raise HTTPException(500, f"billing rule error: {exc}") from exc
+
+        task_id = new_task_id(route.biz)
+        log.debug("preflight: biz={} model={} user_id={} channel_id={} quote={} {}",
+                  route.biz, model, identity.user_id, key.key_id, quote.amount, quote.metric)
+
+        # 同步预冻结（金额 > 0 才计费；freeze 即第二重身份校验）
+        freeze_expires_at = 0
+        if quote.amount > 0:
+            try:
+                frozen = await providers.billing.freeze(
+                    raw_token=token.raw,
+                    request_id=task_id,
+                    biz_type=route.pricing_biz_type or biz,
+                    metric=quote.metric,
+                    amount=quote.amount,
+                    ttl_seconds=settings.freeze_ttl_seconds,
+                    attrs={"gateway": True, "biz": biz, "model": model,
+                           "path": str(request.url.path)},
+                )
+            except BillingError as exc:
+                raise HTTPException(exc.status, exc.message) from exc
+            # 终态 settle/cancel 仍须用户令牌（billing 只认令牌身份；new-api 渠道侧
+            # 轮询不带 sk）——按 task_id 暂存 Redis 作为唯一的 taskid→token 查询处
+            # （终态清除；冻结 TTL 是资金兜底）
+            await tokensession.store(task_id, token.raw)
+            # 冻结到期时刻落 tasks.data：sweep 续期扫描（HELD/长任务防过期）依此判定
+            s = frozen.get("expires_at")
+            expires_at = int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()) if s else 0
+            freeze_expires_at = expires_at or int(time.time()) + settings.freeze_ttl_seconds
+    except Exception:
+        if placeholder_owned:
+            await idem.release(token.hash, idempotency_key)
+        raise
 
     return Preflight(
         biz=biz, route=route, token=token, identity=identity, quote=quote, key=key,

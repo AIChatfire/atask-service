@@ -24,7 +24,7 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    task_id = Column(String(64), unique=True, index=True)   # 网关 UUID = billing request_id，不可枚举
+    task_id = Column(String(64), unique=True, index=True)   # 网关本地 id（{biz}_{uuid4hex} ≤53 字符）= billing request_id，不可枚举
     platform = Column(String(32), default="gateway", index=True)
     action = Column(String(32), default="")
     status = Column(String(32), default="SUBMITTED", index=True)

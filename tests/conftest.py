@@ -138,13 +138,24 @@ class FakeRedis:
             if self._alive(key) and fnmatch.fnmatch(key, pattern):
                 yield key
 
-    # ---- Lua（app.redis 三个脚本按常量等价实现）----
+    # ---- Lua（app.redis 脚本按常量等价实现）----
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
-        from app.redis import LUA_CONC_ACQUIRE, LUA_CONC_RELEASE, LUA_RATE_LIMIT
+        from app.redis import (
+            LUA_CAS_DELETE,
+            LUA_CONC_ACQUIRE,
+            LUA_CONC_RELEASE,
+            LUA_RATE_LIMIT,
+        )
 
         key = args[0]
         argv = [str(a) for a in args[numkeys:]]
+        if script == LUA_CAS_DELETE:
+            if self._alive(key) and self._data.get(key) == argv[0]:
+                self._data.pop(key, None)
+                self._expires.pop(key, None)
+                return 1
+            return 0
         if script == LUA_RATE_LIMIT:
             now_ms, window_ms, limit = int(argv[0]), int(argv[1]), int(argv[2])
             entries: list[int] = self._data.get(key) if self._alive(key) else []
@@ -191,6 +202,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
     import app.services.idem
     import app.services.reconcile
     import app.services.statelog
+    import app.services.submit
     import app.services.tokensession
     import app.services.upstream
 
@@ -203,6 +215,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
         app.services.idem,
         app.services.reconcile,
         app.services.statelog,
+        app.services.submit,
         app.services.tokensession,
         app.services.upstream,
     ):
@@ -258,13 +271,19 @@ class InMemoryTaskStore:
             "status": "SUBMITTED", "progress": "0%", "fail_reason": "",
             "data": json.loads(json.dumps(data, ensure_ascii=False)),
             "user_id": user_id, "channel_id": channel_id,
-            "submit_time": now, "created_at": now, "updated_at": now,
-            "finish_time": 0,
+            "submit_time": now, "start_time": now, "created_at": now,
+            "updated_at": now, "finish_time": 0,
         }
 
     async def get(self, task_id: str) -> dict | None:
         row = self.rows.get(task_id)
         return dict(row) if row else None
+
+    async def get_by_upstream_id(self, upstream_task_id: str) -> dict | None:
+        for row in self.rows.values():
+            if (row.get("data") or {}).get("upstream_task_id") == upstream_task_id:
+                return dict(row)
+        return None
 
     async def cas(self, task_id: str, from_statuses: tuple[str, ...], to_status: str,
                   patch: dict | None = None, fail_reason: str = "") -> bool:
@@ -380,10 +399,10 @@ def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
     import app.services.taskstore as ts
 
     store = InMemoryTaskStore()
-    for name in ("create", "get", "cas", "patch_data", "mark_settled",
-                 "stale_active", "terminal_unsettled", "counts_by_status",
-                 "orphan_active", "expiring_freezes", "reconcile_candidates",
-                 "oldest_held", "held_expired"):
+    for name in ("create", "get", "get_by_upstream_id", "cas", "patch_data",
+                 "mark_settled", "stale_active", "terminal_unsettled",
+                 "counts_by_status", "orphan_active", "expiring_freezes",
+                 "reconcile_candidates", "oldest_held", "held_expired"):
         monkeypatch.setattr(ts, name, getattr(store, name))
     return store
 
@@ -395,13 +414,16 @@ def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
 
 @pytest.fixture
 def queue_events(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
-    """拦截 app.queue 四个发布门面，记录调用参数（settle/cancel/notify/poll）。"""
+    """拦截 app.queue 发布门面，记录调用参数（submit/settle/cancel/notify/poll）。"""
     from unittest.mock import AsyncMock
 
     import app.queue as q
 
-    events: dict[str, list] = {"settle": [], "cancel": [], "notify": [], "poll": [],
-                               "resume_held": []}
+    events: dict[str, list] = {"submit": [], "settle": [], "cancel": [], "notify": [],
+                               "poll": [], "resume_held": []}
+
+    async def _submit(task_id):
+        events["submit"].append(task_id)
 
     async def _settle(request_id, actual_amount, user_sk, units=None, attrs=None):
         events["settle"].append({
@@ -421,6 +443,7 @@ def queue_events(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
     async def _resume_held(delay):
         events["resume_held"].append({"delay": delay})
 
+    monkeypatch.setattr(q, "publish_submit", AsyncMock(side_effect=_submit))
     monkeypatch.setattr(q, "publish_settle", AsyncMock(side_effect=_settle))
     monkeypatch.setattr(q, "publish_cancel", AsyncMock(side_effect=_cancel))
     monkeypatch.setattr(q, "publish_notify", AsyncMock(side_effect=_notify))

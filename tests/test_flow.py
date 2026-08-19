@@ -1,13 +1,16 @@
-"""任务生命周期测试：创建（幂等/渠道覆盖/失败补偿）与终态推进（三档结算）。
+"""任务生命周期测试：创建（异步提交受理/幂等/补偿）、查询（上游 id 反查、
+耗时序列化）与终态推进（三档结算）。
 
 边界：providers 用记录器替换（除单独声明外），上游 HTTP 走 respx，
 taskstore 内存实现，queue 发布门面记录器，Redis FakeRedis。
+worker 侧提交执行（submit_one）的测试在 test_submit.py。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,7 +18,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app.schemas import FAILURE, QUEUED, SUCCESS, Quote
+from app.schemas import FAILURE, SUBMITTED, SUCCESS, Quote
 from app.services import flow, providers, tokensession
 
 
@@ -51,18 +54,19 @@ def key_recorder(monkeypatch: pytest.MonkeyPatch):
 
 
 # ---------------------------------------------------------------------------
-# create_task
+# create_task（异步提交受理：落库 → 返回本地 id → 提交事件入队）
 # ---------------------------------------------------------------------------
 
 
-async def test_create_task_success_full_chain(
+async def test_create_task_returns_local_id_immediately(
     respx_router, route_factory, key_lease_factory,
     patch_redis, task_store, queue_events, key_recorder,
 ):
-    """提交全链路：渠道覆盖报文 → 落库 → 探测排程 → key 上报。"""
+    """创建链路不再同步等上游：零上游出站调用，落库即返回本地 task_id，
+    上游提交事件入队（worker 异步执行，见 test_submit.py）。"""
     key = key_lease_factory(param_override={"aigc_watermark": False})
     route = route_factory()
-    http = respx_router.post("http://upstream.test/v2/video_generation").mock(
+    upstream_mock = respx_router.post("http://upstream.test/v2/video_generation").mock(
         return_value=httpx.Response(200, json={"task_id": "mm-1"})
     )
     body = {"model": "MiniMax-H3",
@@ -73,80 +77,48 @@ async def test_create_task_success_full_chain(
 
     view = await flow.create_task("minimax", body, pf, action="video", source="videos")
 
-    assert view["status"] == QUEUED and view["upstream_task_id"] == "mm-1"
-    # 渠道 param_override 合并进提交体；用户回调不直接带上游
-    sent = json.loads(http.calls.last.request.content)
-    assert sent["aigc_watermark"] is False
-    assert sent["content"][0]["text"] == "a cat"
-    assert "callback_url" not in sent       # supports_callback=False 不注入
-    # 落库与台账
+    assert view == {"task_id": pf.task_id, "status": SUBMITTED}
+    assert not upstream_mock.calls                     # 请求内零上游调用（立即返回）
     row = await task_store.get(pf.task_id)
-    assert row["status"] == QUEUED
-    assert row["data"]["upstream_task_id"] == "mm-1"
-    assert row["data"]["request_body"]["duration"] == 5     # 结算重估基底
+    assert row["status"] == SUBMITTED
+    assert row["data"]["request_body"]["duration"] == 5   # 提交体重建/结算重估基底
+    assert row["data"]["callback_url"] == "https://user.test/hook"
     assert row["channel_id"] == 7
-    # 不支持回调 → 进探测队列；key 成功上报
-    assert queue_events["poll"] == [{"task_id": pf.task_id, "delay": 5}]
-    assert key_recorder == [{"ok": True, "status_code": 0, "error": ""}]
+    assert queue_events["submit"] == [pf.task_id]      # 提交事件已入队
+    assert queue_events["poll"] == []                  # 拿到上游 id 前不排探测
 
 
 async def test_create_task_idempotent_replay(
     respx_router, route_factory, key_lease_factory,
     patch_redis, task_store, queue_events, key_recorder,
 ):
-    """同 Idempotency-Key 重放：直接返回原任务，不产生第二次提交/扣费。"""
+    """同 Idempotency-Key 重放：回放同一本地 task_id，不产生第二次提交事件。"""
     route = route_factory()
     key = key_lease_factory()
-    http = respx_router.post("http://upstream.test/v2/video_generation").mock(
-        return_value=httpx.Response(200, json={"task_id": "mm-1"})
-    )
     body = {"model": "MiniMax-H3", "duration": 5}
     pf = _make_preflight(route, key, body=body, idem_key="idem-1")
-    await flow.create_task("minimax", body, pf, action="video", source="videos")
-    assert len(http.calls) == 1
+    view1 = await flow.create_task("minimax", body, pf, action="video", source="videos")
+    assert view1["task_id"] == pf.task_id
+    assert queue_events["submit"] == [pf.task_id]
 
+    # 幂等键在落库后即回填：worker 尚未提交时重试也回放同一本地 id
     pf2 = _make_preflight(route, key, body=body, idem_key="idem-1")
     view2 = await flow.create_task("minimax", body, pf2, action="video", source="videos")
-    assert view2["task_id"] == pf.task_id   # 返回首个任务
-    assert len(http.calls) == 1             # 没有第二次上游提交
+    assert view2["task_id"] == pf.task_id              # 返回首个任务
+    assert queue_events["submit"] == [pf.task_id]      # 没有第二次提交事件
+    assert len(task_store.rows) == 1
 
 
-async def test_create_task_upstream_rejected_compensates(
-    respx_router, route_factory, key_lease_factory,
-    patch_redis, task_store, queue_events, key_recorder,
-):
-    """上游 4xx 拒绝：任务 FAILURE + 取消冻结（用户令牌）+ key 失败上报。"""
-    respx_router.post("http://upstream.test/v2/video_generation").mock(
-        return_value=httpx.Response(400, json={"error": "content policy"})
-    )
-    pf = _make_preflight(route_factory(), key_lease_factory(),
-                         body={"model": "MiniMax-H3"})
-
-    with pytest.raises(HTTPException) as exc_info:
-        await flow.create_task("minimax", {"model": "MiniMax-H3"}, pf,
-                               action="video", source="videos")
-    assert exc_info.value.status_code == 502
-    row = await task_store.get(pf.task_id)
-    assert row["status"] == FAILURE
-    assert queue_events["cancel"] == [{"request_id": pf.task_id, "user_sk": "sk-user-1"}]
-    assert key_recorder[0]["ok"] is False and key_recorder[0]["status_code"] == 400
-
-
-async def test_create_task_tail_gather_poll_failure(
-    respx_router, route_factory, key_lease_factory,
+async def test_create_task_publish_failure_compensates(
+    route_factory, key_lease_factory,
     patch_redis, task_store, queue_events, key_recorder, monkeypatch,
 ):
-    """收尾并行化失败语义：schedule_poll 抛错时——
-    ① 异常照常传播到外层补偿（释放并发槽 + 取消冻结）；
-    ② 同 gather 的 idem.set_task_id 不被取消、落键成功
-       （gather 默认不取消兄弟协程，客户端重试可回放）。"""
+    """提交事件入队失败（Redis 故障）：异常传播 + 外层补偿（释放并发槽 +
+    取消冻结）；幂等键已回填（重试回放该行，孤儿 sweep 会收口判死）。"""
     import app.queue as q
     from unittest.mock import AsyncMock
 
-    respx_router.post("http://upstream.test/v2/video_generation").mock(
-        return_value=httpx.Response(200, json={"task_id": "mm-1"})
-    )
-    monkeypatch.setattr(q, "schedule_poll",
+    monkeypatch.setattr(q, "publish_submit",
                         AsyncMock(side_effect=RuntimeError("redis down")))
     body = {"model": "MiniMax-H3", "duration": 5}
     pf = _make_preflight(route_factory(), key_lease_factory(),
@@ -157,27 +129,9 @@ async def test_create_task_tail_gather_poll_failure(
 
     # 外层补偿：取消冻结（用户令牌）已发布
     assert queue_events["cancel"] == [{"request_id": pf.task_id, "user_sk": "sk-user-1"}]
-    # 兄弟协程未被取消：幂等键仍落库，重试可回放原任务而非双建双扣
+    # 幂等键已落：客户端重试回放同一行而非双建双扣
     from app.services import idem
     assert await idem.get_task_id(pf.token.hash, "idem-tail") == pf.task_id
-
-
-async def test_create_task_missing_task_id_visible(
-    respx_router, route_factory, key_lease_factory,
-    patch_redis, task_store, queue_events, key_recorder,
-):
-    """傻瓜式防护：提交响应提取不到 task_id（task_id_path 配错）→ 立即 502。"""
-    respx_router.post("http://upstream.test/v2/video_generation").mock(
-        return_value=httpx.Response(200, json={"unexpected": "shape"})
-    )
-    pf = _make_preflight(route_factory(), key_lease_factory(),
-                         body={"model": "MiniMax-H3"})
-    with pytest.raises(HTTPException) as exc_info:
-        await flow.create_task("minimax", {"model": "MiniMax-H3"}, pf,
-                               action="video", source="videos")
-    assert exc_info.value.status_code == 502
-    assert "missing task id" in str(exc_info.value.detail)
-    assert queue_events["cancel"]            # 冻结已取消补偿
 
 
 async def test_create_task_submit_path_not_configured(
@@ -191,6 +145,111 @@ async def test_create_task_submit_path_not_configured(
                                action="video", source="videos")
     assert exc_info.value.status_code == 502
     assert "submit_path" in str(exc_info.value.detail)
+    assert queue_events["submit"] == []
+
+
+# ---------------------------------------------------------------------------
+# view_task：上游 id 反查 + 耗时序列化
+# ---------------------------------------------------------------------------
+
+
+async def test_view_task_resolves_upstream_task_id(
+    route_factory, patch_redis, task_store, queue_events,
+):
+    """GET 兼容入口：客户端持上游任务 id 轮询 → 反查本地任务（返回视图里
+    仍是本地 task_id，全链路以本地 id 为准）。"""
+    task_id = await _seed_task(task_store, route_factory())
+    await task_store.patch_data(task_id, {"upstream_task_id": "up-424010"})
+
+    view = await flow.view_task("up-424010")
+    assert view["task_id"] == task_id
+    assert view["status"] == SUBMITTED
+    # 反查是兜底入口，绝不意味着上游 id 可以回显给客户端
+    assert "upstream_task_id" not in view
+    assert "up-424010" not in json.dumps(view, ensure_ascii=False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await flow.view_task("no-such-id")
+    assert exc_info.value.status_code == 404
+
+
+async def test_public_view_strips_internal_fields(
+    route_factory, patch_redis, task_store, queue_events,
+):
+    """对外契约收紧：public_view 白名单序列化——upstream_task_id/token_hash/
+    freeze_amount 等内部实现细节绝不泄给客户端（上游 id 只留 tasks.data 内部，
+    供轮询/结算/对账与 ops 诊断使用）。"""
+    task_id = await _seed_task(task_store, route_factory())
+    await task_store.patch_data(task_id, {"upstream_task_id": "up-424010"})
+
+    task = await task_store.get(task_id)
+    view = flow.public_view(task)
+
+    assert set(view) == {"task_id", "status", "progress", "fail_reason", "result",
+                         "created_at", "finish_time", "duration"}
+    serialized = json.dumps(view, ensure_ascii=False)
+    assert "upstream_task_id" not in view
+    assert "up-424010" not in serialized          # 上游 id 值本身也不出现
+    assert "token_hash" not in serialized
+    assert "freeze_amount" not in serialized
+
+
+async def test_cancel_task_resolves_upstream_task_id(
+    route_factory, patch_redis, task_store, queue_events,
+):
+    """取消同一兼容入口：按上游 id 反查后正常终态收口。"""
+    task_id = await _seed_task(task_store, route_factory())
+    await task_store.patch_data(task_id, {"upstream_task_id": "up-424010"})
+    await tokensession.store(task_id, "sk-user-1")
+
+    view = await flow.cancel_task("up-424010")
+    assert view["task_id"] == task_id
+    assert view["status"] == "CANCELED"
+    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+
+
+# ---------------------------------------------------------------------------
+# duration：耗时序列化（秒；终态时间缺失/毫秒混入不产出天文数字）
+# ---------------------------------------------------------------------------
+
+
+def _duration_task(**overrides) -> dict:
+    now = int(time.time())
+    task = {"task_id": "d" + "0" * 31, "status": SUCCESS, "data": {},
+            "created_at": now - 271, "finish_time": now}
+    task.update(overrides)
+    return task
+
+
+async def test_duration_seconds_success_and_failure():
+    """成功/失败同一公式：耗时 = 终态时间 - 创建时间（秒）。"""
+    ok = flow.duration_seconds(_duration_task(status=SUCCESS))
+    assert ok == 271
+    failed = flow.duration_seconds(_duration_task(status=FAILURE))
+    assert failed == 271
+    assert flow.public_view(_duration_task())["duration"] == 271
+
+
+async def test_duration_seconds_non_terminal_is_zero():
+    """非终态（finish_time=0/缺失）耗时为 0，不产出"当前时间"级天文数字。"""
+    assert flow.duration_seconds(_duration_task(status=SUBMITTED, finish_time=0)) == 0
+    task = _duration_task(status=SUBMITTED)
+    del task["finish_time"]
+    assert flow.duration_seconds(task) == 0
+    assert flow.duration_seconds(_duration_task(created_at=0)) == 0
+
+
+async def test_duration_seconds_millisecond_timestamp_normalized():
+    """毫秒时间戳混入（如 new-api 原生任务模块 UnixMilli 写法）→ 归一为秒，
+    绝不把 ~1e12 的毫秒值当秒输出。"""
+    now_ms = int(time.time() * 1000)
+    task = _duration_task(finish_time=now_ms, created_at=now_ms - 271_000)
+    assert flow.duration_seconds(task) == 271
+    # 终态为毫秒、创建时间为秒的混合单位同样归一
+    mixed = _duration_task(finish_time=now_ms)
+    assert 0 <= flow.duration_seconds(mixed) <= 300
+    # 终态缺失但创建时间毫秒混入：仍然 0
+    assert flow.duration_seconds(_duration_task(finish_time=0, created_at=now_ms)) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +276,7 @@ async def test_finalize_success_settle_requote(
     """成功终态：settle_usage_map 提取实际秒数 → 重跑渠道计费规则 → 多退少补。"""
     route = route_factory(billing_rule="duration * 0.026", billing_type="second")
     task_id = await _seed_task(task_store, route, callback_url="https://user.test/hook")
+    await task_store.patch_data(task_id, {"upstream_task_id": "up-424010"})
     await tokensession.store(task_id, "sk-user-1")
 
     task = await task_store.get(task_id)
@@ -237,6 +297,10 @@ async def test_finalize_success_settle_requote(
     assert row["data"]["result"] == "http://cdn.test/v.mp4"
     assert queue_events["notify"][0]["url"] == "https://user.test/hook"
     assert queue_events["notify"][0]["payload"]["result"] == "http://cdn.test/v.mp4"
+    # 回调投递载荷与 public_view 同一白名单：不含上游任务 id（字段与值都不出现）
+    notify_payload = queue_events["notify"][0]["payload"]
+    assert "upstream_task_id" not in notify_payload
+    assert "up-424010" not in json.dumps(notify_payload, ensure_ascii=False)
     assert await tokensession.get(task_id) is None
 
 

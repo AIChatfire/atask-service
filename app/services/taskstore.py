@@ -33,10 +33,11 @@ async def create(
                 """
                 INSERT INTO tasks
                   (task_id, platform, action, status, progress, data,
-                   user_id, channel_id, quota, submit_time, created_at, updated_at)
+                   user_id, channel_id, quota, submit_time, start_time,
+                   created_at, updated_at)
                 VALUES
                   (:task_id, :platform, :action, 'SUBMITTED', '0%', CAST(:data AS JSON),
-                   :user_id, :channel_id, 0, :now, :now, :now)
+                   :user_id, :channel_id, 0, :now, :now, :now, :now)
                 """
             ),
             {
@@ -52,6 +53,16 @@ async def create(
         await db.commit()
 
 
+def _row_to_dict(row) -> dict:
+    result = dict(row)
+    data = result.get("data")
+    if isinstance(data, str):
+        result["data"] = json.loads(data)
+    elif data is None:
+        result["data"] = {}
+    return result
+
+
 async def get(task_id: str) -> dict | None:
     async with get_session_factory()() as db:
         row = (
@@ -61,13 +72,28 @@ async def get(task_id: str) -> dict | None:
         ).mappings().first()
     if not row:
         return None
-    result = dict(row)
-    data = result.get("data")
-    if isinstance(data, str):
-        result["data"] = json.loads(data)
-    elif data is None:
-        result["data"] = {}
-    return result
+    return _row_to_dict(row)
+
+
+async def get_by_upstream_id(upstream_task_id: str) -> dict | None:
+    """按上游任务 id 反查本地任务（客户端持上游 id 轮询的兼容入口；
+    权威 id 仍是本地 task_id，data.upstream_task_id 为两者的关联点）。"""
+    async with get_session_factory()() as db:
+        row = (
+            await db.execute(
+                text(
+                    """
+                    SELECT * FROM tasks
+                    WHERE platform = :p AND data ->> '$.upstream_task_id' = :u
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ),
+                {"p": settings.gateway_platform, "u": upstream_task_id},
+            )
+        ).mappings().first()
+    if not row:
+        return None
+    return _row_to_dict(row)
 
 
 async def cas(

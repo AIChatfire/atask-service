@@ -12,8 +12,8 @@ from app import queue
 from app.config import settings
 from app.logging import log
 from app.queue import publish_cancel, publish_settle, schedule_poll
-from app.redis import r
-from app.schemas import FAILURE, SUCCESS, TERMINAL
+from app.redis import K_SUBMIT_LOCK, r
+from app.schemas import FAILURE, SUBMITTED, SUCCESS, TERMINAL
 from app.services import flow, providers, statusmap, taskstore, tokensession, upstream
 from app.services.providers import BillingError
 from app.services.registry import registry, route_from_lease
@@ -44,8 +44,9 @@ async def _orphan_closeout() -> None:
             continue
         log.error("orphan task closed: {} (no upstream_task_id after {}s)",
                   task_id, settings.orphan_grace_seconds)
+        # 上游从未接单（无 upstream_task_id）：一律解冻，不适用 failed_billing=charge
         await flow.finalize_task(
-            task, FAILURE, {},
+            task, FAILURE, {}, failed_charge=False,
             fail_reason="orphan: submit never returned upstream task id",
         )
 
@@ -143,7 +144,10 @@ async def _held_maintenance() -> None:
         if not task or task["status"] in TERMINAL:
             continue
         log.error("held task expired, finalize FAILURE: {}", task_id)
-        await flow.finalize_task(task, FAILURE, {}, fail_reason="held timeout")
+        # HELD 任务从未被上游接单（挂起态无 upstream_task_id）：一律解冻，
+        # 不适用 failed_billing=charge（与 submit/held 恢复判死同口径）
+        await flow.finalize_task(task, FAILURE, {}, failed_charge=False,
+                                 fail_reason="held timeout")
     if await taskstore.oldest_held():
         if await r.set("gw:held:resume_lock", "1", ex=60, nx=True):
             await queue.schedule_resume_held(0)
@@ -152,10 +156,27 @@ async def _held_maintenance() -> None:
 async def sweep_once() -> None:
     await _watch_queue()
     stale = await taskstore.stale_active(settings.task_stale_seconds)
+    resubmitted = 0
+    in_flight = 0
     for task_id in stale:
-        await schedule_poll(task_id, 0)
+        task = await taskstore.get(task_id)
+        if not task or task["status"] in TERMINAL:
+            continue
+        if task["status"] == SUBMITTED and not (task.get("data") or {}).get("upstream_task_id"):
+            # 提交事件丢失（worker 崩溃/Redis 故障）：补投异步提交（submit_one
+            # 幂等 + 互斥锁，重复补投安全）；仍未提交成功的超龄残留由孤儿收口判死。
+            # 补投前查锁（KI2 根治）：锁在 = 有在飞提交，本轮让路——避免锁过期
+            # 竞态叠加出「补投与在飞提交并发 → 上游双建」窗口
+            if await r.get(K_SUBMIT_LOCK.format(task_id=task_id)):
+                in_flight += 1
+                continue
+            await queue.publish_submit(task_id)
+            resubmitted += 1
+        else:
+            await schedule_poll(task_id, 0)
     if stale:
-        log.info("sweeper requeued {} stale tasks", len(stale))
+        log.info("sweeper requeued {} stale tasks ({} resubmitted, {} in-flight skipped)",
+                 len(stale), resubmitted, in_flight)
 
     # 终态但结算未落：重发计费事件（需用户令牌；令牌会话丢失则冻结已由
     # billing TTL 兜底解冻，直接收口并告警，不再无限重发）

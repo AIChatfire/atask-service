@@ -12,6 +12,7 @@ from app.main import app
 from app.services import tokensession
 from app.services.held import resume_held_once
 from app.services.reconcile import sweep_once
+from app.services.submit import submit_one
 
 BODY = {"model": "MiniMax-H3", "duration": 5}
 
@@ -78,8 +79,8 @@ def _seed_held(task_store, task_id: str | None = None, **overrides) -> str:
 async def test_submit_account_level_holds_task(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """submit 撞账户级（403 欠费）→ HELD：202 对外 queued、冻结保留、
-    并发槽释放、resume 已调度、不上报坏 key（账户级 ≠ key 级）。"""
+    """submit 撞账户级（403 欠费）→ HELD：创建即时 202（SUBMITTED），worker 侧
+    挂起保留冻结、对外 GET 映射 queued、并发槽释放、resume 已调度、不上报坏 key。"""
     mocks.create = respx_router.post("http://upstream.test/v2/video_generation").mock(
         return_value=httpx.Response(403, text="account overdue")
     )
@@ -90,9 +91,17 @@ async def test_submit_account_level_holds_task(
             headers={"Authorization": "Bearer sk-user-42"},
         )
 
-    assert resp.status_code == 202, resp.text
-    assert resp.json()["status"] == "QUEUED"          # 对外不暴露 HELD
-    task_id = resp.json()["task_id"]
+        assert resp.status_code == 202, resp.text
+        assert resp.json()["status"] == "SUBMITTED"       # 落库即返，提交在 worker
+        assert not mocks.create.calls                     # 请求内零上游调用
+        task_id = resp.json()["task_id"]
+        assert task_id.startswith("minimax_")             # biz 前缀
+
+        await submit_one(task_id)                         # worker 异步提交
+
+        got = await client.get(f"/minimax/v1/tasks/{task_id}")
+        assert got.json()["status"] == "QUEUED"           # 对外不暴露 HELD
+
     row = task_store.rows[task_id]
     assert row["status"] == "HELD"
     assert row["data"]["held_reason"] == "account_level"
@@ -159,8 +168,8 @@ async def test_held_expired_sweep_fails_task(
 async def test_submit_rate_limited_holds_task(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """submit 全部重打撞 429 → HELD（held_reason=rate_limited）：202 对外 queued、
-    冻结保留、并发槽释放、按 5m 固定退避调度 resume、不上报坏 key（限流 ≠ key 级）。"""
+    """submit 全部重打撞 429 → HELD（held_reason=rate_limited）：创建即时 202，
+    worker 侧挂起保留冻结、并发槽释放、按 5m 固定退避调度 resume、不上报坏 key。"""
     mocks.create = respx_router.post("http://upstream.test/v2/video_generation").mock(
         return_value=httpx.Response(429, text="rate limit exceeded")
     )
@@ -172,8 +181,11 @@ async def test_submit_rate_limited_holds_task(
         )
 
     assert resp.status_code == 202, resp.text
-    assert resp.json()["status"] == "QUEUED"          # 对外不暴露 HELD
+    assert resp.json()["status"] == "SUBMITTED"       # 落库即返，提交在 worker
     task_id = resp.json()["task_id"]
+
+    await submit_one(task_id)                         # worker 异步提交
+
     row = task_store.rows[task_id]
     assert row["status"] == "HELD"
     assert row["data"]["held_reason"] == "rate_limited"
@@ -201,6 +213,68 @@ async def test_resume_held_rate_limited_fixed_backoff(
     assert queue_events["resume_held"] == [{"delay": 300}]   # 固定 5m，非阶梯 60s
     assert queue_events["cancel"] == []
     assert patch_redis._data.get("gw:conc:h") == "0"  # 并发槽已还回
+
+
+async def test_held_expired_ignores_failed_charge_policy(
+    mocks, test_settings, patch_redis, task_store, queue_events, route_factory,
+):
+    """HELD 超龄判死（从未被上游接单）：即使渠道配 failed_billing=charge 也
+    一律解冻（KI1 计费口径回归；charge 只覆盖生成失败）。"""
+    from app.services.registry import registry
+
+    registry._cache.clear()
+    registry.remember(route_factory(failed_billing="charge"))
+    task_id = _seed_held(task_store, updated_at=int(time.time()) - 5 * 3600)
+    await tokensession.store(task_id, "sk-user-1")
+
+    await sweep_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == "FAILURE"
+    assert "held timeout" in row["fail_reason"]
+    assert queue_events["settle"] == []
+    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+    registry._cache.clear()
+
+
+async def test_resume_held_task_level_reject_releases_slot_once(
+    mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """恢复重提交撞任务级拒绝（400）→ 判死 + 解冻；并发槽恰好释放一次——
+    同用户另一任务的占用槽不得被双重 DECR 误还（回归：finalize 统一释槽）。"""
+    mocks.create = respx_router.post("http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(400, text="content rejected")
+    )
+    task_id = _seed_held(task_store)
+    await tokensession.store(task_id, "sk-user-1")
+    patch_redis._data["gw:conc:h"] = "1"            # 同用户另一任务占 1 槽
+
+    await resume_held_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == "FAILURE"
+    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+    assert patch_redis._data.get("gw:conc:h") == "1"    # 只还回自己的槽
+
+
+async def test_resume_held_missing_task_id_releases_slot_once(
+    mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """恢复重提交 200 但提取不到上游 id → 判死 + 解冻；并发槽同样恰好释放一次。"""
+    mocks.create = respx_router.post("http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(200, json={"unexpected": "shape"})
+    )
+    task_id = _seed_held(task_store)
+    await tokensession.store(task_id, "sk-user-1")
+    patch_redis._data["gw:conc:h"] = "1"            # 同用户另一任务占 1 槽
+
+    await resume_held_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == "FAILURE"
+    assert "missing task id" in row["fail_reason"]
+    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+    assert patch_redis._data.get("gw:conc:h") == "1"    # 只还回自己的槽
 
 
 async def test_held_rate_limited_expires_earlier(

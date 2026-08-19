@@ -21,7 +21,7 @@ from app.deps.preflight import preflight
 from app.deps.ratelimit import ip_rate_limit
 from app.logging import log
 from app.schemas import ACTIVE, FAILURE, QUEUED
-from app.services import flow, providers, taskstore, upstream
+from app.services import flow, idem, providers, taskstore, upstream
 from app.services.providers import KeyLeaseError
 from app.services.registry import registry, route_from_lease
 
@@ -95,31 +95,40 @@ async def dynamic_proxy(biz: str, path: str, request: Request):
                 "error": "idempotent replay target missing; retry without Idempotency-Key"})
         route = pf.route
         assert route is not None and pf.identity is not None and pf.key is not None
-        await taskstore.create(
-            task_id=pf.task_id,
-            user_id=pf.identity.user_id,
-            channel_id=pf.key.key_id,
-            action="proxy",
-            data={
-                # 与 flow.create_task 同构的任务记录：权威 biz 取渠道元数据，
-                # model/key_index/request_body 全量落（结算重估与探测钉回的事实源）
-                "biz": route.biz,
-                "source": "proxy",
-                "model": pf.model,
-                "token_hash": pf.token.hash,
-                "idempotency_key": pf.idem_key,
-                # 透传形态不接管用户回调：原始 body 已流式直达上游（含用户
-                # 自带 callback_url），网关再 notify 会重复投递
-                "callback_url": None,
-                "freeze_amount": pf.amount,
-                "settled": pf.amount <= 0,
-                "freeze_expires_at": pf.freeze_expires_at,
-                "key_id": pf.key.key_id,
-                "key_index": pf.key.key_index,
-                "request_body": pf.body,
-                "proxy_path": path,
-            },
-        )
+        try:
+            await taskstore.create(
+                task_id=pf.task_id,
+                user_id=pf.identity.user_id,
+                channel_id=pf.key.key_id,
+                action="proxy",
+                data={
+                    # 与 flow.create_task 同构的任务记录：权威 biz 取渠道元数据，
+                    # model/key_index/request_body 全量落（结算重估与探测钉回的事实源）
+                    "biz": route.biz,
+                    "source": "proxy",
+                    "model": pf.model,
+                    "token_hash": pf.token.hash,
+                    "idempotency_key": pf.idem_key,
+                    # 透传形态不接管用户回调：原始 body 已流式直达上游（含用户
+                    # 自带 callback_url），网关再 notify 会重复投递
+                    "callback_url": None,
+                    "freeze_amount": pf.amount,
+                    "settled": pf.amount <= 0,
+                    "freeze_expires_at": pf.freeze_expires_at,
+                    "key_id": pf.key.key_id,
+                    "key_index": pf.key.key_index,
+                    "request_body": pf.body,
+                    "proxy_path": path,
+                },
+            )
+            if pf.idem_key:
+                # 幂等占位回填（同一键 pending → task_id，与 flow.create_task 同时序）
+                await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
+        except Exception:
+            if pf.idem_key:
+                # 落库失败（无任务可回填）：CAS 归还占位，同键重试立即可重建
+                await idem.release(pf.token.hash, pf.idem_key)
+            raise
         log.info("proxy task created: task_id={} biz={} model={} path=/{}/{}",
                  pf.task_id, route.biz, pf.model, biz, path)
         key_lease = pf.key   # 上方组合 assert 已收窄非 None

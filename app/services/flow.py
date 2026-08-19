@@ -1,23 +1,31 @@
 """任务生命周期共享逻辑：创建 / 查询 / 取消，以及终态推进的统一入口。
 被 tasks / videos / proxy 三个路由和 callback / poller 两个入站复用。
+
+创建链路为**异步提交**：preflight（限流/幂等/内省/租约/冻结）→ 落 tasks 表
+→ 立即返回本地 task_id → 上游提交由 queue.submit_task 在 worker 进程执行
+（app/services/submit.py），拿到上游 id 后回写并进探测/回调闭环。
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
 from typing import Any
 
 from fastapi import HTTPException
 
 from app import queue
-from app.config import settings
 from app.deps import ratelimit
 from app.deps.preflight import Preflight
 from app.logging import log
-from app.schemas import ACTIVE, FAILURE, HELD, QUEUED, SUCCESS, TERMINAL
+from app.schemas import (
+    ACTIVE,
+    FAILURE,
+    HELD,
+    QUEUED,
+    SUBMITTED,
+    SUCCESS,
+    TERMINAL,
+)
 from app.services import (
-    errclass,
     idem,
     pricing,
     providers,
@@ -26,12 +34,39 @@ from app.services import (
     tokensession,
     upstream,
 )
-from app.services.providers import KeyLeaseError, PricingError
-from app.services.registry import registry, route_from_lease
+from app.services.providers import PricingError
+from app.services.registry import registry
+
+#: 时间字段统一 int64 unix **秒**；超过该阈值（1e11 秒 ≈ 5138 年）视为混入的
+#: 毫秒时间戳（如 new-api 原生任务模块的 UnixMilli 写法），序列化时归一为秒
+_UNIX_MS_THRESHOLD = 100_000_000_000
+
+
+def _as_unix_seconds(value: Any) -> int:
+    """时间字段归一为 unix 秒：毫秒时间戳折算，缺失/非法 → 0。"""
+    try:
+        ts = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if ts > _UNIX_MS_THRESHOLD:
+        ts //= 1000
+    return ts
+
+
+def duration_seconds(task: dict) -> int:
+    """耗时 = 终态时间 - 创建时间（统一秒）。终态时间缺失（非终态/为 0）或
+    字段异常时返回 0——绝不产出天文数字。"""
+    finish = _as_unix_seconds(task.get("finish_time"))
+    created = _as_unix_seconds(task.get("created_at"))
+    if not finish or not created:
+        return 0
+    return max(0, finish - created)
 
 
 def public_view(task: dict) -> dict:
-    """对外视图：不暴露 key/freeze/token_hash 等内部字段；task_id 即凭证，无需鉴权。
+    """对外视图（白名单序列化）：upstream_task_id/key/freeze/token_hash 等内部
+    字段绝不暴露——上游任务 id 是内部实现细节，只留 tasks.data 供轮询/结算/
+    对账与 ops 诊断使用；task_id 即凭证，无需鉴权。
     HELD（账户级挂起）对外映射为 QUEUED——调用方无需理解挂起语义。"""
     data = task.get("data") or {}
     status = task["status"]
@@ -43,6 +78,7 @@ def public_view(task: dict) -> dict:
         "result": data.get("result"),
         "created_at": task.get("created_at"),
         "finish_time": task.get("finish_time") or 0,
+        "duration": duration_seconds(task),
     }
 
 
@@ -66,12 +102,28 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
 
     assert pf.route is not None and pf.key is not None and pf.identity is not None
 
-    # 2) 并发占用（终态推进时释放）
-    await ratelimit.conc_acquire(pf.token.hash)
+    # 1) 并发占用（终态推进时释放）
+    try:
+        await ratelimit.conc_acquire(pf.token.hash)
+    except Exception:
+        # 占用失败（429 超限）= 创建链路失败：取消预冻结（资金不无任务挂账
+        # 至 freeze TTL）+ CAS 归还幂等占位，与下方创建异常分支同一收口纪律；
+        # 槽位未抢到（LUA 自减），无需 conc_release
+        if pf.amount > 0:
+            await queue.publish_cancel(pf.task_id, pf.token.raw)
+        if pf.idem_key:
+            await idem.release(pf.token.hash, pf.idem_key)
+        raise
 
     route = pf.route
     if not route.submit_path:
         # 渠道 setting.gateway.submit_path 未配置：接入未完成，立即可见
+        await ratelimit.conc_release(pf.token.hash)   # K_CONC 无 TTL，泄漏即永久丢槽
+        if pf.amount > 0:
+            await queue.publish_cancel(pf.task_id, pf.token.raw)
+        if pf.idem_key:
+            # 占位者提前出局（无任务可回填）：CAS 归还占位，同键重试立即可重建
+            await idem.release(pf.token.hash, pf.idem_key)
         raise HTTPException(
             502, f"biz {biz!r} upstream not configured "
                  f"(channel setting.gateway.submit_path missing)"
@@ -80,16 +132,6 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         "task creating: task_id={} biz={} model={} user_id={} channel_id={} freeze={}",
         pf.task_id, route.biz, pf.model, pf.identity.user_id, pf.key.key_id, pf.amount,
     )
-    callback_url = (
-        route.callback_url_for(settings.gateway_public_base_url, pf.task_id)
-        if route.supports_callback
-        else None
-    )
-    # 提交体在路由侧一次塑形：default_params < 用户 body < 渠道 param_override，
-    # model_mapping 改写 + 回调注入 + client_request_id（详见 upstream.build_submit_body）
-    submit_body = upstream.build_submit_body(route, pf.key, body, callback_url,
-                                             client_request_id=pf.task_id)
-
     data = {
         "biz": route.biz,                     # 权威 biz 来自渠道元数据（非 URL 段）
         "source": source,
@@ -102,10 +144,12 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         "key_id": pf.key.key_id,
         "key_index": pf.key.key_index,
         "freeze_expires_at": pf.freeze_expires_at,
-        # 原始请求快照：终态结算重估的基底（settle_usage_map 覆盖实际用量）
+        # 原始请求快照：异步提交体重建与终态结算重估的基底
         "request_body": body,
     }
     try:
+        # 2) 立即落库（SUBMITTED）→ 回填幂等键 → 提交事件入队（Redis list，
+        #    进程重启不丢；sweep 对丢失的提交事件兜底补投）
         await taskstore.create(
             task_id=pf.task_id,
             user_id=pf.identity.user_id,
@@ -113,137 +157,9 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
             action=action,
             data=data,
         )
-
-        # 3) 提交上游：仅换 key 可能改变结果的确定性拒绝（默认 401/403/429，
-        #    GW_SUBMIT_RETRYABLE_STATUS_CODES 可配）重打——确定性拒绝 =
-        #    上游明确未接单（未创建任务/未扣费），重打安全；模糊失败
-        #    （超时/5xx/连接中断）维持绝不重试（防双重创建双扣费）；
-        #    任务级 4xx（如 400 内容审核）重打同一报文无意义，不在默认集合。
-        #    key 级拒绝随重打先 report 驱动 keypool 禁用坏 key，重新 lease 即得
-        #    健康 key（keypool 无 exclude 参数，剔除靠 report 闭环）。
-        key = pf.key
-        resp: dict | None = None
-        last_exc: upstream.UpstreamError | None = None
-        for attempt in range(1, settings.submit_max_attempts + 1):
-            started = time.monotonic()
-            try:
-                resp = await upstream.submit(route, key, submit_body)
-                break
-            except upstream.UpstreamError as exc:
-                last_exc = exc
-                category = errclass.classify(route, exc)
-                retryable = (
-                    attempt < settings.submit_max_attempts
-                    and not exc.envelope
-                    and exc.status in settings.submit_retryable_status_codes
-                )
-                if not retryable:
-                    break
-                if category == errclass.KEY_LEVEL:
-                    await providers.keys.report(
-                        key, ok=False, status_code=exc.status, error=str(exc)[:200])
-                log.warning(
-                    "submit rejected ({}), retry with fresh lease: task_id={} attempt={}/{}",
-                    category, pf.task_id, attempt, settings.submit_max_attempts,
-                )
-                try:
-                    key = await providers.keys.lease(biz, model=pf.model)
-                except KeyLeaseError as lease_exc:
-                    log.warning("submit retry re-lease failed: {}", lease_exc)
-                    break
-                # 渠道覆盖按新租约重建（model_mapping/param_override 逐渠道生效）
-                route = registry.remember(route_from_lease(biz, key))
-                submit_body = upstream.build_submit_body(route, key, body, callback_url,
-                                                         client_request_id=pf.task_id)
-        if resp is None:
-            assert last_exc is not None
-            err = last_exc      # except 块的 as 变量出块即被删除，换名引用
-            category = errclass.classify(route, err)
-            if category in (errclass.ACCOUNT_LEVEL, errclass.RATE_LIMITED):
-                # 账户级故障（欠费/封禁）或上游限流（429）：挂起而非判死——HELD
-                # 保留冻结，sweep 续期保活，resume_held 金丝雀排空（恢复时不钉渠道）。
-                # 挂起即释放并发槽；账户级/限流都不上报 keypool（不是单个 key 坏了）。
-                # held_reason 区分语义：限流退避固定 5m、1h 兜底判死（held.py /
-                # reconcile 据此分流），账户级维持 1m→5m→15m 阶梯与 4h 上限。
-                await taskstore.cas(pf.task_id, ACTIVE, HELD,
-                                    patch={"held_reason": category},
-                                    fail_reason=str(err)[:500])
-                await ratelimit.conc_release(pf.token.hash)
-                if pf.idem_key:
-                    await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
-                await statelog.record_if_changed(pf.task_id, HELD, detail="submit")
-                log.warning("task HELD ({}): task_id={} biz={} err={}",
-                            category, pf.task_id, route.biz, str(err)[:200])
-                if settings.logfire_enabled:
-                    try:
-                        import logfire
-
-                        logfire.warn("task_held", task_id=pf.task_id, biz=route.biz,
-                                     error=str(err)[:200])
-                    except Exception:
-                        pass
-                # 首次排空节奏：限流固定 5m（上游限速窗口语义），账户级 1m 起
-                await queue.schedule_resume_held(
-                    settings.held_rate_limited_backoff_seconds
-                    if category == errclass.RATE_LIMITED else 60)
-                return {"task_id": pf.task_id, "status": QUEUED}   # 202，对外 queued
-            await taskstore.cas(pf.task_id, ACTIVE, FAILURE, fail_reason=str(err)[:500])
-            if pf.amount > 0:
-                await queue.publish_cancel(pf.task_id, pf.token.raw)
-            await ratelimit.conc_release(pf.token.hash)
-            await providers.keys.report(
-                key, ok=False,
-                status_code=0 if err.envelope else err.status,
-                error=str(err)[:200],
-            )
-            log.warning("upstream rejected at submit: task_id={} biz={} class={} err={}",
-                        pf.task_id, route.biz, category, str(err)[:200])
-            raise HTTPException(502, f"upstream rejected: {err}") from err
-        latency_ms = int((time.monotonic() - started) * 1000)
-        await providers.keys.report(key, ok=True, latency_ms=latency_ms)
-        if key.key_id != pf.key.key_id:
-            # 重打落到别的渠道：探测钉回与对账口径以实际渠道为准
-            await taskstore.patch_data(
-                pf.task_id, {"key_id": key.key_id, "key_index": key.key_index},
-                channel_id=key.key_id,
-            )
-
-        upstream_task_id = upstream.extract_path(resp, route.task_id_path)
-        if not upstream_task_id:
-            # 傻瓜式防护：submit_path 配置的 biz 必须能提取到上游任务 id，
-            # 提取不到 = task_id_path 配错或上游非异步——立即可见，不静默挂起
-            await taskstore.cas(
-                pf.task_id, ACTIVE, FAILURE,
-                fail_reason=f"upstream response missing task id at path {route.task_id_path!r}",
-            )
-            if pf.amount > 0:
-                await queue.publish_cancel(pf.task_id, pf.token.raw)
-            await ratelimit.conc_release(pf.token.hash)
-            log.warning("submit response missing task id: task_id={} biz={} path={!r}",
-                        pf.task_id, route.biz, route.task_id_path)
-            raise HTTPException(
-                502, f"upstream response missing task id (task_id_path={route.task_id_path!r})"
-            )
-        await taskstore.patch_data(
-            pf.task_id,
-            {"upstream_task_id": upstream_task_id},
-            status=QUEUED,
-        )
-        log.info("task submitted: task_id={} upstream_task_id={} latency_ms={}",
-                 pf.task_id, upstream_task_id, latency_ms)
-
-        # 4) 上游不支持回调 → 进延迟探测队列；幂等键回填与之相互独立
-        #    （均为 Redis 写，无顺序依赖），并行省一个串行 RTT
-        tail = []
-        if not route.supports_callback:
-            tail.append(queue.schedule_poll(pf.task_id, settings.poll_ladder_seconds[0]))
         if pf.idem_key:
-            tail.append(idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id))
-        if tail:
-            await asyncio.gather(*tail)
-
-        view = {"task_id": pf.task_id, "status": QUEUED, "upstream_task_id": upstream_task_id}
-        return view
+            await idem.set_task_id(pf.token.hash, pf.idem_key, pf.task_id)
+        await queue.publish_submit(pf.task_id)
     except HTTPException:
         raise
     except Exception:
@@ -251,14 +167,32 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
         await ratelimit.conc_release(pf.token.hash)
         if pf.amount > 0:
             await queue.publish_cancel(pf.task_id, pf.token.raw)
+        if pf.idem_key:
+            # 幂等占位未回填（任务未建成）：CAS 归还占位（已回填则 no-op），
+            # 同键重试立即可重建而不是干等占位 TTL
+            await idem.release(pf.token.hash, pf.idem_key)
         raise
+
+    # 3) 立即返回本地 task_id——上游提交在 worker 异步执行（submit.submit_one），
+    #    失败补偿（解冻/HELD 挂起）由 worker 侧收口；GET/轮询/回调全程本地 id
+    log.info("task accepted (async submit): task_id={} biz={}", pf.task_id, route.biz)
+    return {"task_id": pf.task_id, "status": SUBMITTED}
+
+
+async def _resolve_task(task_id: str) -> dict | None:
+    """本地 task_id 优先；未命中按上游任务 id 反查——客户端持上游 id
+    （如同步提交时代/proxy 透传响应里的上游 id）轮询的兼容入口。"""
+    task = await taskstore.get(task_id)
+    if task:
+        return task
+    return await taskstore.get_by_upstream_id(task_id)
 
 
 async def view_task(task_id: str) -> dict:
-    task = await taskstore.get(task_id)
+    task = await _resolve_task(task_id)
     if not task:
         raise HTTPException(404, "task not found")
-    await statelog.record_if_changed(task_id, task["status"], detail="get")
+    await statelog.record_if_changed(task["task_id"], task["status"], detail="get")
     return public_view(task)
 
 
@@ -299,10 +233,12 @@ async def _settle_amount(route, task: dict, raw: dict) -> tuple[float, dict[str,
 
 
 async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str = "",
-                        route=None) -> bool:
-    """终态推进统一入口（callback / poller 共用）。
+                        route=None, failed_charge: bool = True) -> bool:
+    """终态推进统一入口（callback / poller / 异步提交失败补偿共用）。
     CAS 抢到推进权才发事件；结算金额取 actual_amount_path / 重估 / 冻结额三档。
     ``route`` 由调用方（已持有租约构建的路由）传入；缺省读进程缓存兜底。
+    ``failed_charge=False``：提交阶段失败（上游未接单）一律解冻，不适用渠道
+    失败单 charge 策略（该策略只覆盖生成失败的厂商条款收费）。
     """
     route_task_id = task["task_id"]
     data = task.get("data") or {}
@@ -338,7 +274,8 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
                 units=next(iter(usage.values()), None),
                 attrs={"biz": data.get("biz"), "model": data.get("model"), **usage},
             )
-        elif to_status == FAILURE and route and route.failed_billing == "charge":
+        elif (to_status == FAILURE and failed_charge and route
+                and route.failed_billing == "charge"):
             # 失败单计费策略 charge（厂商条款失败也收费）：先查 actual_amount_path
             # 实收 → settle_usage_map 重估 → 冻结额兜底（与成功单同一三档）
             actual, usage = await _settle_amount(route, task, raw)
@@ -385,8 +322,8 @@ async def try_upstream_cancel(task: dict, route=None) -> None:
 
 
 async def cancel_task(task_id: str) -> dict:
-    """按 task_id 取消（持有即凭证，与 GET 同一安全假设）"""
-    task = await taskstore.get(task_id)
+    """按 task_id 取消（持有即凭证，与 GET 同一安全假设；兼容上游 id 反查）"""
+    task = await _resolve_task(task_id)
     if not task:
         raise HTTPException(404, "task not found")
     if task["status"] in TERMINAL:
@@ -394,5 +331,5 @@ async def cancel_task(task_id: str) -> dict:
     await finalize_task(task, "CANCELED", {}, fail_reason="canceled by user")
     # 渠道配了 cancel_path 时尽力源头止损（失败不阻塞，本地已收口）
     await try_upstream_cancel(task)
-    fresh = await taskstore.get(task_id)
+    fresh = await taskstore.get(task["task_id"])
     return public_view(fresh or task)

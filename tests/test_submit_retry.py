@@ -1,8 +1,10 @@
-"""提交有限重试测试（[5]）：仅确定性拒绝（401/403/429/400，可配）换 key 重打；
+"""提交有限重试测试（[5]）：仅确定性拒绝（401/403/429，可配）换 key 重打；
 模糊失败（超时/5xx/连接中断）绝不重试——防双重创建双扣费。
 
-纪律断言：全程只 freeze 一次；重打落到别的渠道时 tasks 行 channel_id 与
-data.key_id/key_index 同步切换（探测钉回与对账口径以实际渠道为准）。
+异步提交架构：HTTP 创建只落库 + 入队（202 立即返回本地 id），重打发生在
+worker 侧 submit_one。纪律断言：全程只 freeze 一次；重打落到别的渠道时
+tasks 行 channel_id 与 data.key_id/key_index 同步切换（探测钉回与对账口径
+以实际渠道为准）。worker 重打矩阵的单测见 test_submit.py。
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import httpx
 import pytest
 
 from app.main import app
+from app.services.submit import submit_one
 
 BODY = {"model": "MiniMax-H3", "duration": 5}
 
@@ -51,11 +54,17 @@ def mocks(respx_router):
     return m
 
 
-async def _submit(client):
-    return await client.post(
+async def _create(client) -> str:
+    """HTTP 创建（异步受理）：202 + 本地 task_id；请求内零上游调用。"""
+    resp = await client.post(
         "/minimax/v1/tasks", json=BODY,
         headers={"Authorization": "Bearer sk-user-42"},
     )
+    assert resp.status_code == 202, resp.text
+    view = resp.json()
+    assert view["status"] == "SUBMITTED"
+    assert view["task_id"].startswith("minimax_")
+    return view["task_id"]
 
 
 async def test_key_level_rejected_retries_with_fresh_lease(
@@ -64,8 +73,9 @@ async def test_key_level_rejected_retries_with_fresh_lease(
     """首 key 401（key 级确定性拒绝）→ report 坏 key + 重新 lease 换渠道重打成功。"""
     mocks.select = respx_router.post("http://keypool.test/v1/keys/select").mock(
         side_effect=[
-            httpx.Response(200, json=_channel(7, "sk-bad")),
-            httpx.Response(200, json=_channel(8, "sk-good")),
+            httpx.Response(200, json=_channel(7, "sk-bad")),    # preflight 租约
+            httpx.Response(200, json=_channel(7, "sk-bad")),    # worker 首打钉回
+            httpx.Response(200, json=_channel(8, "sk-good")),   # 重打新鲜租约
         ]
     )
     create = respx_router.post("http://upstream.test/v2/video_generation").mock(
@@ -76,12 +86,12 @@ async def test_key_level_rejected_retries_with_fresh_lease(
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
-        resp = await _submit(client)
+        task_id = await _create(client)
 
-    assert resp.status_code == 202, resp.text
+    await submit_one(task_id)                                # worker 异步提交
+
     assert len(create.calls) == 2                        # 恰好重打一次
     assert len(mocks.freeze.calls) == 1                  # 只冻结一次（不重扣）
-    task_id = resp.json()["task_id"]
     row = task_store.rows[task_id]
     assert row["status"] == "QUEUED"
     assert row["channel_id"] == 8                        # 对账口径切到实际渠道
@@ -92,7 +102,7 @@ async def test_key_level_rejected_retries_with_fresh_lease(
 async def test_ambiguous_failure_never_retried(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """5xx（模糊失败）绝不重试：只提交一次，FAILURE + cancel 冻结。"""
+    """5xx（模糊失败）绝不重试：创建照常 202，worker 只提交一次即 FAILURE + 解冻。"""
     mocks.select = respx_router.post("http://keypool.test/v1/keys/select").mock(
         return_value=httpx.Response(200, json=_channel(7, "sk-x"))
     )
@@ -101,11 +111,11 @@ async def test_ambiguous_failure_never_retried(
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
-        resp = await _submit(client)
+        task_id = await _create(client)
 
-    assert resp.status_code == 502
+    await submit_one(task_id)
+
     assert len(create.calls) == 1                        # 不重试
-    task_id = next(iter(task_store.rows))
     row = task_store.rows[task_id]
     assert row["status"] == "FAILURE"
     assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-42"}]
@@ -114,7 +124,7 @@ async def test_ambiguous_failure_never_retried(
 async def test_non_retryable_4xx_fails_immediately(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """422 不在重试集合（默认 401/403/429/400）→ 一次失败即终。"""
+    """422 不在重试集合（默认 401/403/429）→ 一次失败即终。"""
     mocks.select = respx_router.post("http://keypool.test/v1/keys/select").mock(
         return_value=httpx.Response(200, json=_channel(7, "sk-x"))
     )
@@ -123,12 +133,12 @@ async def test_non_retryable_4xx_fails_immediately(
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
-        resp = await _submit(client)
+        task_id = await _create(client)
 
-    assert resp.status_code == 502
+    await submit_one(task_id)
+
     assert len(create.calls) == 1
-    row = task_store.rows[next(iter(task_store.rows))]
-    assert row["status"] == "FAILURE"
+    assert task_store.rows[task_id]["status"] == "FAILURE"
 
 
 async def test_retry_exhausted_after_max_attempts(
@@ -143,11 +153,11 @@ async def test_retry_exhausted_after_max_attempts(
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
-        resp = await _submit(client)
+        task_id = await _create(client)
 
-    assert resp.status_code == 502
+    await submit_one(task_id)
+
     assert len(create.calls) == 3                        # 上限即止
-    task_id = next(iter(task_store.rows))
     row = task_store.rows[task_id]
     assert row["status"] == "FAILURE"
     assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-42"}]

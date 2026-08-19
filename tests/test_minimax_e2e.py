@@ -18,6 +18,7 @@ import pytest
 from app.main import app
 from app.services.polling import poll_one
 from app.services.registry import registry
+from app.services.submit import submit_one
 
 MINIMAX_CHANNEL = {
     "id": 7, "name": "minimax-main", "base_url": "http://upstream.test",
@@ -107,6 +108,7 @@ async def test_minimax_h3_full_lifecycle(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
         # ---- ① 提交（t2va 形态，AI_TODO.md 样例报文原样透传）----
+        # 异步受理：preflight + 落库后立即返回本地 task_id，请求内零上游调用
         resp = await client.post(
             "/minimax/v1/videos",
             json=T2VA_BODY,
@@ -114,8 +116,13 @@ async def test_minimax_h3_full_lifecycle(
         )
         assert resp.status_code == 202, resp.text
         view = resp.json()
-        assert view["status"] == "queued"
+        assert view["status"] == "submitted"
         task_id = view["task_id"]
+        assert task_id.startswith("minimax_")           # biz 前缀本地 id
+        assert len(task_id) <= 64                       # tasks.task_id String(64)
+        assert "upstream_task_id" not in view           # 202 受理响应不泄上游 id
+        assert len(e2e_mocks.create.calls) == 0         # 上游提交在 worker 异步执行
+        assert queue_events["submit"] == [task_id]
 
         # keypool 选 key 契约：统一分组 keypool + model + include_channel
         select_body = json.loads(e2e_mocks.select.calls[0].request.content)
@@ -129,6 +136,10 @@ async def test_minimax_h3_full_lifecycle(
         assert freeze_body["biz_type"] == "video_generation"
         assert freeze_body["metric"] == "second"
         assert e2e_mocks.freeze.calls[0].request.headers["Authorization"] == "Bearer sk-user-42"
+
+        # ---- ①b worker 异步提交：回写上游 id 后才进探测闭环 ----
+        await submit_one(task_id)
+        assert task_store.rows[task_id]["status"] == "QUEUED"
 
         # 上游提交契约：Bearer 渠道 key + 渠道覆盖全部生效
         create_req = e2e_mocks.create.calls[0].request
@@ -169,6 +180,9 @@ async def test_minimax_h3_full_lifecycle(
         assert notify["url"] == "https://user.test/done"
         assert notify["payload"]["status"] == "SUCCESS"
         assert notify["payload"]["result"] == "http://cdn.test/h3-output.mp4"
+        # 回调载荷不泄上游任务 id：字段与值都不出现（内部实现细节）
+        assert "upstream_task_id" not in notify["payload"]
+        assert "424010985738629" not in json.dumps(notify["payload"], ensure_ascii=False)
 
         # ---- ⑤ 任务查询视图（task_id 即凭证，免鉴权）----
         got = await client.get(f"/minimax/v1/tasks/{task_id}")
@@ -177,6 +191,22 @@ async def test_minimax_h3_full_lifecycle(
         assert public["status"] == "SUCCESS"
         assert public["result"] == "http://cdn.test/h3-output.mp4"
         assert "freeze_amount" not in json.dumps(public)              # 不泄内部字段
+        assert "upstream_task_id" not in public                       # 上游 id 同级收紧
+        assert "424010985738629" not in json.dumps(public)            # 值本身也不出现
+        assert 0 <= public["duration"] <= 300         # 耗时（秒）：终态-创建，量级健康
+
+        # ⑤b 上游 id 反查兼容入口：客户端持上游 id 轮询也命中同一任务，
+        #    但回显视图同样不含上游 id（反查是兜底，不等于授权回显）
+        by_upstream = await client.get("/minimax/v1/tasks/424010985738629")
+        assert by_upstream.status_code == 200
+        assert by_upstream.json()["task_id"] == task_id
+        assert "upstream_task_id" not in by_upstream.json()
+
+        # ⑤c videos 形态 GET 同一白名单契约
+        got_video = await client.get(f"/minimax/v1/videos/{task_id}")
+        assert got_video.status_code == 200
+        assert "upstream_task_id" not in got_video.json()
+        assert "424010985738629" not in json.dumps(got_video.json())
 
         # ---- ⑥ 幂等重放：同 Idempotency-Key 不产生新任务/新扣费 ----
         replay = await client.post(
@@ -216,12 +246,17 @@ async def test_minimax_i2va_and_r2va_shapes_accepted(
     }
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
+        task_ids = []
         for body in (i2va, r2va):
             resp = await client.post(
                 "/minimax/v1/videos", json=body,
                 headers={"Authorization": "Bearer sk-user-42"},
             )
             assert resp.status_code == 202, resp.text
+            task_ids.append(resp.json()["task_id"])
+        assert len(e2e_mocks.create.calls) == 0     # 创建请求不触上游
+        for task_id in task_ids:                    # worker 异步提交
+            await submit_one(task_id)
 
     # 两次提交的多模态 content 结构原样到达上游（含 role 标注）
     for i, expect_roles in enumerate((["first_frame"], ["reference_video", "reference_audio"])):

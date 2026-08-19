@@ -3,7 +3,7 @@
 - broker：Redis ListQueueBroker（待执行消息 = Redis list `gw:taskiq`）
 - 延迟任务：RedisScheduleSource（`gw:sched:*`），由 scheduler 进程到期派发。
   注意：with_labels(delay=...) 对 ListQueueBroker 不生效，延迟必须走 schedule_by_time。
-- 补数：sweep 定时任务（cron 每分钟）从 tasks 表事实源重发缺失的结算/探测任务
+- 补数：sweep 定时任务（cron 每分钟）从 tasks 表事实源重发缺失的提交/结算/探测任务
 - 并发：`taskiq worker app.queue:broker --max-async-tasks N`，多副本直接加进程
 - 可观测：queue_stats() 队列深度/延迟任务数/死信数/任务状态分布，供 /ops/queue 与巡检告警
 - 死信：Redis Stream gw:events:dlq，/ops/dlq/replay 可重放
@@ -214,6 +214,18 @@ async def _retry_or_dlq(name: str, kicker, context: Context, args: tuple) -> Non
 # ---------------- 任务定义 ----------------
 
 @broker.task
+async def submit_task(task_id: str, context: Context = TaskiqDepends()) -> None:
+    """上游异步提交：创建链路落库即返回本地 task_id，提交在 worker 执行
+    （进程重启不丢任务；基础设施异常退避重试，超限落死信，sweep 兜底补投）。"""
+    from app.services.submit import submit_one  # 延迟 import 防循环
+    try:
+        await submit_one(task_id)
+    except Exception:
+        log.exception("submit failed: {}", task_id)
+        await _retry_or_dlq("SUBMIT", submit_task.kicker(), context, (task_id,))
+
+
+@broker.task
 async def billing_settle_task(request_id: str, actual_amount: float, user_sk: str,
                               units: float | None = None, attrs: dict | None = None,
                               context: Context = TaskiqDepends()) -> None:
@@ -303,6 +315,12 @@ async def sweep_task() -> None:
 # ---------------- 发布门面（请求路径只依赖这里） ----------------
 # 纪律：user_sk 只作为任务参数传递，绝不进日志。
 
+async def publish_submit(task_id: str) -> None:
+    """发布上游异步提交事件（创建链路唯一依赖；消息落 Redis list，重启不丢）。"""
+    log.debug("publish submit: {}", task_id)
+    await submit_task.kiq(task_id)
+
+
 async def publish_settle(request_id: str, actual_amount: float, user_sk: str,
                          units: float | None = None, attrs: dict | None = None) -> None:
     log.debug("publish settle: {} amount={} units={}", request_id, actual_amount, units)
@@ -350,6 +368,7 @@ async def queue_stats() -> dict:
 
 
 _DLQ_TASKS: dict[str, Any] = {
+    "SUBMIT": submit_task,
     "BILLING_SETTLE": billing_settle_task,
     "BILLING_CANCEL": billing_cancel_task,
     "NOTIFY": notify_task,

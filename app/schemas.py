@@ -130,7 +130,9 @@ class RouteConfig(BaseModel):
     submit_path: str = ""              # POST 提交路径（空 = 渠道未配，提交即报错）
     probe_path: str = ""               # GET 探测路径，``{upstream_task_id}`` 占位
     auth_type: str = "bearer"          # bearer | x-api-key | none
-    timeout_sec: float = 60.0
+    timeout_sec: float = Field(default=60.0, ge=0)
+    """上游 HTTP 超时（秒）。非负校验在路由构建期响亮报错（KI-C）——负数配置
+    若带进提交期，锁 TTL 派生（submit_lock_ttl）与 Redis SET ex 才炸。"""
 
     # ---- 请求体塑形（用户 body 为基底，三层叠加）----
     default_params: dict[str, Any] = Field(default_factory=dict)
