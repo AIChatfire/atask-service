@@ -62,6 +62,21 @@ class InterceptHandler(logging.Handler):
 _logfire_attached: bool = False
 
 
+def _logfire_sink_filter(record: dict[str, Any]) -> bool:
+    """logfire sink 降噪过滤（只影响 logfire，stderr 全量保留）。
+
+    taskiq-admin 看板上报（started/executed）每个任务两次 POST，httpx 的
+    INFO 请求日志经 stdlib→loguru→logfire 桥接后高频刷屏、零信息量——
+    按已配置的管理台 URL 前缀精准丢弃；其余 httpx 日志（上游 4xx 排障
+    靠它）照常进 logfire。未配置 ``GW_TASKIQ_ADMIN_URL`` 时全放行。
+    """
+    admin = settings.taskiq_admin_url.rstrip("/")
+    if not admin:
+        return True
+    msg: str = record["message"]
+    return not (msg.startswith("HTTP Request:") and admin in msg)
+
+
 def setup_logging() -> None:
     """装配 loguru（幂等）：stderr sink + stdlib 桥接。
 
@@ -104,9 +119,11 @@ def attach_logfire_handler() -> None:
         import logfire
 
         # loguru_handler() 返回 add() 的 kwargs dict {sink, format}：
-        # 补 level 键控噪（高频 DEBUG 探测日志不进 logfire），解包传参
+        # 补 level 键控噪（高频 DEBUG 探测日志不进 logfire）+ filter
+        # 丢弃看板上报的 httpx 刷屏日志，解包传参
         config = logfire.loguru_handler()
         config["level"] = settings.log_level.upper()
+        config["filter"] = _logfire_sink_filter
         logger.add(**config)
         _logfire_attached = True
     except Exception:

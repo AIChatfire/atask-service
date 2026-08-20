@@ -183,3 +183,52 @@ def test_attach_logfire_handler_lifecycle(monkeypatch):
         # 清理全局 loguru 状态，不污染后续测试
         monkeypatch.setattr(settings, "logfire_enabled", False)
         setup_logging()
+
+
+# ---------------------------------------------------------------------------
+# logfire sink 过滤：taskiq-admin 看板上报的 httpx 刷屏日志精准丢弃
+# ---------------------------------------------------------------------------
+
+
+def test_logfire_sink_filter_predicate(monkeypatch):
+    from app.config import settings
+    from app.logging import _logfire_sink_filter as f
+
+    noise = ('HTTP Request: POST http://taskiq-admin:3000/api/tasks/abc/executed'
+             ' "HTTP/1.1 200 OK"')
+    monkeypatch.setattr(settings, "taskiq_admin_url", "http://taskiq-admin:3000/")
+    assert f({"message": noise}) is False          # 看板上报（含尾斜杠配置）→ 丢弃
+    other = 'HTTP Request: POST http://keypool:8000/api/lease "HTTP/1.1 200 OK"'
+    assert f({"message": other}) is True           # 其余 httpx 日志（4xx 排障靠它）保留
+    fail = "taskiq-admin report failed: http://taskiq-admin:3000 unreachable"
+    assert f({"message": fail}) is True            # 非 httpx 请求行即使含 URL 也保留
+    monkeypatch.setattr(settings, "taskiq_admin_url", "")
+    assert f({"message": noise}) is True           # 未配置管理台 → 全放行
+
+
+def test_logfire_sink_end_to_end_filtering(monkeypatch):
+    """假 sink 走完整 loguru 管线：看板噪音不进 logfire，其余日志照常。"""
+    import logfire
+
+    import app.logging as al
+    from app.config import settings
+
+    sent: list[str] = []
+    monkeypatch.setattr(settings, "logfire_enabled", True)
+    monkeypatch.setattr(settings, "taskiq_admin_url", "http://taskiq-admin:3000")
+    monkeypatch.setattr(
+        logfire, "loguru_handler",
+        lambda: {"sink": lambda m: sent.append(str(m)), "format": "{message}"},
+    )
+    try:
+        al.attach_logfire_handler()
+        al.log.info('HTTP Request: POST http://taskiq-admin:3000/api/tasks/t1/started'
+                    ' "HTTP/1.1 200 OK"')
+        al.log.info('HTTP Request: POST http://taskiq-admin:3000/api/tasks/t1/executed'
+                    ' "HTTP/1.1 200 OK"')
+        al.log.info('HTTP Request: POST http://keypool:8000/lease "HTTP/1.1 200 OK"')
+        assert [m.rstrip("\n") for m in sent] == [
+            'HTTP Request: POST http://keypool:8000/lease "HTTP/1.1 200 OK"']
+    finally:
+        monkeypatch.setattr(settings, "logfire_enabled", False)
+        al.setup_logging()

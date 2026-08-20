@@ -97,6 +97,8 @@
 - 错误响应统一 `{"error": {...}}`（app/errors.py 注册点）；内部状态常量以 app/schemas.py 为准。
 - 日志统一 loguru：业务模块 `from app.logging import log`，装配点 app/logging.py
   （web 在 main、worker 在队列中间件 startup），级别 `GW_LOG_LEVEL`；
+  logfire sink 挂 `_logfire_sink_filter` 按 `GW_TASKIQ_ADMIN_URL` 前缀丢弃
+  看板上报的 httpx 刷屏请求日志（stderr 全量保留）；
   只支持同构任务（新建任务数据形态唯一），不再兼容旧版配置位/旧任务。
 - 配置全部环境变量 `GW_` 前缀（app/config.py；.env.example 为全量样例）。
 

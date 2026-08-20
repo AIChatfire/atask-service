@@ -223,10 +223,7 @@
   created_at）+ test_reconcile（查询层误选年轻任务时二次核龄挡判死）+
   test_flow（taskstore 行级时间列归一）。全量 261 passed + ruff + mypy 全绿。
 
-注：`fail_reason="task timeout after 1440 minutes"` 与 `result_url` 列写入
-不来自本仓库代码（本地无此文案、网关从不写 result_url）——线上跑的是另一
-修订版（2026-08-17 已发现部署漂移），本次修复的是同类单位混用根因；部署侧
-需同步本版本。
+
 
 ## 提交期模糊失败不再判死（2026-08-20 收敛，无需兼容旧版）
 
