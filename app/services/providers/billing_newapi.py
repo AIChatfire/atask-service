@@ -80,11 +80,11 @@ class NewapiBillingProvider:
         )
         if resp.status_code != 200:
             # 402 余额不足 / 409 锁竞争（可重试）/ 4xx 参数错误——状态码原样上抛
-            body = _err_body(resp)
-            _audit_rejected("freeze", request_id, resp.status_code, body)
+            err = _err_body(resp)
+            _audit_rejected("freeze", request_id, resp.status_code, err)
             log.warning("billing freeze rejected: request_id={} status={} body={}",
-                        request_id, resp.status_code, body)
-            raise BillingError(resp.status_code, body)
+                        request_id, resp.status_code, err)
+            raise BillingError(resp.status_code, err)
         log.info("billing freeze ok: request_id={} amount={} metric={}",
                  request_id, round(amount, 6), metric)
         data = resp.json()
@@ -107,11 +107,11 @@ class NewapiBillingProvider:
             json=body,
         )
         if resp.status_code != 200:
-            body = _err_body(resp)
-            _audit_rejected("settle", request_id, resp.status_code, body)
+            err = _err_body(resp)
+            _audit_rejected("settle", request_id, resp.status_code, err)
             log.warning("billing settle rejected: request_id={} status={} body={}",
-                        request_id, resp.status_code, body)
-            raise BillingError(resp.status_code, f"settle {request_id}: {body}")
+                        request_id, resp.status_code, err)
+            raise BillingError(resp.status_code, f"settle {request_id}: {err}")
         log.info("billing settle ok: request_id={} actual_amount={}",
                  request_id, round(actual_amount, 6))
 

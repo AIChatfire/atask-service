@@ -295,7 +295,7 @@ async def _native_query(task: dict, route: RouteConfig, key: KeyLease | None,
 
     url_pairs: list[tuple[str, str]] = []
     if resp.status_code < 400:
-        parsed = {}
+        parsed: dict = {}
         try:
             parsed = json.loads(body) if body else {}
         except json.JSONDecodeError:
