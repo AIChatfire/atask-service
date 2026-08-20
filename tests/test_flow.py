@@ -252,6 +252,26 @@ async def test_duration_seconds_millisecond_timestamp_normalized():
     assert flow.duration_seconds(_duration_task(finish_time=0, created_at=now_ms)) == 0
 
 
+async def test_taskstore_row_time_columns_normalized():
+    """taskstore 读侧单点归一：行内全部时间列的毫秒值 → 秒（共享表其他
+    写入方 UnixMilli 污染的兜底，消费方拿到的永远是秒）。"""
+    from app.services import taskstore
+
+    now = int(time.time())
+    row = taskstore._row_to_dict({
+        "task_id": "t1", "status": SUBMITTED, "data": None,
+        "submit_time": now * 1000, "start_time": now,
+        "finish_time": (now + 3) * 1000, "created_at": now * 1000,
+        "updated_at": now,
+    })
+    assert row["submit_time"] == now
+    assert row["created_at"] == now
+    assert row["finish_time"] == now + 3
+    assert row["start_time"] == now and row["updated_at"] == now   # 秒值不动
+    assert taskstore.as_unix_seconds(None) == 0
+    assert taskstore.as_unix_seconds("bogus") == 0
+
+
 # ---------------------------------------------------------------------------
 # finalize_task：三档结算
 # ---------------------------------------------------------------------------

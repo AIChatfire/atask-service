@@ -157,3 +157,37 @@ async def test_poll_age_exceeded_fails_task(respx_router, test_settings, patch_r
     assert "poll timeout" in row["fail_reason"]
     assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
     assert not respx_router.calls              # 超时直接收尾，不发出站请求
+
+
+async def test_poll_millisecond_submit_time_not_instant_timeout(
+    respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """submit_time 被写成毫秒（共享表其他写入方 UnixMilli）：归一为秒后
+    年龄正常，不把新任务秒判超时（"任务秒失败"回归）。"""
+    _mock_keypool(respx_router)
+    respx_router.get("http://upstream.test/v2/query/video_generation/mm-1").mock(
+        return_value=httpx.Response(200, json={"task": {"status": "processing"}})
+    )
+    task_id = _seed(task_store, age=10)
+    row = task_store.rows[task_id]
+    row["submit_time"] = int((time.time() - 10) * 1000)      # 毫秒污染
+    await poll_one(task_id)
+    row = task_store.rows[task_id]
+    assert row["status"] == IN_PROGRESS                      # 正常推进而非 FAILURE
+    assert queue_events["poll"] == [{"task_id": task_id, "delay": 5}]
+    assert queue_events["cancel"] == []
+
+
+async def test_poll_missing_submit_time_falls_back_created_at(
+    respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """submit_time 缺失/为 0：回退 created_at 计龄，不因缺失误判超时。"""
+    _mock_keypool(respx_router)
+    respx_router.get("http://upstream.test/v2/query/video_generation/mm-1").mock(
+        return_value=httpx.Response(200, json={"task": {"status": "processing"}})
+    )
+    task_id = _seed(task_store, age=10)
+    task_store.rows[task_id]["submit_time"] = 0
+    await poll_one(task_id)
+    assert task_store.rows[task_id]["status"] == IN_PROGRESS
+    assert queue_events["cancel"] == []

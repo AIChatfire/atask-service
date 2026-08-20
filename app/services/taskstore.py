@@ -21,6 +21,38 @@ def _now() -> int:
     return int(time.time())
 
 
+#: 时间列统一 int64 unix **秒**；超过该阈值（1e11 秒 ≈ 5138 年）视为混入的
+#: 毫秒时间戳——tasks 表是共享表（new-api 原生任务模块用 UnixMilli 写法），
+#: 历史行/其他写入方留下的毫秒值在**读侧统一归一**，网关一切时间计算
+#: （探测超龄、duration、对外视图）永远拿到秒，杜绝混用单位的误判
+_UNIX_MS_THRESHOLD = 100_000_000_000
+
+#: tasks 表的全部时间列（读侧归一的作用面）
+_TIME_COLUMNS = ("submit_time", "start_time", "finish_time", "created_at", "updated_at")
+
+
+def _secs(column: str) -> str:
+    """SQL 侧时间列归一表达式（毫秒 → 秒）。
+
+    读侧的 Python 归一救不了**在 SQL 里做的比较**（stale/孤儿/HELD 判死/
+    对账窗口全是 `col < :cutoff`）：cutoff 恒为秒，列里混进毫秒值会让判定
+    彻底失真——毫秒行永远躲过判死，而秒行一旦被拿去与毫秒口径比较就会被
+    瞬间判死（"任务秒失败"）。所有时间比较统一套这个表达式，口径只有一种。
+    """
+    return f"IF({column} > {_UNIX_MS_THRESHOLD}, {column} DIV 1000, {column})"
+
+
+def as_unix_seconds(value: Any) -> int:
+    """时间值归一为 unix 秒：毫秒时间戳折算，缺失/非法 → 0。"""
+    try:
+        ts = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if ts > _UNIX_MS_THRESHOLD:
+        ts //= 1000
+    return ts
+
+
 async def create(
     task_id: str,
     user_id: int,
@@ -62,6 +94,9 @@ def _row_to_dict(row) -> dict:
         result["data"] = json.loads(data)
     elif data is None:
         result["data"] = {}
+    for col in _TIME_COLUMNS:          # 读侧时间单位归一（毫秒 → 秒）
+        if col in result:
+            result[col] = as_unix_seconds(result[col])
     return result
 
 
@@ -124,7 +159,16 @@ async def cas(
     patch: dict | None = None,
     fail_reason: str = "",
 ) -> bool:
-    """CAS 状态迁移。返回 True = 本调用者抢到推进权（负责后续事件/额度释放）"""
+    """CAS 状态迁移。返回 True = 本调用者抢到推进权（负责后续事件/额度释放）
+
+    纪律：
+    - ``WHERE`` 必含 ``platform``——tasks 是与 new-api 共享的表，网关只
+      读写自有行（红线：绝不动别人的任务行）；
+    - 终态一律把 ``progress`` 置 ``100%``（不只 SUCCESS）——失败/取消停在
+      ``0%`` 会让看板与客户端以为任务还在跑；
+    - 终态一律用**秒**刷 ``finish_time``（``_now()``），杜绝毫秒写入让
+      duration/对账窗口算出天文数字。
+    """
     now = _now()
     stmt = text(
         """
@@ -132,10 +176,10 @@ async def cas(
         SET status = :to,
             updated_at = :now,
             finish_time = IF(:terminal = 1, :now, finish_time),
-            progress = IF(:to_status = 'SUCCESS', '100%', progress),
+            progress = IF(:terminal = 1, '100%', progress),
             fail_reason = :reason,
             data = JSON_MERGE_PATCH(COALESCE(data, JSON_OBJECT()), CAST(:patch AS JSON))
-        WHERE task_id = :tid AND status IN :froms
+        WHERE task_id = :tid AND platform = :p AND status IN :froms
         """
     ).bindparams(bindparam("froms", expanding=True))
     async with get_session_factory()() as db:
@@ -144,12 +188,12 @@ async def cas(
             stmt,
             {
                 "to": to_status,
-                "to_status": to_status,
                 "now": now,
                 "terminal": 1 if to_status in TERMINAL else 0,
                 "reason": fail_reason,
                 "patch": json.dumps(patch or {}, ensure_ascii=False),
                 "tid": task_id,
+                "p": settings.gateway_platform,
                 "froms": from_statuses,
             },
         ))
@@ -206,10 +250,10 @@ async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
         rows = (
             await db.execute(
                 text(
-                    """
+                    f"""
                     SELECT task_id FROM tasks
                     WHERE platform = :p AND status IN :acts AND status <> 'HELD'
-                      AND updated_at < :cutoff
+                      AND {_secs('updated_at')} < :cutoff
                     LIMIT :lim
                     """
                 ).bindparams(bindparam("acts", expanding=True)),
@@ -289,11 +333,11 @@ async def orphan_active(older_than_seconds: int, limit: int = 50) -> list[str]:
         rows = (
             await db.execute(
                 text(
-                    """
+                    f"""
                     SELECT task_id FROM tasks
                     WHERE platform = :p AND status IN :acts AND status <> 'HELD'
                       AND COALESCE(data ->> '$.upstream_task_id', '') = ''
-                      AND created_at < :cutoff
+                      AND {_secs('created_at')} < :cutoff
                     LIMIT :lim
                     """
                 ).bindparams(bindparam("acts", expanding=True)),
@@ -309,10 +353,10 @@ async def oldest_held() -> str | None:
         row = (
             await db.execute(
                 text(
-                    """
+                    f"""
                     SELECT task_id FROM tasks
                     WHERE platform = :p AND status = 'HELD'
-                    ORDER BY created_at LIMIT 1
+                    ORDER BY {_secs('created_at')} LIMIT 1
                     """
                 ),
                 {"p": settings.gateway_platform},
@@ -331,9 +375,9 @@ async def held_expired(max_age_seconds: int, rate_limited_max_age_seconds: int =
         rows = (
             await db.execute(
                 text(
-                    """
+                    f"""
                     SELECT task_id FROM tasks
-                    WHERE platform = :p AND status = 'HELD' AND updated_at <
+                    WHERE platform = :p AND status = 'HELD' AND {_secs('updated_at')} <
                         CASE WHEN COALESCE(data ->> '$.held_reason', '') = 'rate_limited'
                              THEN :cutoff_rl ELSE :cutoff END
                     LIMIT :lim
@@ -386,13 +430,13 @@ async def reconcile_candidates(window_seconds: int, recheck_seconds: int,
         rows = (
             await db.execute(
                 text(
-                    """
+                    f"""
                     SELECT task_id, data FROM tasks
                     WHERE platform = :p AND status = 'FAILURE'
                       AND COALESCE(data ->> '$.settled', 'false') = 'true'
                       AND COALESCE(data ->> '$.reconciled', 'false') <> 'true'
                       AND COALESCE(data ->> '$.upstream_task_id', '') <> ''
-                      AND finish_time > :since
+                      AND {_secs('finish_time')} > :since
                       AND CAST(COALESCE(data ->> '$.reconcile_checked_at', '0') AS UNSIGNED)
                           < :recheck
                     LIMIT :lim

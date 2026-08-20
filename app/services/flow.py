@@ -39,20 +39,8 @@ from app.services import (
 from app.services.providers import PricingError
 from app.services.registry import registry
 
-#: 时间字段统一 int64 unix **秒**；超过该阈值（1e11 秒 ≈ 5138 年）视为混入的
-#: 毫秒时间戳（如 new-api 原生任务模块的 UnixMilli 写法），序列化时归一为秒
-_UNIX_MS_THRESHOLD = 100_000_000_000
-
-
-def _as_unix_seconds(value: Any) -> int:
-    """时间字段归一为 unix 秒：毫秒时间戳折算，缺失/非法 → 0。"""
-    try:
-        ts = int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-    if ts > _UNIX_MS_THRESHOLD:
-        ts //= 1000
-    return ts
+#: 时间归一单点在 taskstore（读侧已统一毫秒→秒）；此处仅为消费别名
+_as_unix_seconds = taskstore.as_unix_seconds
 
 
 def duration_seconds(task: dict) -> int:

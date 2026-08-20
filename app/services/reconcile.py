@@ -44,15 +44,28 @@ async def _watch_queue() -> None:
 
 async def _orphan_closeout() -> None:
     """孤儿任务收口：submit 前崩溃的残留（永远不会有上游任务）→ FAILURE + 解冻。
-    （根治靠 submit 注入 client_request_id 反查补挂，这里是兜底）"""
+    （根治靠 submit 注入 client_request_id 反查补挂，这里是兜底）
+
+    判死前**二次核龄**（Python 侧按归一后的秒重算）：SQL 已按秒口径比较，
+    这里再挡一道脏时间列（毫秒/未来时间/0）——判死是不可逆的资金动作，
+    宁可这轮跳过下轮再来，也绝不把刚创建的任务秒判失败。
+    """
     orphans = await taskstore.orphan_active(settings.orphan_grace_seconds,
                                             limit=settings.sweep_orphan_batch)
     for task_id in orphans:
         task = await taskstore.get(task_id)
         if not task or task["status"] in TERMINAL:
             continue
-        log.error("orphan task closed: {} (no upstream_task_id after {}s)",
-                  task_id, settings.orphan_grace_seconds)
+        created = taskstore.as_unix_seconds(task.get("created_at")) \
+            or taskstore.as_unix_seconds(task.get("submit_time"))
+        age = time.time() - created if created else 0.0
+        if age < settings.orphan_grace_seconds:
+            log.warning("orphan closeout skipped, age={:.0f}s < grace={}s "
+                        "(suspect time column): {}", age,
+                        settings.orphan_grace_seconds, task_id)
+            continue
+        log.error("orphan task closed: {} (no upstream_task_id after {:.0f}s)",
+                  task_id, age)
         # 上游从未接单（无 upstream_task_id）：一律解冻，不适用 failed_billing=charge
         await flow.finalize_task(
             task, FAILURE, {}, failed_charge=False,

@@ -197,3 +197,33 @@
   纠正索引/SQL 命中回写/patch_data 写索引/无 id 不碰索引）。FakeRedis 同步
   TTL 语义与 scan_iter(count=)，InMemoryTaskStore 补 active_counts_by_token。
   全量 257 passed + ruff + mypy 全绿。
+
+## 时间列单位混用根治（2026-08-20 收敛，无需兼容旧版）
+
+背景：线上任务「秒失败」——tasks 表是共享表，时间列被其他写入方写成毫秒
+（UnixMilli，如 `finish_time=1787199556679`），网关一切秒口径的时间比较
+（探测超龄/stale/孤儿判死/HELD 判死/对账窗口）遇到毫秒值全部失真：毫秒值
+被当秒比较 → 新任务瞬间超龄判死（FAILURE + 解冻），且判死不可逆。
+
+- [x] **[T1] 归一单点**：`taskstore.as_unix_seconds`（>1e11 视为毫秒折算秒）
+  + `_row_to_dict` 读侧对全部时间列统一归一——消费方（flow.duration/
+  public_view/polling/ops）拿到的永远是秒；flow 内的重复实现删除改引用。
+- [x] **[T2] SQL 侧同口径**：`_secs(col)` 表达式（`IF(col>1e11, DIV 1000)`）
+  套住全部 SQL 时间比较（stale_active/orphan_active/held_expired/
+  reconcile_candidates/oldest_held 排序）——读侧 Python 归一救不了在 SQL
+  里做的 cutoff 比较。
+- [x] **[T3] 判死二次核龄**：`_orphan_closeout` 在 finalize 前按归一后的秒
+  重算年龄，不足 grace 跳过并告警（判死是不可逆资金动作，查询层被脏时间列
+  骗过也有最后一道防线）；`polling.poll_one` 超龄计算同样归一 + 负值钳 0 +
+  submit_time 缺失回退 created_at，超时文案带实际配置值。
+- [x] **[T4] 终态写口径**：`taskstore.cas` 终态一律 `progress='100%'`
+  （不只 SUCCESS——失败/取消停 0% 会被看板误读为在跑）、`finish_time` 恒写
+  秒、WHERE 补 `platform`（共享表红线：绝不动别人的行）。
+- [x] **[T5] 测试**：test_polling（毫秒 submit_time 不秒判超时/缺失回退
+  created_at）+ test_reconcile（查询层误选年轻任务时二次核龄挡判死）+
+  test_flow（taskstore 行级时间列归一）。全量 261 passed + ruff + mypy 全绿。
+
+注：`fail_reason="task timeout after 1440 minutes"` 与 `result_url` 列写入
+不来自本仓库代码（本地无此文案、网关从不写 result_url）——线上跑的是另一
+修订版（2026-08-17 已发现部署漂移），本次修复的是同类单位混用根因；部署侧
+需同步本版本。

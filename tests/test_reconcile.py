@@ -113,6 +113,32 @@ async def test_young_task_not_treated_as_orphan(test_settings, patch_redis,
     assert queue_events["cancel"] == []
 
 
+async def test_orphan_closeout_second_age_check_blocks_bogus_candidates(
+    test_settings, patch_redis, task_store, queue_events, monkeypatch,
+):
+    """判死前二次核龄：即使查询层因时间列被污染（毫秒/脏值）误选出
+    年轻任务，Python 侧按归一后的秒重算也会跳过——判死是不可逆资金动作，
+    绝不把刚创建的任务秒判 FAILURE（"任务秒失败"回归）。"""
+    import app.services.taskstore as ts
+
+    # 毫秒污染的年轻任务（实龄 10s）：模拟查询层误选为孤儿候选
+    task_id = _seed(task_store, status=SUBMITTED,
+                    data__upstream_task_id=None,
+                    created_at=int((time.time() - 10) * 1000),
+                    submit_time=int((time.time() - 10) * 1000))
+    await tokensession.store(task_id, "sk-user-1")
+
+    async def _bogus_candidates(older_than_seconds, limit=50):
+        return [task_id]
+
+    monkeypatch.setattr(ts, "orphan_active", _bogus_candidates)
+    await sweep_once()
+
+    row = task_store.rows[task_id]
+    assert row["status"] == SUBMITTED                  # 不判死
+    assert queue_events["cancel"] == []                # 不解冻
+
+
 async def test_stale_submitted_task_resubmitted(test_settings, patch_redis,
                                                 task_store, queue_events):
     """异步提交事件丢失（worker 崩溃/Redis 故障）：stale 的 SUBMITTED 任务由

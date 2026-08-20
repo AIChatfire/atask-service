@@ -80,6 +80,12 @@ def setup_logging() -> None:
         diagnose=False,
     )
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+    # worker 日志压到最干净
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.INFO)
+    logging.getLogger("taskiq").setLevel(logging.WARNING)
+
     if reattach:
         attach_logfire_handler()
 

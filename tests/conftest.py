@@ -299,11 +299,10 @@ class InMemoryTaskStore:
         row["status"] = to_status
         row["updated_at"] = int(time.time())
         if to_status in ("SUCCESS", "FAILURE", "CANCELED"):
-            row["finish_time"] = int(time.time())
+            row["finish_time"] = int(time.time())     # 秒（与真实实现同口径）
+            row["progress"] = "100%"                  # 终态一律 100%，不只 SUCCESS
         if fail_reason:
             row["fail_reason"] = fail_reason
-        if to_status == "SUCCESS":
-            row["progress"] = "100%"
         if patch:
             row["data"].update(patch)
         return True

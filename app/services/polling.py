@@ -44,10 +44,17 @@ async def poll_one(task_id: str) -> None:
     if not biz or not upstream_task_id:
         return
 
-    age = time.time() - (task.get("submit_time") or time.time())
+    # 任务年龄：时间列可能被共享表的其他写入方写成毫秒（UnixMilli），
+    # 归一为秒后再算；submit_time 缺失回退 created_at，负值（时钟漂移/
+    # 脏数据）钳 0——绝不因单位混用把新任务秒判超时
+    submit = taskstore.as_unix_seconds(task.get("submit_time")) \
+        or taskstore.as_unix_seconds(task.get("created_at"))
+    age = max(0.0, time.time() - submit) if submit else 0.0
     if age > settings.poll_max_age_seconds:
         log.warning("poll timeout, finalize FAILURE: task_id={} age={:.0f}s", task_id, age)
-        await flow.finalize_task(task, FAILURE, {}, fail_reason="poll timeout (>24h)")
+        await flow.finalize_task(
+            task, FAILURE, {},
+            fail_reason=f"poll timeout (>{settings.poll_max_age_seconds}s in-flight)")
         # 超时收口尽力调上游取消端点源头止损（渠道配 cancel_path 才动作）
         await flow.try_upstream_cancel(task)
         return
