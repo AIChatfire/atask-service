@@ -42,16 +42,33 @@ class PricingError(ProviderError):
     """渠道计费规则求值失败（500 语义：配置错误，绝不静默按 0 计费）。"""
 
 
+#: keypool 错误包络 code（契约见 keypool-service README）
+KP_NO_KEY = 40001            # 503 无可用 key（data.retry_after_ms 给建议退避）
+KP_NO_CHANNEL = 40002        # 404 渠道不存在
+KP_BAD_PARAM = 40010         # 400 参数错误（含 key_index 越界——永久性，重试无意义）
+
+
 class KeyLeaseError(ProviderError):
     """keypool 无可用 key / 服务故障（503 语义）。
 
     ``retry_after_ms``：keypool 40001（无可用 key）给出的建议退避——探测重投
     与 503 响应的 ``Retry-After`` 头都以此为 hint（缺省 None = 无建议）。
+    ``code``：keypool 错误包络 code（0 = 未解析出，如纯网络故障）。精确直达
+    （``channel_id + key_index``）的失败分流依赖它：40010 越界为永久性错误
+    （该 key 已不在渠道里），40001 为该 key 被禁用（渠道内换 key 仍可能有救），
+    两者都触发"降级到渠道直达"；40002 渠道不存在则无从降级。
     """
 
-    def __init__(self, message: str, *, retry_after_ms: int | None = None):
+    def __init__(self, message: str, *, retry_after_ms: int | None = None,
+                 code: int = 0):
         super().__init__(message)
         self.retry_after_ms = retry_after_ms
+        self.code = code
+
+    @property
+    def key_level(self) -> bool:
+        """失败只针对"这一把 key"（渠道仍在）——精确直达可降级为渠道直达。"""
+        return self.code in (KP_NO_KEY, KP_BAD_PARAM)
 
 
 # ---------------- 端口定义 ----------------
@@ -77,10 +94,17 @@ class BillingProvider(Protocol):
 
 
 class KeyProvider(Protocol):
-    """上游密钥端口：租约（含渠道全量覆盖配置与 billing 计费规则块）+ 用量/错误上报。"""
+    """上游密钥端口：租约（含渠道全量覆盖配置与 billing 计费规则块）+ 用量/错误上报。
+
+    三种定位形态（keypool select 契约）：
+    ``group+model`` 加权选渠道 → ``key_id``（channel_id）渠道直达 →
+    ``key_id + key_index`` **单 key 精确直达**（mode=direct，跳过调度算法与
+    Redis）。精确直达是「同渠道多上游账号」场景的正解：任务查询/取消必须用
+    创建时那把 key，否则 B 账号的 key 查不到 A 账号的任务。
+    """
 
     async def lease(self, biz: str, model: str = "", key_id: int | None = None,
-                    group: str = "") -> KeyLease: ...
+                    group: str = "", key_index: int | None = None) -> KeyLease: ...
     async def report(self, key: KeyLease, ok: bool, status_code: int = 0,
                      latency_ms: int = 0, error: str = "",
                      usage: dict[str, Any] | None = None) -> None: ...

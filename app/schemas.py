@@ -142,8 +142,19 @@ class RouteConfig(BaseModel):
 
     # ---- 响应提取（点分路径，支持数字下标如 data.0.task_id）----
     task_id_path: str = "task_id"      # 提交响应中上游任务 id
+    probe_task_id_path: str = ""
+    """探测/查询报文中任务 id 的字段路径（如 ``task.id``）。仅用于**原生查询
+    拦截**在上游还没接单时自造同构快照报文；空则回退 ``task_id_path``。"""
     status_path: str = "status"        # 探测/回调报文中状态
     result_path: str = ""              # 成功产物 URL
+    result_url_template: str = ""
+    """产物直链改写模板（转存/镜像；空 = 不改写）。占位符
+    ``{upstream_result_url}`` / ``{upstream_result_url_encoded}`` /
+    ``{upstream_result_url_no_scheme}`` / ``{upstream_result_host}`` /
+    ``{upstream_result_path}`` / ``{task_id}``，例如
+    ``https://myhost.com/{upstream_result_url}``。网关只改地址、不搬字节：
+    终态落库时改写 ``data.result``（原始链另存 ``data.upstream_result``），
+    原生查询报文里的直链同步字节级替换。见 ``app.services.resulturl``。"""
     error_path: str = ""               # 失败信息（如 task.error.message）
     actual_amount_path: str = ""       # 上游直接给出实收金额（结算最高优先）
     settle_usage_map: dict[str, str] = Field(default_factory=dict)

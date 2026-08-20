@@ -15,7 +15,7 @@ freeze 幂等：request_id 唯一索引，重复提交返回首次结果（不�
 from __future__ import annotations
 
 from app.config import settings
-from app.logging import log
+from app.logging import log, logfire_event
 from app.schemas import UserIdentity
 from app.services import httpc
 from app.services.providers import BillingError
@@ -27,6 +27,14 @@ def _err_body(resp) -> str:
         return str(data.get("error") or data)[:200]
     except Exception:
         return resp.text[:200]
+
+
+def _audit_rejected(op: str, request_id: str, status: int, body: str) -> None:
+    """资金链路被拒事件（SPEC「资金事件必发」纪律）：结构化发 logfire，
+    与 OTel httpx span 同 trace——4xx 原因（body）不再只躺在容器 stderr。"""
+    logfire_event("error" if status >= 500 else "warning",
+                  f"billing_{op}_rejected",
+                  request_id=request_id, status=status, body=body)
 
 
 class NewapiBillingProvider:
@@ -72,9 +80,11 @@ class NewapiBillingProvider:
         )
         if resp.status_code != 200:
             # 402 余额不足 / 409 锁竞争（可重试）/ 4xx 参数错误——状态码原样上抛
+            body = _err_body(resp)
+            _audit_rejected("freeze", request_id, resp.status_code, body)
             log.warning("billing freeze rejected: request_id={} status={} body={}",
-                        request_id, resp.status_code, _err_body(resp))
-            raise BillingError(resp.status_code, _err_body(resp))
+                        request_id, resp.status_code, body)
+            raise BillingError(resp.status_code, body)
         log.info("billing freeze ok: request_id={} amount={} metric={}",
                  request_id, round(amount, 6), metric)
         data = resp.json()
@@ -97,9 +107,11 @@ class NewapiBillingProvider:
             json=body,
         )
         if resp.status_code != 200:
+            body = _err_body(resp)
+            _audit_rejected("settle", request_id, resp.status_code, body)
             log.warning("billing settle rejected: request_id={} status={} body={}",
-                        request_id, resp.status_code, _err_body(resp))
-            raise BillingError(resp.status_code, f"settle {request_id}: {_err_body(resp)}")
+                        request_id, resp.status_code, body)
+            raise BillingError(resp.status_code, f"settle {request_id}: {body}")
         log.info("billing settle ok: request_id={} actual_amount={}",
                  request_id, round(actual_amount, 6))
 
@@ -111,9 +123,11 @@ class NewapiBillingProvider:
             json={"request_id": request_id},
         )
         if resp.status_code != 200:
+            body = _err_body(resp)
+            _audit_rejected("cancel", request_id, resp.status_code, body)
             log.warning("billing cancel rejected: request_id={} status={} body={}",
-                        request_id, resp.status_code, _err_body(resp))
-            raise BillingError(resp.status_code, f"cancel {request_id}: {_err_body(resp)}")
+                        request_id, resp.status_code, body)
+            raise BillingError(resp.status_code, f"cancel {request_id}: {body}")
         log.info("billing cancel ok: request_id={}", request_id)
 
     async def renew(self, *, raw_token: str, request_id: str,
@@ -126,9 +140,11 @@ class NewapiBillingProvider:
             json={"request_id": request_id, "ttl_seconds": ttl_seconds},
         )
         if resp.status_code != 200:
+            body = _err_body(resp)
+            _audit_rejected("renew", request_id, resp.status_code, body)
             log.warning("billing renew rejected: request_id={} status={} body={}",
-                        request_id, resp.status_code, _err_body(resp))
-            raise BillingError(resp.status_code, f"renew {request_id}: {_err_body(resp)}")
+                        request_id, resp.status_code, body)
+            raise BillingError(resp.status_code, f"renew {request_id}: {body}")
         data = resp.json()
         payload = data.get("data", data)
         log.info("billing renew ok: request_id={} expires_at={}",

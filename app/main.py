@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.db import close_db
 from app.errors import register_exception_handlers
-from app.logging import log, setup_logging
+from app.logging import attach_logfire_handler, log, setup_logging
 from app.services import httpc, upstream
 
 
@@ -44,6 +44,8 @@ def _setup_logfire(app: FastAPI) -> None:
             console=False,
         )
         logfire.instrument_fastapi(app, excluded_urls=settings.logfire_excluded_urls)
+        # configure 成功后再挂 loguru→logfire 桥接（顺序颠倒会丢启动期日志）
+        attach_logfire_handler()
     except Exception:
         log.opt(exception=True).warning("logfire setup failed, continue without it")
 

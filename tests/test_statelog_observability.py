@@ -149,3 +149,37 @@ async def test_failure_escalation_disabled_logfire_no_crash(patch_redis, monkeyp
     monkeypatch.setattr(settings, "logfire_enabled", False)
     assert await statelog.record_failure_escalated("poll:t-10", "x") == 1
     await statelog.reset_failure("poll:t-10")
+
+
+# ---------------------------------------------------------------------------
+# loguru → logfire 桥接装配：disabled 零挂载 / enabled 幂等挂接 / 重建自动补挂
+# ---------------------------------------------------------------------------
+
+
+def test_attach_logfire_handler_lifecycle(monkeypatch):
+    from app.config import settings
+    from app.logging import attach_logfire_handler, setup_logging
+
+    def _attached() -> bool:
+        import app.logging
+
+        return app.logging._logfire_attached
+
+    try:
+        monkeypatch.setattr(settings, "logfire_enabled", False)
+        setup_logging()
+        attach_logfire_handler()
+        assert _attached() is False                  # disabled：零挂载
+
+        monkeypatch.setattr(settings, "logfire_enabled", True)
+        attach_logfire_handler()
+        assert _attached() is True                   # 挂接成功
+        attach_logfire_handler()
+        assert _attached() is True                   # 重复挂接幂等（flag 不变）
+
+        setup_logging()                              # 重建 sink 后自动补挂
+        assert _attached() is True
+    finally:
+        # 清理全局 loguru 状态，不污染后续测试
+        monkeypatch.setattr(settings, "logfire_enabled", False)
+        setup_logging()

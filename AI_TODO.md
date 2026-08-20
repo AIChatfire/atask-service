@@ -1,5 +1,27 @@
 # 要优化的点
 
+## keypool 精确直达 + 产物转存 ✅ 已完成（2026-08-20）
+- 任务级操作（探测/取消/原生查询/回调/对账）用 `channel_id + key_index`
+  单 key 精确直达（`app/services/leasing.py` 统一收口），根治同渠道多账号
+  key 查不到任务的隐患；key 级失败自动降级渠道直达。
+- 产物转存：渠道配 `result_url_template`（如
+  `https://myhost.com/{upstream_result_url}`），上游直链在任务视图/回调/
+  原生报文中统一改写为镜像链，原始直链另存 `data.upstream_result`。
+- 验收：`tests/test_leasing.py` + `tests/test_resulturl.py`；
+  详细清单见 OPTIMIZATION_BACKLOG.md。
+
+## 原生接口同构（request/response 与上游一致，任务 id 用本地）✅ 已完成（2026-08-20）
+- `POST /{biz}/v2/video_generation`（命中渠道 `submit_path`）不再同步透传：
+  走 `flow.create_task` 异步受理，**请求内零上游往返**，响应
+  `{"task_id": "minimax_<uuid4hex>"}`（形状由渠道 `task_id_path` + `ok_check`
+  驱动，与上游报文严格同构）。
+- `GET /{biz}/v2/query/video_generation/{id}`（命中 `probe_path`）：本地 id 与
+  上游 id 都认，按 tasks 行的 `channel_id` 钉回直达租约转发探测，响应里的上游
+  id 被逐字节改写回本地 id；worker 还没提交时按本地快照直出（200，不 404）。
+- `cancel_path` 命中 → 本地 cancel（解冻 + 尽力源头止损），不当新任务计费。
+- 免费 GET 透传不再对 keypool 发空 model 的 `select`（必拒 40010）。
+- 验收：`tests/test_native_passthrough.py`；详细清单见 OPTIMIZATION_BACKLOG.md。
+
 ## 适配 minimax-h3 ✅ 已完成（2026-08-12）
 - 接入方式：`POST /minimax/v1/videos`（或 `/minimax/v1/tasks`），请求体与下方
   示例完全一致（content[] 多模态结构原样透传，t2va/i2va/r2va 零差异支持）。

@@ -152,14 +152,21 @@ async def test_ops_task_diagnostics_session_cleared_after_finalize(
 
 
 async def test_proxy_task_record_is_homogeneous(
-    diag_mocks, test_settings, patch_redis, task_store, queue_events,
+    diag_mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
     """同构约定：计费透传落下的 tasks 行与 flow.create_task 同一份数据形态
-    （biz 取渠道权威值、model/key_index/request_body 全量快照）。"""
+    （biz 取渠道权威值、model/key_index/request_body 全量快照）。
+
+    路径特意取**非** submit_path 的计费端点——渠道 submit_path 已被原生提交
+    拦截（走 flow.create_task 异步受理），此处验的是其余 POST 的透传语义。
+    """
+    respx_router.post("http://upstream.test/v2/image_generation").mock(
+        return_value=httpx.Response(200, json={"task_id": "up-1"})
+    )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gw.test") as client:
         resp = await client.post(
-            "/minimax/v2/video_generation", json=BODY,
+            "/minimax/v2/image_generation", json=BODY,
             headers={"Authorization": "Bearer sk-user-42"},
         )
         assert resp.status_code == 200, resp.text
@@ -173,6 +180,7 @@ async def test_proxy_task_record_is_homogeneous(
     assert data["model"] == "MiniMax-H3"
     assert data["key_id"] == 7 and data["key_index"] == 1
     assert data["request_body"]["duration"] == 5          # 结算重估基底
+    assert data["proxy_path"] == "v2/image_generation"    # 透传形态记录原路径
     assert data["upstream_task_id"] == "up-1"
     assert data["freeze_amount"] == pytest.approx(0.13)
     assert queue_events["poll"][-1]["task_id"] == task_id  # 已接入探测闭环

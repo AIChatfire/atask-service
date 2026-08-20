@@ -221,21 +221,22 @@ async def test_wait_task_id_returns_none_when_placeholder_released(
 async def test_proxy_billable_idem_placeholder_backfill_and_replay(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """计费透传带 Idempotency-Key：落库后占位回填为 task_id；同键二次请求
-    直接 202 回放首个任务——上游只透传一次、只冻结一次、只落一行。"""
+    """计费透传（**非** submit_path 的其余 POST）带 Idempotency-Key：落库后
+    占位回填为 task_id；同键二次请求直接 202 回放首个任务——上游只透传一次、
+    只冻结一次、只落一行。"""
     upstream_call = respx_router.post(
-        "http://upstream.test/v2/video_generation").mock(
+        "http://upstream.test/v2/image_generation").mock(
         return_value=httpx.Response(200, json={"task_id": "up-1"})
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://gw.test") as client:
         resp1 = await client.post(
-            "/minimax/v2/video_generation", json=BODY,
+            "/minimax/v2/image_generation", json=BODY,
             headers={"authorization": f"Bearer {TOKEN}",
                      "idempotency-key": "idem-proxy-1"})
         resp2 = await client.post(
-            "/minimax/v2/video_generation", json=BODY,
+            "/minimax/v2/image_generation", json=BODY,
             headers={"authorization": f"Bearer {TOKEN}",
                      "idempotency-key": "idem-proxy-1"})
 
@@ -248,6 +249,39 @@ async def test_proxy_billable_idem_placeholder_backfill_and_replay(
     assert resp2.json()["task_id"] == task_id
     # 占位已同键回填为真实 task_id（pending → task_id 流转完成）
     assert await idem.get_task_id(TOKEN_HASH, "idem-proxy-1") == task_id
+
+
+async def test_native_submit_idem_replay_keeps_native_shape(
+    mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """原生提交路径（命中渠道 submit_path）带 Idempotency-Key：两次都是
+    **原生形状 + 200 + 本地 task_id**（重放绝不退化成 public_view 202），
+    上游零往返、只冻结一次、只落一行。"""
+    upstream_call = respx_router.post(
+        "http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(200, json={"task_id": "up-1"})
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://gw.test") as client:
+        resp1 = await client.post(
+            "/minimax/v2/video_generation", json=BODY,
+            headers={"authorization": f"Bearer {TOKEN}",
+                     "idempotency-key": "idem-native-1"})
+        resp2 = await client.post(
+            "/minimax/v2/video_generation", json=BODY,
+            headers={"authorization": f"Bearer {TOKEN}",
+                     "idempotency-key": "idem-native-1"})
+
+    assert (resp1.status_code, resp2.status_code) == (200, 200)
+    assert not upstream_call.calls                          # 提交由 worker 异步执行
+    assert len(mocks.freeze.calls) == 1
+    assert len(task_store.rows) == 1
+    task_id = next(iter(task_store.rows))
+    assert resp1.json() == {"task_id": task_id}             # 与上游报文同构
+    assert resp2.json() == {"task_id": task_id}
+    assert queue_events["submit"] == [task_id]              # 只入队一次
+    assert await idem.get_task_id(TOKEN_HASH, "idem-native-1") == task_id
 
 
 async def test_proxy_billable_releases_placeholder_when_store_fails(
@@ -265,7 +299,7 @@ async def test_proxy_billable_releases_placeholder_when_store_fails(
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://gw.test") as client:
         resp = await client.post(
-            "/minimax/v2/video_generation", json=BODY,
+            "/minimax/v2/image_generation", json=BODY,
             headers={"authorization": f"Bearer {TOKEN}",
                      "idempotency-key": "idem-proxy-fail"})
 

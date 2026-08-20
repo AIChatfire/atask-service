@@ -1,6 +1,7 @@
 """上游状态探测（由 queue.poll_task 调用）。
 退避按任务年龄升档；超 poll_max_age 转 FAILURE 并取消冻结；重投走 queue.schedule_poll。
-租约按原 channel 钉回（key_id 直达），路由配置随租约从渠道元数据重建。
+租约按原 key 钉回（``channel_id + key_index`` 精确直达，见 app.services.leasing），
+路由配置随租约从渠道元数据重建。
 """
 
 from __future__ import annotations
@@ -11,9 +12,17 @@ from app.config import settings
 from app.logging import log
 from app.queue import schedule_poll
 from app.schemas import ACTIVE, FAILURE, TERMINAL
-from app.services import errclass, flow, providers, statelog, statusmap, taskstore, upstream
+from app.services import (
+    errclass,
+    flow,
+    leasing,
+    providers,
+    statelog,
+    statusmap,
+    taskstore,
+    upstream,
+)
 from app.services.providers import KeyLeaseError
-from app.services.registry import registry, route_from_lease
 
 
 def _next_delay(age_seconds: float) -> int:
@@ -44,10 +53,9 @@ async def poll_one(task_id: str) -> None:
         return
 
     try:
-        key = await providers.keys.lease(           # 按原 channel 钉回（channel_id 直达）
-            biz, model=str(data.get("model") or ""),
-            key_id=data.get("key_id"),
-        )
+        # 按原 key 钉回（channel_id + key_index 精确直达，失败降级渠道直达）：
+        # 同渠道多上游账号时，换账号的 key 查不到这条任务
+        key, route = await leasing.route_for_task(biz, data, task)
     except KeyLeaseError as exc:
         # 无可用 key：keypool 给出 retry_after_ms 时按 hint 拉长重投（退避升档兜底）；
         # 每轮 warning 走失败升档计数（1/5/20 档才告警，其余 DEBUG）
@@ -58,7 +66,6 @@ async def poll_one(task_id: str) -> None:
             f"poll:{task_id}", f"lease failed, retry in {delay}s: {exc}")
         await schedule_poll(task_id, delay)                            # 租约失败下轮再来
         return
-    route = registry.remember(route_from_lease(biz, key))
     if not route.probe_path:
         log.error("biz={} channel setting.gateway.probe_path missing, cannot probe", biz)
         return
@@ -85,20 +92,30 @@ async def poll_one(task_id: str) -> None:
         return
     await statelog.reset_failure(f"poll:{task_id}")                    # 探测成功清零失败计数
 
+    mapped = await advance_from_probe(task, route, resp, detail="poll")
+    if mapped not in TERMINAL:
+        await schedule_poll(task_id, _next_delay(age))                 # 非终态/未识别：下轮再探
+
+
+async def advance_from_probe(task: dict, route, resp: dict,
+                             detail: str = "probe") -> str | None:
+    """一份上游探测快照 → 推进本地任务状态（不含重投排程）。
+
+    poller 与**原生查询透传拦截**共用：客户端轮询原生查询端点时顺带驱动状态
+    推进（结果更早可见；与 poller 并发无害——终态走 CAS 恰好一次，活跃态
+    patch_data 幂等）。返回映射后的内部状态；未识别 → None。
+    """
+    task_id = task["task_id"]
     upstream_status = upstream.extract_path(resp, route.status_path)
     mapped = statusmap.map_status(route, upstream_status)
     log.debug("probe result: task_id={} upstream_status={} mapped={}",
               task_id, upstream_status, mapped)
-
-    if mapped is not None:
-        await statelog.record_if_changed(task_id, mapped, detail="poll")
-
     if mapped is None:
-        await schedule_poll(task_id, _next_delay(age))                   # 未识别状态：下轮再探
-    elif mapped in TERMINAL:
+        return None
+    await statelog.record_if_changed(task_id, mapped, detail=detail)
+    if mapped in TERMINAL:
         await flow.finalize_task(task, mapped, resp, route=route)
     elif mapped in ACTIVE:
-        await taskstore.patch_data(task_id, {"upstream_status": upstream_status}, status=mapped)
-        await schedule_poll(task_id, _next_delay(age))
-    else:
-        await schedule_poll(task_id, _next_delay(age))
+        await taskstore.patch_data(task_id, {"upstream_status": upstream_status},
+                                   status=mapped)
+    return mapped

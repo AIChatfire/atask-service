@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     key_svc_url: str = "http://127.0.0.1:8081"
     key_svc_token: str = "change-me"
     key_group: str = "keypool"            # 统一分组：全部渠道挂在此 group 下集中维护
+    # biz -> 最近使用 channel_id 的 Redis 记忆 TTL（免费 GET 钉渠道直达租约用：
+    # 免费请求不带 model，keypool select 对空 model 必拒 40010，所以网关不问它）
+    route_channel_ttl_seconds: int = 86400
 
     # ---- 网关自身 ----
     gateway_public_base_url: str = "http://127.0.0.1:8000"  # 注入上游 callback_url 基址

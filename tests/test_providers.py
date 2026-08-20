@@ -94,6 +94,41 @@ async def test_keypool_lease_channel_id_direct(respx_router, test_settings):
     req_body = json.loads(route.calls.last.request.content)
     assert req_body["channel_id"] == 7
     assert "group" not in req_body           # channel_id 直达不带 group/model
+    assert "key_index" not in req_body       # 未指定下标 → 渠道内按算法选 key
+
+
+async def test_keypool_lease_exact_key_index_direct(respx_router, test_settings):
+    """``channel_id + key_index`` 单 key 精确直达（keypool mode=direct）：
+    同渠道挂多个上游账号时，任务级操作必须打回创建时那把 key。"""
+    from app.services.providers.keypool import KeypoolProvider
+
+    route = respx_router.post("http://keypool.test/v1/keys/select").mock(
+        return_value=httpx.Response(200, json=_SELECT_PAYLOAD)
+    )
+    await KeypoolProvider().lease("minimax", key_id=7, key_index=2)
+    req_body = json.loads(route.calls.last.request.content)
+    assert req_body["channel_id"] == 7 and req_body["key_index"] == 2
+    assert "group" not in req_body and "model" not in req_body
+
+    # key_index=0 是合法下标（0 起），不能被 falsy 判断吃掉
+    await KeypoolProvider().lease("minimax", key_id=7, key_index=0)
+    assert json.loads(route.calls.last.request.content)["key_index"] == 0
+
+
+async def test_keypool_lease_key_index_without_channel_is_dropped(
+    respx_router, test_settings,
+):
+    """keypool 契约：``key_index`` 必须搭配 ``channel_id``（单传必 400）——
+    网关在客户端就不发出这个无效组合。"""
+    from app.services.providers.keypool import KeypoolProvider
+
+    route = respx_router.post("http://keypool.test/v1/keys/select").mock(
+        return_value=httpx.Response(200, json=_SELECT_PAYLOAD)
+    )
+    await KeypoolProvider().lease("minimax", model="gpt-4o", key_index=3)
+    req_body = json.loads(route.calls.last.request.content)
+    assert "key_index" not in req_body
+    assert req_body["group"] == "keypool" and req_body["model"] == "gpt-4o"
 
 
 async def test_keypool_no_available_key_40001(respx_router, test_settings):
@@ -104,8 +139,40 @@ async def test_keypool_no_available_key_40001(respx_router, test_settings):
             503, json={"code": 40001, "message": "no available key",
                        "data": {"retry_after_ms": 1000}})
     )
-    with pytest.raises(KeyLeaseError, match="no available key"):
+    with pytest.raises(KeyLeaseError) as exc_info:
         await KeypoolProvider().lease("minimax", model="x")
+    exc = exc_info.value
+    assert "no available key" in str(exc)
+    assert exc.retry_after_ms == 1000
+    assert exc.code == 40001 and exc.key_level is True     # key 级 → 可降级重试
+
+
+async def test_keypool_key_index_out_of_range_40010(respx_router, test_settings):
+    """``key_index`` 越界 = 该 key 已不在渠道里（永久性错误）：code 透出为
+    40010 且归类为 key 级，供上层降级到渠道直达。"""
+    from app.services.providers.keypool import KeypoolProvider
+
+    respx_router.post("http://keypool.test/v1/keys/select").mock(
+        return_value=httpx.Response(
+            400, json={"code": 40010, "message": "key_index out of range"})
+    )
+    with pytest.raises(KeyLeaseError) as exc_info:
+        await KeypoolProvider().lease("minimax", key_id=7, key_index=99)
+    assert exc_info.value.code == 40010 and exc_info.value.key_level is True
+
+
+async def test_keypool_channel_not_found_40002_is_not_key_level(
+    respx_router, test_settings,
+):
+    """渠道不存在（40002）不是 key 级问题——无从降级，必须原样上抛。"""
+    from app.services.providers.keypool import KeypoolProvider
+
+    respx_router.post("http://keypool.test/v1/keys/select").mock(
+        return_value=httpx.Response(404, json={"code": 40002, "message": "channel not found"})
+    )
+    with pytest.raises(KeyLeaseError) as exc_info:
+        await KeypoolProvider().lease("minimax", key_id=99)
+    assert exc_info.value.code == 40002 and exc_info.value.key_level is False
 
 
 async def test_keypool_auth_failure(respx_router, test_settings):
@@ -239,3 +306,57 @@ async def test_billing_settle_and_cancel_use_user_token(respx_router, test_setti
     assert cancel.calls.last.request.headers["Authorization"] == "Bearer sk-user-2"
     body = json.loads(settle.calls.last.request.content)
     assert body["actual_amount"] == 0.0104 and body["units"] == 4
+
+
+async def test_billing_rejected_emits_logfire_event(respx_router, test_settings,
+                                                    monkeypatch):
+    """资金链路被拒必发结构化 logfire 事件（SPEC「资金事件必发」纪律）：
+    4xx 原因（body）不再只躺在容器 stderr——与 httpx span 同 trace 可查。
+    4xx → warning / 5xx → error 两档。"""
+    import sys
+    from types import SimpleNamespace
+
+    calls: list[dict] = []
+
+    def _mk(level):
+        def _emit(event, **fields):
+            calls.append({"level": level, "event": event, "fields": fields})
+        return _emit
+
+    monkeypatch.setitem(sys.modules, "logfire", SimpleNamespace(
+        info=_mk("info"), warn=_mk("warn"), warning=_mk("warning"), error=_mk("error"),
+    ))
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "logfire_enabled", True)
+    from app.services.providers.billing_newapi import NewapiBillingProvider
+
+    provider = NewapiBillingProvider()
+    respx_router.post("http://billing.test/api/v1/billing/settle").mock(
+        return_value=httpx.Response(400, json={"error": "freeze expired"})
+    )
+    with pytest.raises(BillingError):
+        await provider.settle(raw_token="sk-u", request_id="t-400",
+                              actual_amount=0.01, units=4)
+
+    assert len(calls) == 1
+    assert calls[0]["level"] == "warning"            # 4xx → warning 档
+    assert calls[0]["event"] == "billing_settle_rejected"
+    fields = calls[0]["fields"]
+    assert fields["request_id"] == "t-400" and fields["status"] == 400
+    assert "freeze expired" in fields["body"]
+
+    calls.clear()
+    respx_router.post("http://billing.test/api/v1/billing/settle").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    with pytest.raises(BillingError):
+        await provider.settle(raw_token="sk-u", request_id="t-500", actual_amount=0.01)
+    assert calls[0]["level"] == "error"              # 5xx → error 档
+
+    # disabled 时零发射（观测开关不劫持业务路径）
+    calls.clear()
+    monkeypatch.setattr(settings, "logfire_enabled", False)
+    with pytest.raises(BillingError):
+        await provider.settle(raw_token="sk-u", request_id="t-401", actual_amount=0.01)
+    assert calls == []

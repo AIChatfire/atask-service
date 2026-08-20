@@ -3,8 +3,11 @@
 服务级 Bearer token 认证（GW_KEY_SVC_TOKEN）；统一响应包络
 ``{"code":0,"message":"ok","data":...}``。
 
-- ``POST {BASE}/v1/keys/select``：按 ``group+model`` 选渠道与 key（或
-  ``channel_id`` 直达）；``include_channel=true`` 让响应附带渠道全量元数据
+- ``POST {BASE}/v1/keys/select``：三种定位形态——``group+model`` 加权选渠道、
+  ``channel_id`` 渠道直达、``channel_id + key_index`` **单 key 精确直达**
+  （``mode="direct"``，跳过轮换批次/轮询游标/usage 打分，且不访问 Redis，
+  Redis 降级期间仍可用；同传的 mode/est_tokens/advance_cursor/exclude 一律
+  被忽略）。``include_channel=true`` 让响应附带渠道全量元数据
   （model_mapping/param_override/header_override/status_code_mapping/
   setting.proxy/openai_organization/base_url）——网关零配置消费渠道差异。
   ``retry`` 为**服务侧内部重试深度**（选 key 失败时 keypool 内部换 key 重试
@@ -13,8 +16,12 @@
 - ``POST {BASE}/v1/keys/report``：上报调用结果驱动自动禁启；
   ``Idempotency-Key`` 头幂等，重复上报 409 视为成功；fire-and-forget。
 
-错误包络 code：40001=无可用 key（503，data.retry_after_ms 给出建议）、
-40002=渠道不存在（404）、40010=参数错误（400）、40100=未鉴权（401）。
+错误包络 code：40001=无可用 key / key 被禁用（503，data.retry_after_ms 给出
+建议）、40002=渠道不存在（404）、40010=参数错误（400；含 ``key_index`` 越界
+或负数——**永久性错误，重试无意义**）、40100=未鉴权（401）。
+
+``key_index`` 约束：必须搭配 ``channel_id``（单传走 group+model 时渠道是动态
+选出的，索引无从对应，keypool 直接 400）；索引 0 起。
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from app.config import settings
 from app.logging import log
 from app.schemas import KeyLease
 from app.services import httpc
-from app.services.providers import KeyLeaseError
+from app.services.providers import KP_NO_KEY, KeyLeaseError
 
 #: select 内部重试深度（keypool 服务侧换 key 重试次数；网关自身有租约失败
 #: 重试与探测重投，默认 1 对网关无影响，见模块 docstring）
@@ -48,26 +55,34 @@ class KeypoolProvider:
         if code == 0:
             return resp_json.get("data") or {}
         message = str(resp_json.get("message") or "keypool error")
-        if code == 40001:
+        if code == KP_NO_KEY:
             raw_ms = (resp_json.get("data") or {}).get("retry_after_ms")
             retry_ms = int(raw_ms) if isinstance(raw_ms, int | float) else None
             raise KeyLeaseError(
                 f"no available key ({ctx}); retry_after_ms={retry_ms}",
-                retry_after_ms=retry_ms,
+                retry_after_ms=retry_ms, code=code,
             )
-        raise KeyLeaseError(f"keypool {ctx} failed: code={code} {message}")
+        raise KeyLeaseError(f"keypool {ctx} failed: code={code} {message}", code=code)
 
     async def lease(self, biz: str, model: str = "", key_id: int | None = None,
-                    group: str = "") -> KeyLease:
-        """取一个可用 key 与渠道覆盖配置。
+                    group: str = "", key_index: int | None = None) -> KeyLease:
+        """取一个可用 key 与渠道覆盖配置。三种定位形态（优先级从高到低）：
 
-        ``key_id`` 非空 → ``channel_id`` 直达（探测时钉回原渠道）；否则按
-        ``group+model`` 经 abilities 分档加权选择。``group`` 缺省取
-        ``GW_KEY_GROUP``（统一分组，默认 "keypool"）。
+        1. ``key_id + key_index`` → **单 key 精确直达**（``mode="direct"``）：
+           跳过全部调度算法与 Redis。任务级操作（探测/取消/原生查询）必须用
+           创建时那把 key——同渠道挂多个上游账号时，换 key 就查不到任务。
+        2. ``key_id`` → ``channel_id`` 渠道直达（渠道内按算法选一把健康 key）。
+        3. 否则 ``group+model`` 经 abilities 分档加权选择；``group`` 缺省取
+           ``GW_KEY_GROUP``（统一分组，默认 "keypool"）。
+
+        ``key_index`` 单独出现（无 ``key_id``）会被忽略——keypool 契约要求它
+        必须搭配 ``channel_id``，这里在客户端就不发出无效请求。
         """
         body: dict[str, Any] = {"retry": _SELECT_RETRY, "include_channel": True}
         if key_id:
             body["channel_id"] = key_id
+            if key_index is not None and key_index >= 0:
+                body["key_index"] = key_index      # 单 key 精确直达（mode=direct）
         else:
             body["group"] = group or settings.key_group
             body["model"] = model
@@ -83,19 +98,23 @@ class KeypoolProvider:
             raise KeyLeaseError("keypool auth failed (check GW_KEY_SVC_TOKEN)")
         if resp.status_code != 200:
             # 错误响应仍是统一包络（如 503 + code=40001 无可用 key）——解出
-            # data.retry_after_ms 作为结构化退避 hint（探测重投 / Retry-After 头）
+            # code 与 data.retry_after_ms 作为结构化 hint（失败分流 / 退避 /
+            # Retry-After 头）；非 JSON 响应（网关 502 等）code=0
             retry_ms: int | None = None
+            err_code = 0
             try:
                 err_env = resp.json()
             except Exception:
                 err_env = {}
             if isinstance(err_env, dict):
+                raw_code = err_env.get("code")
+                err_code = int(raw_code) if isinstance(raw_code, int) else 0
                 raw_ms = (err_env.get("data") or {}).get("retry_after_ms")
                 if isinstance(raw_ms, int | float):
                     retry_ms = int(raw_ms)
             raise KeyLeaseError(
                 f"keypool select failed: {resp.status_code} {resp.text[:200]}",
-                retry_after_ms=retry_ms,
+                retry_after_ms=retry_ms, code=err_code,
             )
         data = self._unwrap(resp.json(), "select")
 

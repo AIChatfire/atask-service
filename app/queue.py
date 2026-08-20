@@ -35,23 +35,15 @@ from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend, RedisScheduleSource
 
 from app.config import settings
-from app.logging import log, setup_logging
+from app.logging import attach_logfire_handler, log, logfire_event, setup_logging
 from app.redis import S_DLQ, r
 
 QUEUE_NAME = "gw:taskiq"
 SCHED_PREFIX = "gw:sched"
 
-
-def _logfire_event(level: str, event: str, **fields: Any) -> None:
-    """logfire 事件发射点（GW_LOGFIRE_ENABLED 时才真正发出；测试可替换）。"""
-    if not settings.logfire_enabled:
-        return
-    try:
-        import logfire
-
-        getattr(logfire, level)(event, **fields)
-    except Exception:
-        pass
+# 公共发射点收敛到 app.logging（billing 等其他模块共用）；保留本模块别名，
+# 兼容既有调用点与测试的 monkeypatch 面（queue._logfire_event）
+_logfire_event = logfire_event
 
 
 class ObservabilityMiddleware(TaskiqMiddleware):
@@ -87,6 +79,8 @@ class ObservabilityMiddleware(TaskiqMiddleware):
                 ),
                 console=False,
             )
+            # configure 成功后再挂 loguru→logfire 桥接（顺序颠倒会丢启动期日志）
+            attach_logfire_handler()
         except Exception:
             log.opt(exception=True).warning("logfire setup failed in worker")
 

@@ -27,8 +27,10 @@ from app.schemas import (
 )
 from app.services import (
     idem,
+    leasing,
+    nativeapi,
     pricing,
-    providers,
+    resulturl,
     statelog,
     taskstore,
     tokensession,
@@ -179,9 +181,10 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
     return {"task_id": pf.task_id, "status": SUBMITTED}
 
 
-async def _resolve_task(task_id: str) -> dict | None:
+async def resolve_task(task_id: str) -> dict | None:
     """本地 task_id 优先；未命中按上游任务 id 反查——客户端持上游 id
-    （如同步提交时代/proxy 透传响应里的上游 id）轮询的兼容入口。"""
+    （如同步提交时代/proxy 透传响应里的上游 id）轮询的兼容入口。
+    原生透传路径的 GET 拦截同样复用它（URL 里的 id 段两种形态都认）。"""
     task = await taskstore.get(task_id)
     if task:
         return task
@@ -189,7 +192,7 @@ async def _resolve_task(task_id: str) -> dict | None:
 
 
 async def view_task(task_id: str) -> dict:
-    task = await _resolve_task(task_id)
+    task = await resolve_task(task_id)
     if not task:
         raise HTTPException(404, "task not found")
     await statelog.record_if_changed(task["task_id"], task["status"], detail="get")
@@ -246,9 +249,19 @@ async def finalize_task(task: dict, to_status: str, raw: dict, fail_reason: str 
         route = registry.get_cached(data.get("biz", ""))
     patch = {"upstream_status": upstream.extract_path(raw, route.status_path) if route else None}
     if to_status == SUCCESS and route and route.result_path:
-        patch["result"] = upstream.extract_path(raw, route.result_path)
+        extracted = upstream.extract_path(raw, route.result_path)
+        # 产物直链改写（渠道配了 result_url_template 才动作）：对外统一走网关
+        # 自己的域名/转存服务；原始直链另存 upstream_result 供对账与回源
+        patch["result"] = resulturl.transform(route, extracted, route_task_id)
+        if patch["result"] != extracted:
+            patch["upstream_result"] = extracted
     if not fail_reason and route and route.error_path:
         fail_reason = str(upstream.extract_path(raw, route.error_path) or "")
+    # 终态上游原始报文快照：原生查询拦截据此逐字段同构回放（usage/trace_id 等
+    # 网关不认识的字段全都在），且终态查询零上游往返。小体积才落，见 nativeapi
+    snapshot = nativeapi.capture_snapshot(raw)
+    if snapshot is not None:
+        patch["upstream_snapshot"] = snapshot
 
     ok = await taskstore.cas(route_task_id, ACTIVE, to_status, patch=patch, fail_reason=fail_reason[:500])
     if not ok:
@@ -311,8 +324,8 @@ async def try_upstream_cancel(task: dict, route=None) -> None:
     if route is None or not route.cancel_path or not upstream_task_id:
         return
     try:
-        key = await providers.keys.lease(biz, model=str(data.get("model") or ""),
-                                         key_id=data.get("key_id"))
+        # 钉回创建时那把 key（精确直达）：同渠道多账号时换 key 取消不到
+        key = await leasing.lease_for_task(biz, data, task)
         if await upstream.cancel_task_remote(route, key, str(upstream_task_id)):
             log.info("upstream cancel ok: task_id={} upstream_task_id={}",
                      task["task_id"], upstream_task_id)
@@ -323,7 +336,7 @@ async def try_upstream_cancel(task: dict, route=None) -> None:
 
 async def cancel_task(task_id: str) -> dict:
     """按 task_id 取消（持有即凭证，与 GET 同一安全假设；兼容上游 id 反查）"""
-    task = await _resolve_task(task_id)
+    task = await resolve_task(task_id)
     if not task:
         raise HTTPException(404, "task not found")
     if task["status"] in TERMINAL:

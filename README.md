@@ -89,6 +89,15 @@ sweep 补数；scheduler 必须单副本，worker 扩副本时拆回独立服务
 渠道模型映射改写、参数覆盖合并、回调注入（`supports_callback` 时）、
 按路径提取 task_id/状态/结果、终态用实际产出秒数重跑规则结算。
 
+**可选 · 产物转存/镜像**：渠道 gateway 块加
+`"result_url_template": "https://myhost.com/{upstream_result_url}"`，终态时
+`result_path` 提取出的上游直链按模板改写。占位符：`{upstream_result_url}`
+（原样）、`{upstream_result_url_encoded}`（百分号编码，当查询参数值时用）、
+`{upstream_result_url_no_scheme}`、`{upstream_result_host}`、
+`{upstream_result_path}`、`{task_id}`。改写后的镜像链在任务视图、用户回调
+与原生查询报文中**全面替换**上游直链（原始直链另存 `data.upstream_result`
+供对账/回源）。网关不搬运字节，转存由模板指向的服务负责。
+
 字段全集与缺省值见 `app/schemas.py:RouteConfig` 与
 `app/services/registry.py:_GATEWAY_DEFAULTS`。
 
@@ -103,8 +112,33 @@ sweep 补数；scheduler 必须单副本，worker 扩副本时拆回独立服务
 | `GET /{biz}/v1/videos/{task_id}` | 视频任务查询 |
 | `POST /callback/{biz}/{task_id}` | 上游 webhook 入站（HMAC 验签 + 去重） |
 | `ANY /{biz}/{原生路径}` | 动态透传（GET 免费按 IP 限流；写方法计费透传） |
+| `POST /{biz}/{渠道 submit_path}` | **原生提交**：报文与上游同构，返回本地 task_id，零上游往返秒级受理 |
+| `GET /{biz}/{渠道 probe_path}` | **原生查询**：本地 id / 上游 id 都认，报文与上游同构（上游 id 改写为本地 id） |
+| `POST /{biz}/{渠道 cancel_path}` | **原生取消**：走本地 cancel（解冻 + 尽力源头止损） |
 | `GET /ops/queue`、`GET /ops/tasks/{task_id}`、`POST /ops/requeue/{task_id}`、`POST /ops/dlq/replay` | 运维（`X-Admin-Token`） |
 | `GET /healthz/live`、`GET /healthz/ready` | 探针 |
+
+### 原生形态接入（零客户端改造）
+
+想让客户端**一行代码不改**地从直连上游切到网关？直接打上游原生路径即可——
+网关按渠道配置的三个路径模板识别生命周期端点（判定零硬编码）：
+
+```bash
+# 提交：请求体与上游完全一致，立刻拿到本地 task_id（不等上游）
+curl -X POST https://gw.example.com/minimax/v2/video_generation \
+  -H 'Authorization: Bearer sk-user-xxx' -H 'Content-Type: application/json' \
+  -d '{"model":"MiniMax-H3","content":[{"type":"text","text":"..."}],"duration":5}'
+# → {"task_id":"minimax_5f2c...e91"}      ← 与上游报文同构，值是本地 id
+
+# 查询：拿本地 id 直接查原生端点，报文与上游逐字节同构
+curl https://gw.example.com/minimax/v2/query/video_generation/minimax_5f2c...e91
+# → {"task":{"id":"minimax_5f2c...e91","status":"succeeded","content":{...}}}
+```
+
+要点：响应形状由渠道 `task_id_path`/`probe_task_id_path`/`status_path`/
+`result_path`/`ok_check` 反向构建；上游任务 id 只存在于 `tasks.data`，对外
+一律回显本地 id；上游还没接单时返回排队态快照（200，绝不 404）；其余原生
+路径维持原样流式透传。
 
 ## 计费闭环与可靠性
 

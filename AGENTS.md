@@ -39,6 +39,37 @@
   渠道挂进分组 + 配 gateway 块 billing 计费规则，不改代码。
 - **渠道覆盖三层叠加**：route.default_params < 用户 body < channel.param_override；
   model_mapping 改写 model；用户自带 callback_url/webhook 一律摘除（用户回调由网关签名投递）。
+- **任务级租约钉回精确到 key**（唯一入口 `app/services/leasing.py`）：探测 /
+  取消 / 原生查询 / 回调 / 反向对账一律用 keypool 的 `channel_id + key_index`
+  **单 key 精确直达**（`mode=direct`，跳过调度算法与 Redis）——同一渠道挂多个
+  上游账号时，换 key 就查不到任务。key 级失败（40010 索引越界 / 40001 该 key
+  被禁用）自动降级为渠道直达；40002 渠道不存在原样上抛。**提交链路不钉 key**
+  （任务还没进上游，渠道内任意健康 key 都行；钉死反而在该 key 被禁时白等）。
+  凭证治理（禁用/轮换/epoch）全留在 keypool，网关绝不缓存明文 key。
+- **产物直链改写（转存/镜像）**：渠道配 `result_url_template`（如
+  `https://myhost.com/{upstream_result_url}`）即让所有出口只出现网关地址——
+  finalize 改写 `data.result`（原始链另存 `data.upstream_result`）→ tasks/videos
+  视图与用户回调自动跟随；原生查询报文里的直链**字节级替换**（报文其余部分
+  同构）。占位符见 `app/services/resulturl.py`（还有 `_encoded` / `_no_scheme` /
+  `_host` / `_path` / `{task_id}`）。**网关只改地址、不搬字节**，回源由模板指向
+  的服务负责；模板为空 = 不改写（默认零影响）。
+- **原生路径拦截（透传形态的生命周期入口）**：通配 `/{biz}/{原生路径}` 默认同步
+  透传，但命中渠道路径模板的三条路径被改写为网关语义（零硬编码、判定全来自
+  渠道配置，见 app/services/nativeapi.py + app/routers/proxy.py）：
+  `submit_path`（POST）→ 走 flow.create_task 异步受理，**零上游往返秒级返回**，
+  响应体按 `task_id_path`（+ `ok_check` 信封）塑形为原生形状、值是本地 task_id；
+  `probe_path`（GET）→ 按 URL 里的 id 反查 tasks 行（本地 id 主键直查、上游 id
+  兜底反查），用 `channel_id` 钉回直达租约转发，响应缓冲后把上游 id 逐字节改写
+  回本地 id（其余字节 100% 同构）；**终态零上游往返**——finalize 时把上游终态
+  原始报文落 `data.upstream_snapshot`（≤8KB），查询直接回放（逐字段同构）；
+  首探前/上游不可达时按配置反向构建快照（`probe_task_id_path` 指定快照里 id
+  的字段路径，状态词优先用 `data.upstream_status` 上游原话），绝不 404；
+  `cancel_path`（非 GET）→ 走本地 cancel 链路（解冻 + 尽力源头止损），绝不当
+  新任务报价冻结。其余路径透传语义一字不改。
+- **免费透传永不空 model 问 keypool**：`select(group, model)` 对空 model 直接拒
+  （40010），所以免费 GET 按「Redis `biz→channel_id` 记忆（app/services/routecache.py，
+  唯一写入点 = preflight 成功租约）→ 进程路由缓存」钉回 channel_id 直达租约，
+  两级都落空才 404——一次浪费的出站都不发。
 - **提交异步化**：创建接口 preflight+落库即返回本地 task_id（`{biz}_{uuid4hex}`），
   上游提交由 worker 执行（app/services/submit.py）。"上游已接单、落库前"崩溃
   存在双重提交窗口：渠道配 `client_request_id_param` 时提交体注入 task_id

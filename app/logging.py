@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import sys
 from types import FrameType
+from typing import Any
 
 from loguru import logger
 
@@ -56,8 +57,20 @@ class InterceptHandler(logging.Handler):
         )
 
 
+#: loguru→logfire 桥接是否已挂接（``logger.remove()`` 重建 sink 后由
+#: ``setup_logging`` 依据它自动补挂；loguru sink 无稳定标记位，用模块态记录）
+_logfire_attached: bool = False
+
+
 def setup_logging() -> None:
-    """装配 loguru（幂等）：stderr sink + stdlib 桥接。"""
+    """装配 loguru（幂等）：stderr sink + stdlib 桥接。
+
+    ``logger.remove()`` 会摘掉 logfire 桥接 sink——若本进程已挂接
+    （重复调用场景），末尾自动补挂。
+    """
+    global _logfire_attached
+    reattach = _logfire_attached
+    _logfire_attached = False
     logger.remove()
     logger.add(
         sys.stderr,
@@ -67,3 +80,44 @@ def setup_logging() -> None:
         diagnose=False,
     )
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+    if reattach:
+        attach_logfire_handler()
+
+
+def attach_logfire_handler() -> None:
+    """loguru → logfire 桥接（幂等）：业务日志与 OTel span 同 trace 汇聚，
+    logfire 平台不再只有孤零零的 httpx span（排查 4xx 时 body 直接可查）。
+
+    必须在 ``logfire.configure()`` **成功之后**调用——先挂后 configure 时
+    启动期日志会被 logfire no-op 吞掉。失败降级为纯 stderr，绝不阻塞启动。
+    """
+    global _logfire_attached
+    if not settings.logfire_enabled or _logfire_attached:
+        return
+    try:
+        import logfire
+
+        # loguru_handler() 返回 add() 的 kwargs dict {sink, format}：
+        # 补 level 键控噪（高频 DEBUG 探测日志不进 logfire），解包传参
+        config = logfire.loguru_handler()
+        config["level"] = settings.log_level.upper()
+        logger.add(**config)
+        _logfire_attached = True
+    except Exception:
+        logger.opt(exception=True).warning("logfire loguru handler attach failed")
+
+
+def logfire_event(level: str, event: str, **fields: Any) -> None:
+    """logfire 结构化事件公共发射点（``GW_LOGFIRE_ENABLED`` 时才真正发出）。
+
+    与 stderr 文本日志互补：字段化（可查询、可告警）、与 span 同 trace。
+    任何失败静默——观测链路绝不影响业务主流程。
+    """
+    if not settings.logfire_enabled:
+        return
+    try:
+        import logfire
+
+        getattr(logfire, level)(event, **fields)
+    except Exception:
+        pass

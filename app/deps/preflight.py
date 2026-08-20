@@ -25,7 +25,7 @@ from app.deps import ratelimit
 from app.deps.auth import TokenCtx, extract_token, resolve_identity
 from app.logging import log
 from app.schemas import KeyLease, Quote, RouteConfig, UserIdentity
-from app.services import idem, providers, tokensession
+from app.services import idem, providers, routecache, tokensession
 from app.services.pricing import quote_from_route
 from app.services.providers import (
     BillingError,
@@ -157,6 +157,10 @@ async def preflight(
         # 路由配置随租约从渠道元数据构建（零本地路由文件）并回填进程缓存；
         # 报价 = 渠道 gateway 块 billing.rule 本地求值（规则唯一事实源 = keypool）
         route = registry.remember(route_from_lease(biz, key))
+        # biz → channel_id 跨进程记忆（免费 GET 钉渠道直达租约的唯一来源；
+        # 免费请求没有 model，keypool select 对空 model 必拒 40010）。
+        # 所有创建入口（tasks/videos/原生透传）都过 preflight，此处是唯一写入点。
+        await routecache.remember(route.biz, key.key_id)
         try:
             quote = quote_from_route(route, body)
         except PricingError as exc:

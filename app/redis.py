@@ -18,6 +18,7 @@ K_CONC = "gw:conc:{token_hash}"              # 并发任务占用
 K_CB = "gw:cb:{biz}:{event_id}"              # 回调去重（72h）
 K_BREAKER = "gw:breaker:{biz}"               # 上游熔断失败计数
 K_SUBMIT_LOCK = "gw:submit_lock:{task_id}"   # 异步提交互斥锁（补投/重放去重；TTL 按路由动态派生）
+K_ROUTE_CHANNEL = "gw:route_channel:{biz}"   # biz -> 最近使用 channel_id（免费 GET 钉渠道；丢了回落 404）
 S_DLQ = "gw:events:dlq"                      # 死信（taskiq 任务超限后落信）
 
 # ---- 滑动窗口限流 ----

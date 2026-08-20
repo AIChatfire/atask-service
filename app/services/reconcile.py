@@ -14,9 +14,16 @@ from app.logging import log
 from app.queue import publish_cancel, publish_settle, schedule_poll
 from app.redis import K_SUBMIT_LOCK, r
 from app.schemas import FAILURE, SUBMITTED, SUCCESS, TERMINAL
-from app.services import flow, providers, statusmap, taskstore, tokensession, upstream
+from app.services import (
+    flow,
+    leasing,
+    providers,
+    statusmap,
+    taskstore,
+    tokensession,
+    upstream,
+)
 from app.services.providers import BillingError
-from app.services.registry import registry, route_from_lease
 
 
 async def _watch_queue() -> None:
@@ -66,9 +73,9 @@ async def _reverse_reconcile() -> None:
         if not biz or not upstream_task_id:
             continue
         try:
-            key = await providers.keys.lease(biz, model=str(data.get("model") or ""),
-                                             key_id=data.get("key_id"))
-            route = registry.remember(route_from_lease(biz, key))
+            # 钉回原 key（精确直达）：多账号渠道下换 key 会把"上游没有这条任务"
+            # 误读成对账通过，反而掩盖真实的少收/多退
+            key, route = await leasing.route_for_task(biz, data)
             if not route.probe_path:
                 continue
             resp = await upstream.probe(route, key, str(upstream_task_id))

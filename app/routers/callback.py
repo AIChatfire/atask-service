@@ -1,6 +1,7 @@
 """Callback Hub：接收上游 webhook。
 入站 HMAC 验签 → Redis 去重 → 状态机推进 → 结算/通知事件。
-路由配置按任务的 channel_id 从 keypool 租约重建（渠道元数据为唯一事实源）。
+路由配置按任务快照的 key 钉回 keypool 租约重建（渠道元数据为唯一事实源，
+见 app.services.leasing）。
 """
 
 from __future__ import annotations
@@ -16,9 +17,9 @@ from app.config import settings
 from app.logging import log
 from app.redis import K_CB, r
 from app.schemas import ACTIVE, TERMINAL
-from app.services import flow, providers, statelog, statusmap, taskstore, upstream
+from app.services import flow, leasing, statelog, statusmap, taskstore, upstream
 from app.services.providers import KeyLeaseError
-from app.services.registry import registry, route_from_lease
+from app.services.registry import registry
 
 router = APIRouter()
 
@@ -41,18 +42,14 @@ async def receive_callback(biz: str, task_id: str, request: Request):
     if not task or (task.get("data") or {}).get("biz") != biz:
         return {"status": "ignored"}          # 不认识的任务直接丢弃
 
-    # 按原 channel 直达租约重建路由（渠道元数据唯一事实源；缓存兜底）
+    # 按原 key 钉回租约重建路由（渠道元数据唯一事实源；进程缓存优先）
     route = registry.get_cached(biz)
     if route is None:
         try:
-            key = await providers.keys.lease(
-                biz, model=str((task.get("data") or {}).get("model") or ""),
-                key_id=task.get("channel_id") or None,
-            )
+            _, route = await leasing.route_for_task(biz, task.get("data") or {}, task)
         except KeyLeaseError as exc:
             log.warning("callback route resolve failed: {}", exc)
             return JSONResponse(status_code=503, content={"status": "route_unavailable"})
-        route = registry.remember(route_from_lease(biz, key))
 
     raw = await request.body()
     if not _verify(route.callback_secret, route.callback_sig_header, request.headers, raw):

@@ -81,3 +81,79 @@
   槽（`conc_acquire` 只覆盖 tasks/videos 创建链路；透传是同步流式转发，
   占用语义与异步任务不同）。终态 finalize 的 `conc_release` 对未占槽任务
   DECR 由 Lua 钳 0，无负槽风险；如需统一并发限流口径再议。
+  *2026-08-20 更新*：命中渠道 `submit_path` 的原生提交已改走
+  `flow.create_task`，与 tasks/videos 同口径占槽；不对称只剩「其余方法的
+  纯透传」这一类。
+
+## 原生路径拦截（2026-08-20 收敛）
+
+背景：`POST /minimax/v2/video_generation` 落通配透传 → 同步转发 → 客户端拿到
+**上游** task_id + 上游 RTT，与「原生接口同构 + 本地 id + 秒级返回」的目标冲突。
+
+- [x] **[N1] 免费 GET 不再空 model 问 keypool**：`select(group, model)` 对空
+  model 必拒 40010——删掉这次必然失败的出站，改「Redis `biz→channel_id`
+  记忆（`app/services/routecache.py`，唯一写入点 = preflight 成功租约）→
+  进程路由缓存」两级钉回 channel_id 直达租约，全落空才 404。
+  **不缓存上游 key**（凭证轮换/禁用治理属 keypool，缓存明文违反红线）。
+- [x] **[N2] 原生查询按 path 里的 id 反查任务钉渠道**：`nativeapi.
+  path_task_id_candidates` 零成本形态预筛（路径无 id 形态 → 零查库）→ 本地
+  id 主键直查 → 唯一候选做一次 `get_by_upstream_id` 兜底；命中即拿
+  `channel_id`/`key_id` 直达租约（精确解，跨副本稳）。
+- [x] **[N3] 原生提交/查询/取消三条路径拦截**：判定全部来自渠道路径模板
+  （`submit_path`/`probe_path`/`cancel_path`，支持路径段与查询参数两种占位
+  形态），报文塑形按 `task_id_path`/`probe_task_id_path`/`status_path`/
+  `result_path`/`error_path` + `ok_check` 信封反向构建；上游 id → 本地 id
+  为**字节级替换**（不重新序列化，字段顺序/未知字段/数值写法全部原样）。
+- [x] **[N4] 客户端轮询驱动状态推进**：`polling.advance_from_probe` 从
+  `poll_one` 抽出复用——原生查询拿到的上游快照顺带推进本地状态（终态走
+  CAS 恰好一次，活跃态 patch_data 幂等），结果比下一轮 poller 更早可见。
+- [x] **[N6] 终态零往返 + 逐字段同构**：`flow.finalize_task` 把上游终态原始
+  报文落 `data.upstream_snapshot`（`nativeapi.capture_snapshot`，≤8KB 才落，
+  防 data 列膨胀）；原生查询遇终态直接回放该快照并把上游 id 改写为本地 id
+  （`replay_snapshot`）——usage/trace_id 等网关不认识的字段全都在，且不再打
+  上游（终态本地即权威，上游终态记录还有保留期问题）。无快照（旧任务/本地
+  判死）时回退按配置反向构建，状态词三档取值（`upstream_status` 上游原话 →
+  渠道 `status_map` 逆映射 → 内置词表），且终态绝不回显活跃态原话。
+- [x] **[N5] 测试**：`tests/test_native_passthrough.py`（提交/嵌套 id 路径+
+  信封塑形/双向 id 改写/首探前快照/`probe_task_id_path`/终态结算+快照回放/
+  上游原话回放/终态不回显活跃词/上游不可达回落/取消/非生命周期路径透传
+  11 用例）+ `test_idem_concurrency.py` 原生重放保持原生形状 +
+  `test_free_passthrough.py` 三条选渠道纪律。
+
+行为变更（已接受）：
+
+1. 原生提交响应 **200**（原生语义）而非 202，且只含 `task_id_path` 一个字段。
+2. 原生提交路径的用户自带 `callback_url`/`webhook` 由网关摘除并改为签名投递
+   （`build_submit_body` 纪律），与 tasks/videos 入口一致。
+3. 原生查询在「上游未接单 / 上游不可达 / 无终态快照」时返回按配置反向构建的
+   报文，字段只保证 status/id/result/error 这几处（有终态快照时逐字段同构）。
+
+## keypool 精确直达 + 产物转存（2026-08-20 收敛，无需兼容旧版）
+
+- [x] **[K1] `channel_id + key_index` 单 key 精确直达**：keypool select 支持
+  `mode=direct`（跳过轮换批次/轮询游标/usage 打分，不访问 Redis），网关端口
+  `KeyProvider.lease` 加 `key_index` 参数。任务级操作（探测/取消/原生查询/
+  回调/反向对账）一律带 `data.key_index` 钉回创建时那把 key——根治同渠道挂
+  多上游账号 key 时「B 账号 key 查 A 账号任务 404」的隐患（原 polling 也有
+  此坑）。`key_index` 必须搭配 `channel_id`，单独出现被忽略。
+- [x] **[K2] 降级纪律**：key 级失败（40010 越界——永久性，重试无意义；或
+  key 被禁）→ 自动降级为渠道直达（渠道内换健康 key）；40002 渠道不存在
+  原样上抛，无从降级。**提交链路不钉 key**（首打钉渠道 `key_id` 直达，
+  key 级确定性拒绝重打换新鲜租约）；HELD 恢复排空不钉渠道（自动切健康账号）。
+- [x] **[K3] `app/services/leasing.py`**：任务级钉回租约统一收口
+  （`lease_for_task` / `route_for_task`），polling / reconcile / callback /
+  flow.try_upstream_cancel / proxy 生命周期拦截全部迁入，钉 key 语义一处维护；
+  旧任务无 `key_index` 快照 → 自动退渠道直达。
+- [x] **[K4] 产物转存/镜像 `result_url_template`**（`app/services/
+  resulturl.py`，纯函数零 I/O）：渠道配模板（如 `https://myhost.com/
+  {upstream_result_url}`），终态时 `result_path` 提取的上游直链按模板改写；
+  占位符 6 个（原样 / URL-encode / 去 scheme / host / path / task_id），
+  未知占位符原样保留（响亮暴露配置错误）。生效范围全入口一致：
+  `finalize_task` 改写 `data.result`（原始直链另存 `data.upstream_result`
+  供对账/回源）→ 任务视图/用户回调自动跟随；原生查询与终态快照回放对报文
+  做**字节级替换**（同时处理原文与 JSON 转义两种字节形态），其余字节
+  100% 同构。网关不搬运字节，转存由模板指向的服务负责。模板为空 = 不改写。
+- [x] **[K5] 测试**：`tests/test_leasing.py`（精确直达/降级/提交不钉 key）+
+  `tests/test_resulturl.py`（模板渲染/多产物列表/字节级替换同构/finalize
+  全视图改写/原生查询直链不外泄）+ `test_providers.py` 对齐新 select 契约。
+  全量 243 passed + ruff 全绿。

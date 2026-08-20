@@ -31,8 +31,10 @@ _GATEWAY_DEFAULTS: dict[str, Any] = {
     "submit_path": "",
     "probe_path": "",
     "task_id_path": "task_id",
+    "probe_task_id_path": "",
     "status_path": "status",
     "result_path": "",
+    "result_url_template": "",
     "error_path": "",
     "actual_amount_path": "",
     "settle_usage_map": {},
@@ -128,6 +130,11 @@ class RouteRegistry:
         if hit and time.monotonic() - hit[1] < self._ttl:
             return hit[0]
         return None
+
+    def channel_id_of(self, biz: str) -> int:
+        """缓存里该 biz 最近使用的 channel_id（0 = 未知；免费透传钉渠道用）。"""
+        cached = self.get_cached(biz)
+        return cached.channel_id if cached else 0
 
     async def get(self, biz: str, *, model: str = "",
                   channel_id: int | None = None) -> RouteConfig | None:
