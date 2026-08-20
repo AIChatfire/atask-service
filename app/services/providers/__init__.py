@@ -34,8 +34,10 @@ class BillingError(ProviderError):
 
     @property
     def retryable(self) -> bool:
-        """5xx/网络类（599）可重试；4xx 为确定性失败（重试无意义）。"""
-        return self.status >= 500
+        """5xx/网络类（599）可重试；409 锁竞争是瞬时状态（billing 契约明示
+        可带相同 request_id 退避重试），同 5xx 处理；其余 4xx 为确定性失败
+        （冻结已过期/已结算/跨用户，重试无意义）。"""
+        return self.status >= 500 or self.status == 409
 
 
 class PricingError(ProviderError):

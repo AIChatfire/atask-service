@@ -6,8 +6,9 @@ user_id 由令牌解析（网关不指定、不缓存用户余额）。金额为
 - ``POST /auth/inspect`` → 200 扁平 ``{"valid": true, "user_id", "token_id"}`` / 401
 - ``POST /billing/freeze``  body {request_id, biz_type, metric, amount, units?, attrs?, ttl_seconds?}
   → 200 / 401 非法 / 402 余额不足 / 409 锁竞争（可带相同 request_id 退避重试）
-- ``POST /billing/settle``  body {request_id, actual_amount, units?, attrs?}（多退少补，幂等）
-- ``POST /billing/cancel``  body {request_id}（全额解冻，幂等）
+- ``POST /billing/settle``  body {request_id, actual_amount, units?, attrs?}（多退少补，幂等；
+  409 锁竞争为瞬时态——``BillingError.retryable`` 判 True，worker 退避重试）
+- ``POST /billing/cancel``  body {request_id}（全额解冻，幂等；409 同上）
 
 freeze 幂等：request_id 唯一索引，重复提交返回首次结果（不重复扣款）。
 """

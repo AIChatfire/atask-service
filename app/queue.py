@@ -233,7 +233,9 @@ async def billing_settle_task(request_id: str, actual_amount: float, user_sk: st
         await taskstore.mark_settled(request_id, actual_amount)
     except BillingError as exc:
         if not exc.retryable:
-            # 4xx 确定性失败（冻结已过期/已结算/跨用户）：收口不重试
+            # 4xx 确定性失败（冻结已过期/已结算/跨用户）：收口不重试。
+            # 注意 409 锁竞争不在此列（retryable=True）——瞬时竞争退避重试，
+            # 否则 settle 撞锁会被静默记为已结算而实际分文未扣（营收漏单）
             log.error("billing_settle terminal failure {}: {}", request_id, exc.message)
             await taskstore.mark_settled(request_id, actual_amount)
             return
@@ -256,6 +258,8 @@ async def billing_cancel_task(request_id: str, user_sk: str,
         await taskstore.mark_settled(request_id, 0)
     except BillingError as exc:
         if not exc.retryable:
+            # 409 锁竞争不在此列（retryable=True）：瞬时竞争退避重试，
+            # 避免冻结干等 TTL 兜底才解冻（用户额度被多占 ~30min）
             log.error("billing_cancel terminal failure {}: {}", request_id, exc.message)
             await taskstore.mark_settled(request_id, 0)
             return

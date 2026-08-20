@@ -287,6 +287,21 @@ async def test_billing_freeze_ok_and_402(respx_router, test_settings):
     assert exc_info.value.status == 402 and not exc_info.value.retryable
 
 
+def test_billing_error_retryable_classification():
+    """retryable 分类：5xx/599 网络类 + 409 锁竞争（瞬时，billing 契约明示可带
+    相同 request_id 退避重试）可重试；其余 4xx 确定性失败。
+
+    409 判非重试的历史后果：settle 撞锁被静默 mark_settled(actual) 而实际
+    分文未扣（营收漏单）；cancel 撞锁冻结干等 TTL 兜底（额度多占 ~30min）。
+    """
+    assert BillingError(500, "srv").retryable
+    assert BillingError(599, "net").retryable
+    assert BillingError(409, "account is locked by another operation").retryable
+    assert not BillingError(400, "freeze expired").retryable
+    assert not BillingError(402, "insufficient balance").retryable
+    assert not BillingError(403, "cross user").retryable
+
+
 async def test_billing_settle_and_cancel_use_user_token(respx_router, test_settings):
     from app.services.providers.billing_newapi import NewapiBillingProvider
 
