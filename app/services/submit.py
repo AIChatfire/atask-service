@@ -107,6 +107,12 @@ async def _submit(task: dict) -> None:
         return
     try:
         await _submit_locked(task, key, route, lock_key)
+    except upstream.UpstreamError as exc:
+        # 持锁体内偶发冒泡（如 client_for 的 base_url 校验、重打后租约
+        # 重建时 submit 未被循环捕获）：与 _submit_rejected 同一分流——
+        # 模糊失败（599/5xx）留活重试，绝不判死（DLQ 是最后手段，任务
+        # 状态必须诚实反映"还没失败"）
+        await _submit_rejected(task, route, key, exc)
     finally:
         await r.delete(lock_key)
 
@@ -199,13 +205,18 @@ async def _submit_locked(task: dict, key: KeyLease, route: RouteConfig,
         patch["key_index"] = key.key_index
         channel_id = key.key_id
     # 终态守卫（KI-D）：提交在飞期间任务可能已被并发判死（孤儿收口/用户取消/
-    # 探测超时）——CAS 只允许活跃态落 QUEUED，绝不复活终态、不覆盖退款事实；
-    # 此时上游这单成为孤儿，靠 client_request_id 反查对账/人工处理
+    # 探测超时）——CAS 只允许活跃态落 QUEUED，绝不复活终态、不覆盖退款事实。
     queued = await taskstore.cas(task_id, (SUBMITTED, QUEUED), QUEUED, patch=patch)
     if not queued:
+        # 上游 id **绝不丢**：纯 data 合并落库（不带 status，不复活终态），
+        # 顺带写 tidx 反查索引——反向对账（本地 FAILURE 上游 SUCCESS 的
+        # 亏损面）与人工追款全靠这条线索；再尽力调上游取消源头止损。
+        await taskstore.patch_data(task_id, patch)
         log.warning("submit succeeded but task already terminal, upstream task {} "
-                    "orphaned (reconcile via client_request_id): task_id={}",
-                    upstream_task_id, task_id)
+                    "persisted for reconcile: task_id={}", upstream_task_id, task_id)
+        task_now = await taskstore.get(task_id)
+        if task_now:
+            await flow.try_upstream_cancel(task_now, route=route)
         return
     if channel_id:
         await taskstore.patch_data(task_id, {}, channel_id=channel_id)
@@ -218,7 +229,20 @@ async def _submit_locked(task: dict, key: KeyLease, route: RouteConfig,
 
 
 async def _submit_rejected(task: dict, route, key, err: upstream.UpstreamError) -> None:
-    """重打耗尽后的分流：账户级/限流 → HELD 保留冻结；其余 → FAILURE + 解冻。"""
+    """重打耗尽后的分流。
+
+    五级语义（误判原则：**拿不准一律留活重试**——判死是不可逆资金动作，
+    只有"上游明确未接单且重试无意义"的确定性失败才 FAILURE + 解冻）：
+
+    - 账户级/限流 → HELD 保留冻结（金丝雀排空恢复）；
+    - 任务级（4xx 内容审核等）→ FAILURE + 解冻（重打同一报文无意义）；
+    - **模糊失败（599 网络/超时/base_url 缺失、5xx、熔断）→ 留活重试**：
+      上游可能已接单（超时）或根本没发出（无 host），判死既可能放过
+      上游真实在跑的单（钱面裸奔），又把基础设施故障误伤成任务失败。
+      保 SUBMITTED/QUEUED + 更新 data.last_submit_error 观测 → sweep 的
+      stale 补投负责下轮重试（submit_one 幂等短路 + 互斥锁 + 终态守卫
+      已保证重复提交安全；无 upstream_task_id 的上限由孤儿收口兜底）。
+    """
     task_id = task["task_id"]
     data = task.get("data") or {}
     category = errclass.classify(route, err)
@@ -249,9 +273,23 @@ async def _submit_rejected(task: dict, route, key, err: upstream.UpstreamError) 
             settings.held_rate_limited_backoff_seconds
             if category == errclass.RATE_LIMITED else 60)
         return
-    # 提交阶段上游明确未接单：一律解冻（失败单 charge 策略只覆盖生成失败，
-    # 不覆盖提交拒绝），走 finalize 统一终态路径（令牌会话解冻 + 回调通知 +
-    # 并发槽释放）
+    if category == errclass.AMBIGUOUS:
+        # 模糊失败：不判死。记录观测字段（ops 视图可见），任务保持活跃，
+        # sweep 每 300s 对 stale SUBMITTED/QUEUED 补投重试（submit_one 幂等
+        # + 互斥锁 + 终态守卫，重复触发安全）；持续失败由 orphan_grace
+        # （默认 1800s）兜底判死——那才是"确实从未接单"的正确口径。
+        await taskstore.patch_data(task_id, {
+            "last_submit_error": str(err)[:300],
+            "last_submit_error_at": int(time.time()),
+        })
+        await statelog.record_failure_escalated(
+            f"submit:{task_id}", f"ambiguous, sweep will retry: {category} {err}")
+        log.warning("submit ambiguous (retry, not final): task_id={} biz={} err={}",
+                    task_id, route.biz, str(err)[:200])
+        return
+    # 任务级确定性失败（4xx/信封业务错）：提交阶段上游明确未接单，一律解冻
+    # （失败单 charge 策略只覆盖生成失败，不覆盖提交拒绝），走 finalize 统一
+    # 终态路径（令牌会话解冻 + 回调通知 + 并发槽释放）
     await providers.keys.report(
         key, ok=False,
         status_code=0 if err.envelope else err.status,

@@ -10,8 +10,7 @@
   [keypool-service](https://github.com/AIChatfire/keypool-service)，资金走
   [newapi-billing-service](https://github.com/AIChatfire/newapi-billing-service)；
   网关本身无状态（自有状态全在 Redis），零自有 MySQL 表（只读写 new-api
-  `tasks` 表）。~~pricing-service~~ 已废弃（定价从"按模型全局价"变
-  "按渠道价"，贴渠道成本）。
+  `tasks` 表）。
 - **傻瓜式模型接入**：接入新模型 = 在 new-api 建一个渠道 + 在渠道 gateway
   块配 `billing` 计费规则，**网关零代码改动、零路由文件**。
 - **计费闭环**：提交顶格预估 freeze → 终态按实际用量 settle（多退少补）/

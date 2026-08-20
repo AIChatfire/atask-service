@@ -85,6 +85,15 @@
   防双建双冻结）；创建链路失败 CAS 归还占位。
 - **计费纪律**：freeze 用渠道 billing.rule 顶格预估；settle 三档（actual_amount_path →
   settle_usage_map 重估 → 冻结兜底），绝不静默按 0 结算；settle/cancel 用**用户令牌**。
+- **提交失败分流（五级）**：账户级/限流 → HELD 挂起；任务级 4xx/信封业务错 →
+  FAILURE + 解冻；**模糊失败（599 网络/超时/base_url 缺失、5xx、熔断）→ 留活重试**
+  （保 SUBMITTED + `data.last_submit_error` 观测，sweep 补投下轮重试，孤儿收口兜底）。
+  原则：判死是不可逆资金动作，只有"上游明确未接单且重试无意义"的确定性失败才
+  FAILURE——基础设施故障/超时不判死（上游可能已接单，判死=钱面裸奔+误伤任务）。
+- **共享表时间列不可信**：tasks 表与 new-api 共享，时间列可能被其他写入方写成
+  毫秒（UnixMilli）。一切时间计算（探测超龄/stale/孤儿/HELD/对账/duration）必须
+  走 `taskstore.as_unix_seconds` 归一；SQL 比较必须套 `_secs(col)` 表达式；
+  判死类不可逆动作在 finalize 前二次核龄（`reconcile._orphan_closeout` 范式）。
 - 错误响应统一 `{"error": {...}}`（app/errors.py 注册点）；内部状态常量以 app/schemas.py 为准。
 - 日志统一 loguru：业务模块 `from app.logging import log`，装配点 app/logging.py
   （web 在 main、worker 在队列中间件 startup），级别 `GW_LOG_LEVEL`；

@@ -102,7 +102,8 @@ async def test_key_level_rejected_retries_with_fresh_lease(
 async def test_ambiguous_failure_never_retried(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """5xx（模糊失败）绝不重试：创建照常 202，worker 只提交一次即 FAILURE + 解冻。"""
+    """5xx（模糊失败）绝不重试也不判死：创建照常 202，worker 只提交一次，
+    任务保持 SUBMITTED 由 sweep 补投重试（基础设施故障不误伤任务）。"""
     mocks.select = respx_router.post("http://keypool.test/v1/keys/select").mock(
         return_value=httpx.Response(200, json=_channel(7, "sk-x"))
     )
@@ -117,8 +118,8 @@ async def test_ambiguous_failure_never_retried(
 
     assert len(create.calls) == 1                        # 不重试
     row = task_store.rows[task_id]
-    assert row["status"] == "FAILURE"
-    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-42"}]
+    assert row["status"] == "SUBMITTED"                  # 留活（非 FAILURE）
+    assert queue_events["cancel"] == []                  # 不解冻
 
 
 async def test_non_retryable_4xx_fails_immediately(

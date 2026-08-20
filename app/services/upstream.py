@@ -57,11 +57,33 @@ class BreakerOpenError(Exception):
 # ---------------------------------------------------------------------------
 
 
+def resolve_base_url(route: RouteConfig, key: KeyLease | None = None) -> str:
+    """出站基址：渠道 base_url 优先，回退路由配置；两处都空 → 空串。"""
+    return ((key.base_url if key else None) or route.upstream_base_url).rstrip("/")
+
+
+def _require_base_url(route: RouteConfig, key: KeyLease | None, action: str) -> str:
+    """出站前的基址硬校验。
+
+    渠道 ``base_url`` 缺失时 httpx 会拿相对路径去发请求，报出与业务无关的
+    传输层错误（形如 *Target host is not specified*）——这类失败是**配置/
+    基础设施问题，不是任务失败**，必须归到模糊类（599）走重试而非判死。
+    """
+    base_url = resolve_base_url(route, key)
+    if not base_url:
+        log.error("biz={} channel base_url missing, cannot {}", route.biz, action)
+        raise UpstreamError(
+            route.biz, 599,
+            f"channel base_url missing for biz {route.biz!r} (infrastructure, not task failure)",
+        )
+    return base_url
+
+
 def client_for(route: RouteConfig, key: KeyLease | None = None) -> httpx.AsyncClient:
     """按 (biz, base_url, proxy, timeout) 缓存连接池：同一 biz 不同渠道
     base_url/代理各自独立，渠道差异不需要新建配置。缓存键含 timeout——
     渠道热更 ``timeout_sec`` 后新租约自动落到新池，不再要求重启生效。"""
-    base_url = ((key.base_url if key else None) or route.upstream_base_url).rstrip("/")
+    base_url = resolve_base_url(route, key)
     proxy = (key.proxy if key else None) or ""
     cache_key = (route.biz, base_url, proxy, float(route.timeout_sec))
     client = _clients.get(cache_key)
@@ -210,6 +232,7 @@ async def submit(route: RouteConfig, key: KeyLease, payload: dict) -> dict:
     ``payload`` 必须经 :func:`build_submit_body` 组装（渠道覆盖已应用）。
     """
     await breaker_guard(route.biz)
+    _require_base_url(route, key, "submit")
     client = client_for(route, key)
     try:
         resp = await client.post(route.submit_path, json=payload,
@@ -230,6 +253,7 @@ async def submit(route: RouteConfig, key: KeyLease, payload: dict) -> dict:
 async def probe(route: RouteConfig, key: KeyLease, upstream_task_id: str) -> dict:
     """查询上游任务状态（路径含 ``{upstream_task_id}`` 占位，可为路径段或查询参数）。"""
     await breaker_guard(route.biz)
+    _require_base_url(route, key, "probe")
     client = client_for(route, key)
     path = route.probe_path.format(upstream_task_id=upstream_task_id)
     try:

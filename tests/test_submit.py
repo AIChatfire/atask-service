@@ -219,10 +219,11 @@ async def test_submit_missing_task_id_fails_visibly(
     assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
 
 
-async def test_submit_ambiguous_failure_never_retried(
+async def test_submit_ambiguous_failure_keeps_alive(
     mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
 ):
-    """5xx（模糊失败）绝不重打：只提交一次，FAILURE + 解冻（防双重创建双扣费）。"""
+    """5xx（模糊失败）绝不重打也不判死：只提交一次，任务保持 SUBMITTED，
+    sweep 补投负责下轮重试（防双重创建双扣费；基础设施故障不误伤任务）。"""
     create = respx_router.post("http://upstream.test/v2/video_generation").mock(
         return_value=httpx.Response(500, text="boom")
     )
@@ -231,9 +232,53 @@ async def test_submit_ambiguous_failure_never_retried(
 
     await submit_one(task_id)
 
-    assert len(create.calls) == 1
-    assert task_store.rows[task_id]["status"] == FAILURE
-    assert queue_events["cancel"] == [{"request_id": task_id, "user_sk": "sk-user-1"}]
+    assert len(create.calls) == 1                          # 不重打
+    row = task_store.rows[task_id]
+    assert row["status"] == "SUBMITTED"                    # 留活（非 FAILURE）
+    assert "boom" in row["data"]["last_submit_error"]      # 观测字段
+    assert queue_events["cancel"] == []                    # 不解冻
+    assert queue_events["settle"] == []
+
+
+async def test_submit_base_url_missing_keeps_alive(
+    mocks, respx_router, test_settings, patch_redis, task_store, queue_events,
+):
+    """渠道 base_url 缺失（keypool 元数据缺口）：哨兵 599 → 模糊失败留活，
+    响亮文案进 last_submit_error，绝不产出 "Target host is not specified"
+    这类不可操作信息，也绝不把配置故障判成任务失败。"""
+    mocks.select = respx_router.post("http://keypool.test/v1/keys/select").mock(
+        return_value=httpx.Response(200, json={
+            "code": 0, "message": "ok",
+            "data": {
+                "channel_id": 7, "key_index": 0, "key": "sk-x",
+                "base_url": "", "epoch": "e1",           # 租约 base_url 空
+                "channel": {
+                    "id": 7, "name": "ch-7",
+                    "base_url": "",                       # 渠道 base_url 也空
+                    "setting": {"gateway": {
+                        "biz": "minimax",
+                        "submit_path": "/v2/video_generation",
+                        "probe_path": "/v2/query/video_generation/{upstream_task_id}",
+                        "status_path": "task.status",
+                        "billing": {"rule": "def calulate(request):\n    return 0.13"},
+                    }},
+                },
+            },
+        })
+    )
+    create = respx_router.post("http://upstream.test/v2/video_generation").mock(
+        return_value=httpx.Response(200, json={"task_id": "up-9"})
+    )
+    task_id = _seed(task_store)
+    await tokensession.store(task_id, "sk-user-1")
+
+    await submit_one(task_id)
+
+    assert len(create.calls) == 0                          # 零出站（哨兵拦截）
+    row = task_store.rows[task_id]
+    assert row["status"] == "SUBMITTED"                    # 留活
+    assert "base_url missing" in row["data"]["last_submit_error"]
+    assert queue_events["cancel"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +404,8 @@ async def test_submit_success_does_not_revive_terminal_task(
     monkeypatch,
 ):
     """KI-D：提交在飞期间任务已被并发判死（孤儿收口抢先 FAILURE）——提交
-    成功回调绝不复活终态：不回填 upstream_task_id、不转 QUEUED、不排探测，
-    上游这单成为孤儿（靠 client_request_id 对账/人工处理）。"""
+    成功回调绝不复活终态：不转 QUEUED、不排探测；但 upstream_task_id
+    **绝不丢**（纯 data 合并落库，反向对账/人工追款的唯一线索）。"""
     import app.services.upstream as upstream_mod
 
     task_id = _seed(task_store)
@@ -375,10 +420,10 @@ async def test_submit_success_does_not_revive_terminal_task(
     await submit_one(task_id)
 
     row = task_store.rows[task_id]
-    assert row["status"] == FAILURE                      # 终态不被复活
-    assert row["data"].get("upstream_task_id") is None   # 不覆盖判死事实
-    assert queue_events["poll"] == []                    # 不进探测闭环
-    assert queue_events["settle"] == []                  # 不产生结算事件
+    assert row["status"] == FAILURE                          # 终态不被复活
+    assert row["data"]["upstream_task_id"] == "up-orphan"    # 线索绝不丢（对账/追款）
+    assert queue_events["poll"] == []                        # 不进探测闭环
+    assert queue_events["settle"] == []                      # 不产生结算事件
 
 
 async def test_submit_lock_ttl_covers_worst_case_window(

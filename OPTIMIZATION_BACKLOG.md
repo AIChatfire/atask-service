@@ -227,3 +227,31 @@
 不来自本仓库代码（本地无此文案、网关从不写 result_url）——线上跑的是另一
 修订版（2026-08-17 已发现部署漂移），本次修复的是同类单位混用根因；部署侧
 需同步本版本。
+
+## 提交期模糊失败不再判死（2026-08-20 收敛，无需兼容旧版）
+
+背景：线上任务「秒失败」第二个根因——`fail_reason=I/O error on POST request
+for "": Target host is not specified`（渠道 base_url 缺失时 httpx 拿相对
+路径发请求）。这类**基础设施/配置故障**被当成任务失败判死（FAILURE + 解冻
++ finish_time 落库），刚提交的任务立即终态。
+
+- [x] **[S1] base_url 缺失哨兵**：`upstream.resolve_base_url` +
+  `_require_base_url`——渠道与租约 base_url 双空时抛 599 UpstreamError
+  （文案明示 "channel base_url missing … infrastructure, not task
+  failure"），submit/probe 出站前硬校验，**零出站**、不再产生 Java 风格
+  误导文案。
+- [x] **[S2] 模糊失败留活重试**：`_submit_rejected` 三级分流改为——
+  账户级/限流 → HELD；任务级 4xx/信封错 → FAILURE + 解冻；**AMBIGUOUS
+  （599 网络/超时/base_url 缺失、5xx、熔断）→ 保 SUBMITTED/QUEUED +
+  patch `data.last_submit_error` 观测，sweep stale 补投下轮重试**
+  （submit_one 幂等短路 + 互斥锁 + 终态守卫已保证重复提交安全；持续失败
+  由 orphan_grace 兜底判死——"确实从未接单"的正确口径）。`_submit` 持锁
+  体冒泡的 UpstreamError 也收编同一分流（不再冒泡 DLQ 了事）。
+- [x] **[S3] 测试改写**：test_submit/test_submit_retry 的 5xx 用例从
+  「FAILURE + 解冻」翻转为「留活 SUBMITTED + 观测字段 + 不解冻」；
+  新增 base_url 双空哨兵用例（零出站 + 响亮文案）。262 passed +
+  ruff + mypy 全绿。
+
+注：`finish_time=1787214476106`（毫秒）与 `result_url` 列写入仍来自部署版
+与本地仓库的漂移（2026-08-17 已发现），本地已修（cas 终态恒写秒 + 终态一律
+progress=100%），部署侧需同步本版本。
