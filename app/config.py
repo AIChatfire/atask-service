@@ -87,15 +87,27 @@ class Settings(BaseSettings):
     idem_replay_wait_seconds: float = 25.0  # 同键并发等占位回填上限（超时按 409 冲突处理）
     rate_limit_per_minute: int = 60
     max_concurrent_tasks: int = 5         # 每用户并发任务上限
+    # 并发槽键 TTL 兜底（防「占槽后崩溃」的永久泄漏；每次 acquire 刷新，
+    # 精确校准另由 sweep conc_recalibrate 做）——必须 > 最长任务在途时长
+    conc_ttl_seconds: int = 172800
+    conc_recalibrate_batch: int = 200     # 每轮 sweep 校准的并发槽键数上限
 
     # ---- 用户回调投递 ----
     callback_sign_secret: str = "change-me"  # 推送用户 callback_url 的 HMAC 签名密钥
     cb_dedup_ttl: int = 259200            # 上游回调去重（72h）
 
     # ---- 探测（不支持回调的上游）----
-    poll_ladder_seconds: Annotated[tuple[int, ...], NoDecode] = (5, 15, 30, 120)
+    poll_ladder_seconds: Annotated[tuple[int, ...], NoDecode] = (5, 15, 30, 120, 300)
     poll_max_age_seconds: int = 86400     # 任务最大在途时长（超时转 FAILURE）
     task_stale_seconds: int = 300         # 非终态任务超过该时长未更新则 sweeper 重投探测
+
+    # ---- 上游数据面（提交/探测出站）----
+    upstream_breaker_threshold: int = 10  # 熔断：窗口内失败 N 次打开
+    upstream_breaker_window_seconds: int = 30
+    upstream_max_connections: int = 50    # 每 (biz, base_url, proxy) 连接池上限
+    upstream_max_keepalive: int = 20
+    native_buffer_limit_bytes: int = 1_048_576   # 原生查询响应缓冲上限（超限放弃 id 改写）
+    upstream_index_ttl_seconds: int = 604800     # 上游 task_id → 本地 task_id 反查索引 TTL（7d）
 
     # ---- 提交重试（仅换 key 可能改变结果的确定性拒绝；模糊失败绝不重试防双重创建）----
     submit_max_attempts: int = 3          # 含首次提交
@@ -120,6 +132,14 @@ class Settings(BaseSettings):
     queue_warn_depth: int = 500           # 积压告警阈值
     taskiq_admin_url: str = ""            # taskiq-admin 看板地址（空 = 不上报）
     taskiq_admin_api_token: str = ""      # 看板 API access-token
+
+    # ---- Sweep（每分钟补数巡检）----
+    sweep_lock_ttl_seconds: int = 300     # 重入锁 TTL：慢轮（反向对账打上游）不叠加并发轮
+    sweep_stale_batch: int = 200          # 每轮 stale 重投上限（积压追赶速度）
+    sweep_orphan_batch: int = 50          # 每轮孤儿收口上限
+    sweep_held_expire_batch: int = 100    # 每轮 HELD 超限判死上限
+    sweep_unsettled_batch: int = 200      # 每轮结算补发上限
+    queue_stats_cache_seconds: int = 55   # 队列观测快照缓存（全库 scan + 全表 GROUP BY 降频）
 
     @field_validator("poll_ladder_seconds", mode="before")
     @classmethod

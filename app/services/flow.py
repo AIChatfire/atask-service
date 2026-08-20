@@ -120,7 +120,7 @@ async def create_task(biz: str, body: dict, pf: Preflight, action: str, source: 
     route = pf.route
     if not route.submit_path:
         # 渠道 setting.gateway.submit_path 未配置：接入未完成，立即可见
-        await ratelimit.conc_release(pf.token.hash)   # K_CONC 无 TTL，泄漏即永久丢槽
+        await ratelimit.conc_release(pf.token.hash)   # 及时还槽（TTL 兜底 + sweep 校准只是保险）
         if pf.amount > 0:
             await queue.publish_cancel(pf.task_id, pf.token.raw)
         if pf.idem_key:

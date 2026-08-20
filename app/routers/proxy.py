@@ -33,6 +33,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app import queue
+from app.config import settings
 from app.deps.preflight import preflight
 from app.deps.ratelimit import ip_rate_limit
 from app.logging import log
@@ -61,9 +62,10 @@ HOP_BY_HOP = {
 }
 BUFFER_LIMIT = 256 * 1024   # 小响应缓冲上限，用于提取 upstream_task_id
 SMALL_BODY_LIMIT = 1_048_576  # 与 preflight JSON 解析上限一致
-#: 原生查询拦截的响应缓冲上限：超限则放弃 id 改写、退回流式（探测报文极小，
-#: 正常永不触发；触发时告警而不是把内存打爆）
-NATIVE_BUFFER_LIMIT = 1_048_576
+#: 原生查询拦截的响应缓冲上限（``GW_NATIVE_BUFFER_LIMIT_BYTES``）：超限则
+#: 放弃 id 改写、退回流式（探测报文极小，正常永不触发；触发时告警而不是
+#: 把内存打爆）
+NATIVE_BUFFER_LIMIT = settings.native_buffer_limit_bytes
 
 
 def _forward_headers(request: Request, extra: dict) -> dict:

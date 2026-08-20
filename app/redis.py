@@ -19,6 +19,9 @@ K_CB = "gw:cb:{biz}:{event_id}"              # 回调去重（72h）
 K_BREAKER = "gw:breaker:{biz}"               # 上游熔断失败计数
 K_SUBMIT_LOCK = "gw:submit_lock:{task_id}"   # 异步提交互斥锁（补投/重放去重；TTL 按路由动态派生）
 K_ROUTE_CHANNEL = "gw:route_channel:{biz}"   # biz -> 最近使用 channel_id（免费 GET 钉渠道；丢了回落 404）
+K_TIDX = "gw:tidx:{upstream_task_id}"        # 上游 task_id -> 本地 task_id 反查索引（7d；miss 落 SQL 兜底）
+K_SWEEP_LOCK = "gw:sweep_lock"               # sweep 重入锁（慢轮防并发踩踏）
+K_QSTATS = "gw:queue_stats"                  # 队列观测快照缓存（JSON，短 TTL）
 S_DLQ = "gw:events:dlq"                      # 死信（taskiq 任务超限后落信）
 
 # ---- 滑动窗口限流 ----
@@ -32,12 +35,16 @@ return 1
 """
 
 # ---- 并发占用（不超上限才 +1）----
+# TTL 兜底（ARGV[2]）：进程在「占槽后、落库前」崩溃时槽位不再永久泄漏——
+# 键整体过期后按 tasks 表事实重建；精确校准另由 sweep 的 conc_recalibrate
+# 每轮对照实际活跃任务数回写（见 app/services/reconcile.py）。
 LUA_CONC_ACQUIRE = """
 local n = redis.call('INCR', KEYS[1])
 if n > tonumber(ARGV[1]) then
   redis.call('DECR', KEYS[1])
   return 0
 end
+redis.call('EXPIRE', KEYS[1], ARGV[2])
 return 1
 """
 

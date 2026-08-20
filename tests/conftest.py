@@ -131,7 +131,7 @@ class FakeRedis:
         value = self._data.get(key) if self._alive(key) else None
         return len(value) if isinstance(value, list) else 0
 
-    async def scan_iter(self, pattern: str):
+    async def scan_iter(self, pattern: str, count: int | None = None):
         import fnmatch
 
         for key in list(self._data):
@@ -173,6 +173,8 @@ class FakeRedis:
             if cur + 1 > limit:
                 return 0
             self._data[key] = str(cur + 1)
+            if len(argv) > 1:                      # TTL 兜底（防占槽崩溃永久泄漏）
+                self._expires[key] = time.time() + int(argv[1])
             return 1
         if script == LUA_CONC_RELEASE:
             cur = int(self._data.get(key, "0")) if self._alive(key) else 0
@@ -203,6 +205,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
     import app.services.reconcile
     import app.services.statelog
     import app.services.submit
+    import app.services.taskstore
     import app.services.tokensession
     import app.services.upstream
 
@@ -216,6 +219,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
         app.services.reconcile,
         app.services.statelog,
         app.services.submit,
+        app.services.taskstore,
         app.services.tokensession,
         app.services.upstream,
     ):
@@ -341,6 +345,15 @@ class InMemoryTaskStore:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
         return counts
 
+    async def active_counts_by_token(self) -> dict[str, int]:
+        """并发槽校准事实源（口径同真实实现：活跃且非 HELD，按 token_hash）。"""
+        counts: dict[str, int] = {}
+        for t in self.rows.values():
+            th = str((t.get("data") or {}).get("token_hash") or "")
+            if th and t["status"] in ("SUBMITTED", "QUEUED", "IN_PROGRESS"):
+                counts[th] = counts.get(th, 0) + 1
+        return counts
+
     async def orphan_active(self, older_than_seconds: int, limit: int = 50) -> list[str]:
         cutoff = int(time.time()) - older_than_seconds
         return [t["task_id"] for t in self.rows.values()
@@ -402,7 +415,8 @@ def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
     for name in ("create", "get", "get_by_upstream_id", "cas", "patch_data",
                  "mark_settled", "stale_active", "terminal_unsettled",
                  "counts_by_status", "orphan_active", "expiring_freezes",
-                 "reconcile_candidates", "oldest_held", "held_expired"):
+                 "reconcile_candidates", "oldest_held", "held_expired",
+                 "active_counts_by_token"):
         monkeypatch.setattr(ts, name, getattr(store, name))
     return store
 

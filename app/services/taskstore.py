@@ -12,6 +12,8 @@ from sqlalchemy import CursorResult, bindparam, text
 
 from app.config import settings
 from app.db import get_session_factory
+from app.logging import log
+from app.redis import K_TIDX, r
 from app.schemas import ACTIVE, TERMINAL
 
 
@@ -77,7 +79,20 @@ async def get(task_id: str) -> dict | None:
 
 async def get_by_upstream_id(upstream_task_id: str) -> dict | None:
     """按上游任务 id 反查本地任务（客户端持上游 id 轮询的兼容入口；
-    权威 id 仍是本地 task_id，data.upstream_task_id 为两者的关联点）。"""
+    权威 id 仍是本地 task_id，data.upstream_task_id 为两者的关联点）。
+
+    先查 Redis 反查索引（``gw:tidx:*``，回填 upstream_task_id 时写入）——
+    ``data ->> '$.upstream_task_id'`` 无索引（零建表红线，不能加虚拟列），
+    SQL 兜底是全表扫描，表大后必须靠索引挡住热路径。"""
+    try:
+        local_id = await r.get(K_TIDX.format(upstream_task_id=upstream_task_id))
+        if local_id:
+            task = await get(str(local_id))
+            if task and str((task.get("data") or {}).get("upstream_task_id")) \
+                    == upstream_task_id:
+                return task     # 命中且校验一致（防索引指向被复用/脏数据）
+    except Exception:
+        log.opt(exception=True).debug("tidx lookup failed, falling back to SQL")
     async with get_session_factory()() as db:
         row = (
             await db.execute(
@@ -93,7 +108,13 @@ async def get_by_upstream_id(upstream_task_id: str) -> dict | None:
         ).mappings().first()
     if not row:
         return None
-    return _row_to_dict(row)
+    task = _row_to_dict(row)
+    try:    # SQL 兜底命中：回写索引（下次直达），失败不影响返回
+        await r.set(K_TIDX.format(upstream_task_id=upstream_task_id),
+                    task["task_id"], ex=settings.upstream_index_ttl_seconds)
+    except Exception:
+        pass
+    return task
 
 
 async def cas(
@@ -139,7 +160,11 @@ async def cas(
 async def patch_data(task_id: str, patch: dict, status: str | None = None,
                      channel_id: int | None = None) -> None:
     """非迁移性的数据合并（如回填 upstream_task_id）；可选顺带更新状态列。
-    ``channel_id``：提交重打落到别的渠道时同步对账口径列。"""
+    ``channel_id``：提交重打落到别的渠道时同步对账口径列。
+
+    补丁含 ``upstream_task_id`` 时顺带维护 Redis 反查索引（上游 id → 本地
+    id，TTL ``GW_UPSTREAM_INDEX_TTL_SECONDS``）——覆盖 submit/held 恢复/
+    proxy 回填三个写入点，get_by_upstream_id 靠它免全表扫描。"""
     set_status = "status = :status, " if status else ""
     set_channel = "channel_id = :channel_id, " if channel_id else ""
     sql = f"""
@@ -160,6 +185,13 @@ async def patch_data(task_id: str, patch: dict, status: str | None = None,
     async with get_session_factory()() as db:
         await db.execute(text(sql), params)
         await db.commit()
+    upstream_task_id = str(patch.get("upstream_task_id") or "")
+    if upstream_task_id:
+        try:
+            await r.set(K_TIDX.format(upstream_task_id=upstream_task_id),
+                        task_id, ex=settings.upstream_index_ttl_seconds)
+        except Exception:
+            log.opt(exception=True).debug("tidx write failed (SQL fallback covers)")
 
 
 async def mark_settled(task_id: str, amount: float) -> None:
@@ -199,6 +231,28 @@ async def counts_by_status() -> dict[str, int]:
             )
         ).all()
     return {row[0]: row[1] for row in rows}
+
+
+async def active_counts_by_token() -> dict[str, int]:
+    """活跃任务数按 token_hash 分布（并发槽校准的事实源）。
+
+    HELD 不计——挂起任务的槽已在转 HELD 时释放（resume 重占），
+    与 conc_acquire/release 的占用口径保持一致。"""
+    async with get_session_factory()() as db:
+        rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT data ->> '$.token_hash' AS th, COUNT(*) AS n FROM tasks
+                    WHERE platform = :p AND status IN :acts AND status <> 'HELD'
+                      AND COALESCE(data ->> '$.token_hash', '') <> ''
+                    GROUP BY th
+                    """
+                ).bindparams(bindparam("acts", expanding=True)),
+                {"p": settings.gateway_platform, "acts": ACTIVE},
+            )
+        ).all()
+    return {str(row[0]): int(row[1]) for row in rows}
 
 
 async def terminal_unsettled(limit: int = 200) -> list[dict]:

@@ -36,7 +36,7 @@ from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend, RedisSchedule
 
 from app.config import settings
 from app.logging import attach_logfire_handler, log, logfire_event, setup_logging
-from app.redis import S_DLQ, r
+from app.redis import K_QSTATS, S_DLQ, r
 
 QUEUE_NAME = "gw:taskiq"
 SCHED_PREFIX = "gw:sched"
@@ -345,7 +345,18 @@ async def schedule_resume_held(delay: int | float) -> None:
 # ---------------- 可观测与补号 ----------------
 
 async def queue_stats() -> dict:
-    """队列健康快照：待执行深度 / 延迟任务数 / 死信数 / 任务状态分布"""
+    """队列健康快照：待执行深度 / 延迟任务数 / 死信数 / 任务状态分布。
+
+    带短缓存（``GW_QUEUE_STATS_CACHE_SECONDS``）：sweep 每分钟观测 + /ops
+    人工查询共用，避免每次都付「scan 全部延迟键 + tasks 全表 GROUP BY」
+    ——多副本 sweep/看板同时打时开销会叠乘。缓存失败降级为直算。"""
+    try:
+        cached = await r.get(K_QSTATS)
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
+
     pending = await r.llen(QUEUE_NAME)
     delayed = 0
     async for key in r.scan_iter(f"{SCHED_PREFIX}:time:*"):
@@ -353,12 +364,18 @@ async def queue_stats() -> dict:
     dlq = await r.xlen(S_DLQ)
 
     from app.services import taskstore
-    return {
+    stats = {
         "pending": pending,          # 队列积压：>阈值应加 worker 副本或调大 --max-async-tasks
         "delayed": delayed,          # 延迟任务（探测回退/重试退避）
         "dlq": dlq,                  # 死信：>0 需要人工介入
         "tasks_by_status": await taskstore.counts_by_status(),
     }
+    try:
+        await r.set(K_QSTATS, json.dumps(stats, ensure_ascii=False),
+                    ex=settings.queue_stats_cache_seconds)
+    except Exception:
+        pass
+    return stats
 
 
 _DLQ_TASKS: dict[str, Any] = {

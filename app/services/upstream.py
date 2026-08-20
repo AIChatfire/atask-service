@@ -25,14 +25,12 @@ from typing import Any
 
 import httpx
 
+from app.config import settings
 from app.logging import log
 from app.redis import K_BREAKER, r
 from app.schemas import KeyLease, RouteConfig
 
-BREAKER_THRESHOLD = 10        # 30s 内失败 10 次熔断
-BREAKER_WINDOW = 30
-
-_clients: dict[tuple[str, str, str], httpx.AsyncClient] = {}
+_clients: dict[tuple[str, str, str, float], httpx.AsyncClient] = {}
 
 
 class UpstreamError(Exception):
@@ -60,17 +58,21 @@ class BreakerOpenError(Exception):
 
 
 def client_for(route: RouteConfig, key: KeyLease | None = None) -> httpx.AsyncClient:
-    """按 (biz, base_url, proxy) 缓存连接池：同一 biz 不同渠道 base_url/代理
-    各自独立，渠道差异不需要新建配置。"""
+    """按 (biz, base_url, proxy, timeout) 缓存连接池：同一 biz 不同渠道
+    base_url/代理各自独立，渠道差异不需要新建配置。缓存键含 timeout——
+    渠道热更 ``timeout_sec`` 后新租约自动落到新池，不再要求重启生效。"""
     base_url = ((key.base_url if key else None) or route.upstream_base_url).rstrip("/")
     proxy = (key.proxy if key else None) or ""
-    cache_key = (route.biz, base_url, proxy)
+    cache_key = (route.biz, base_url, proxy, float(route.timeout_sec))
     client = _clients.get(cache_key)
     if client is None:
         client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(route.timeout_sec, connect=10.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            limits=httpx.Limits(
+                max_connections=settings.upstream_max_connections,
+                max_keepalive_connections=settings.upstream_max_keepalive,
+            ),
             proxy=proxy or None,
         )
         _clients[cache_key] = client
@@ -141,7 +143,7 @@ def build_submit_body(route: RouteConfig, key: KeyLease, body: dict,
 
 async def breaker_guard(biz: str) -> None:
     failures = await r.get(K_BREAKER.format(biz=biz))
-    if failures and int(failures) >= BREAKER_THRESHOLD:
+    if failures and int(failures) >= settings.upstream_breaker_threshold:
         log.warning("upstream circuit open: biz={} failures={}", biz, failures)
         raise BreakerOpenError(f"upstream {biz} circuit open")
 
@@ -153,7 +155,7 @@ async def breaker_report(biz: str, ok: bool) -> None:
     else:
         pipe = r.pipeline()
         pipe.incr(key)
-        pipe.expire(key, BREAKER_WINDOW)
+        pipe.expire(key, settings.upstream_breaker_window_seconds)
         await pipe.execute()
 
 

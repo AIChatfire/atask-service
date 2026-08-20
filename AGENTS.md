@@ -20,7 +20,8 @@
 - tests/         pytest（respx 拦 HTTP，FakeRedis + 内存 taskstore，无外部依赖）
 
 ## 常用命令
-- 测试：`.venv/bin/python -m pytest tests/ -q`
+- 测试：`.venv/bin/python -m pytest tests/ -q`（含 mypy 类型检查，见
+  tests/test_typecheck.py；单跑 `.venv/bin/python -m mypy app/`）
 - Lint：`.venv/bin/python -m ruff check app tests`
 - 安装：`.venv/bin/pip install -e ".[dev]"`
 - 本地依赖：`docker compose up -d mysql redis`

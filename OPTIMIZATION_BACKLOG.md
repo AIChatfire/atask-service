@@ -157,3 +157,43 @@
   `tests/test_resulturl.py`（模板渲染/多产物列表/字节级替换同构/finalize
   全视图改写/原生查询直链不外泄）+ `test_providers.py` 对齐新 select 契约。
   全量 243 passed + ruff 全绿。
+
+## 长期运行稳定性加固（2026-08-20 收敛，无需兼容旧版）
+
+性能与稳定性审查（长期运行 + 任务量增长）发现的 5 项问题，全部落地：
+
+- [x] **[P1] 并发槽泄漏根治**（🔴 最高险：`gw:conc:*` INCR 无 TTL，「占槽后
+  崩溃」永久泄漏，累积到上限该用户永远 429，只能人工删键）：双保险——
+  ① `LUA_CONC_ACQUIRE` 挂 TTL 兜底（`GW_CONC_TTL_SECONDS`，默认 48h，每次
+  acquire 刷新；须 > 最长任务在途时长）；② sweep 每轮 `conc_recalibrate()`
+  （`app/deps/ratelimit.py`）按 tasks 表事实源（`taskstore.
+  active_counts_by_token`，HELD 除外，口径同 acquire/release）回写：泄漏收回、
+  少计补齐、归零删键。TTL 管兜底、校准管精确，两者独立成立。
+- [x] **[P2] sweep 重入锁**（🔴 cron 每分钟触发，慢轮——反向对账打上游——
+  超 1 分钟时叠加并发轮 → 重复补投/重复 renew/重复对账）：`sweep_once` 加
+  `gw:sweep_lock` SET NX（TTL `GW_SWEEP_LOCK_TTL_SECONDS` 300s，崩溃自动
+  释放），拿不到直接跳过本轮；finally 释放。
+- [x] **[P3] tidx 上游 id 反查索引**（🔴 `get_by_upstream_id` 的
+  `data ->> '$.upstream_task_id'` 无索引=全表扫描，零建表红线不能加虚拟列；
+  原生查询按上游 id 轮询是热路径，表大后必炸）：Redis `gw:tidx:{upstream_
+  task_id}` → task_id（TTL `GW_UPSTREAM_INDEX_TTL_SECONDS` 7d）。写入点收口
+  在 `taskstore.patch_data`（补丁含 upstream_task_id 自动写，覆盖 submit/
+  held 恢复/proxy 回填三处，零调用点改动）；读取先索引（命中后校验
+  `data.upstream_task_id` 一致防脏指向）→ miss 落 SQL 兜底 → SQL 命中回写。
+  索引丢失只是退化为慢查询，正确性不依赖 Redis。
+- [x] **[P4] 硬编码参数配置化**（🟡 预留调参空间）：熔断阈值/窗口
+  （`GW_UPSTREAM_BREAKER_*`）、上游连接池（`GW_UPSTREAM_MAX_*`）、原生缓冲
+  上限（`GW_NATIVE_BUFFER_LIMIT_BYTES`）、sweep 各批次（`GW_SWEEP_*_BATCH`）
+  全部提为环境变量；poll ladder 加 300s 长尾档（长视频任务减少无效探测）；
+  `upstream.client_for` 缓存键补 timeout 维度（渠道热更 timeout_sec 后新
+  租约自动落新连接池，不再被旧池粘住）。
+- [x] **[P5] queue_stats 降频缓存**（🟡 每分钟 `_watch_queue` 全库
+  `scan gw:submit_lock:*` + tasks 全表 GROUP BY）：快照缓存进 `gw:queue_
+  stats`（TTL `GW_QUEUE_STATS_CACHE_SECONDS` 55s），/ops/queue 与 sweep 共
+  用；缓存不可用降级直算。
+- [x] **[P6] 测试**：`tests/test_perf_hardening.py` 13 用例（校准泄漏收回/
+  归零删键/少计补齐/一致跳过+HELD 口径/acquire 挂 TTL；sweep 锁被占跳过且
+  不误删他轮锁/正常轮释放/异常轮也释放；tidx 命中零 SQL/脏指向回落 SQL 并
+  纠正索引/SQL 命中回写/patch_data 写索引/无 id 不碰索引）。FakeRedis 同步
+  TTL 语义与 scan_iter(count=)，InMemoryTaskStore 补 active_counts_by_token。
+  全量 257 passed + ruff + mypy 全绿。

@@ -10,9 +10,10 @@ import time
 
 from app import queue
 from app.config import settings
+from app.deps import ratelimit
 from app.logging import log
 from app.queue import publish_cancel, publish_settle, schedule_poll
-from app.redis import K_SUBMIT_LOCK, r
+from app.redis import K_SUBMIT_LOCK, K_SWEEP_LOCK, r
 from app.schemas import FAILURE, SUBMITTED, SUCCESS, TERMINAL
 from app.services import (
     flow,
@@ -44,7 +45,8 @@ async def _watch_queue() -> None:
 async def _orphan_closeout() -> None:
     """孤儿任务收口：submit 前崩溃的残留（永远不会有上游任务）→ FAILURE + 解冻。
     （根治靠 submit 注入 client_request_id 反查补挂，这里是兜底）"""
-    orphans = await taskstore.orphan_active(settings.orphan_grace_seconds)
+    orphans = await taskstore.orphan_active(settings.orphan_grace_seconds,
+                                            limit=settings.sweep_orphan_batch)
     for task_id in orphans:
         task = await taskstore.get(task_id)
         if not task or task["status"] in TERMINAL:
@@ -146,7 +148,8 @@ async def _held_maintenance() -> None:
     """HELD 维护：超上限判死（FAILURE + cancel 兜底收口；账户级 4h / 限流 1h）；
     仍有存活 HELD → 触发金丝雀排空（Redis 锁防每分钟 sweep 堆积调度）。"""
     for task_id in await taskstore.held_expired(
-            settings.hold_max_age_seconds, settings.hold_max_age_rate_limited_seconds):
+            settings.hold_max_age_seconds, settings.hold_max_age_rate_limited_seconds,
+            limit=settings.sweep_held_expire_batch):
         task = await taskstore.get(task_id)
         if not task or task["status"] in TERMINAL:
             continue
@@ -161,8 +164,22 @@ async def _held_maintenance() -> None:
 
 
 async def sweep_once() -> None:
+    # 重入锁：反向对账/续期会打外部服务，慢轮（> 1 分钟）时 cron 会叠加
+    # 并发轮——重复补投/重复 renew/重复对账。锁 TTL 覆盖最坏单轮时长，
+    # 到期自动释放（进程崩溃不永久卡巡检）；拿不到直接跳过本轮。
+    if not await r.set(K_SWEEP_LOCK, "1", ex=settings.sweep_lock_ttl_seconds, nx=True):
+        log.debug("sweep skipped: previous round still running")
+        return
+    try:
+        await _sweep_once_locked()
+    finally:
+        await r.delete(K_SWEEP_LOCK)
+
+
+async def _sweep_once_locked() -> None:
     await _watch_queue()
-    stale = await taskstore.stale_active(settings.task_stale_seconds)
+    stale = await taskstore.stale_active(settings.task_stale_seconds,
+                                         limit=settings.sweep_stale_batch)
     resubmitted = 0
     in_flight = 0
     for task_id in stale:
@@ -187,7 +204,7 @@ async def sweep_once() -> None:
 
     # 终态但结算未落：重发计费事件（需用户令牌；令牌会话丢失则冻结已由
     # billing TTL 兜底解冻，直接收口并告警，不再无限重发）
-    unsettled = await taskstore.terminal_unsettled()
+    unsettled = await taskstore.terminal_unsettled(limit=settings.sweep_unsettled_batch)
     for item in unsettled:
         data = item.get("data") or {}
         amount = float(data.get("freeze_amount") or 0)
@@ -216,3 +233,10 @@ async def sweep_once() -> None:
     await _held_maintenance()
     await _orphan_closeout()
     await _reverse_reconcile()
+    try:
+        # 并发槽校准（漂移不可自愈：泄漏吃并发余额，少计放行超限）
+        fixed = await ratelimit.conc_recalibrate()
+        if fixed:
+            log.warning("sweep recalibrated {} concurrency slots", fixed)
+    except Exception:
+        log.opt(exception=True).warning("conc recalibrate failed (next round retries)")
