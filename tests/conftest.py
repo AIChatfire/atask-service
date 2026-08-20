@@ -203,6 +203,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
     import app.routers.callback
     import app.services.idem
     import app.services.reconcile
+    import app.services.routecache
     import app.services.statelog
     import app.services.submit
     import app.services.taskstore
@@ -217,6 +218,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
         app.routers.callback,
         app.services.idem,
         app.services.reconcile,
+        app.services.routecache,
         app.services.statelog,
         app.services.submit,
         app.services.taskstore,
