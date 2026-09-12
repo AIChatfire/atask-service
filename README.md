@@ -19,6 +19,10 @@ stask-service 只接受同步任务（由它完成任务化），两者产出的
   配一个 base_url + 白名单，**零渠道元数据依赖、零计费规则配置**。
 - **异步受理**：`POST /queue/{path}` 落库即返回本地 task_id，客户端侧零上游往返；
   上游提交交 worker（`app/services/relayflow.py`）。
+- **可选攒批放行**：`BATCH_SIZE>=2`（或客户端声明 `X-Batch-Size`）时把「上游提交」
+  从受理时刻解耦，攒够 N 条或等够 T 秒才**整批提交**（**不合并请求**——上游是约定式
+  异步接口，没有批量端点）；等待期**不占并发槽**，故攒批路径受理不再 429、改为排队。
+  默认 `BATCH_SIZE=0` = 收到即提交，开箱行为与无此特性时逐字节一致（本仓库 ADR-011）。
 - **无状态**：自有状态全在 Redis，零自有 MySQL 表（只读写与 new-api 共享的
   `tasks` 表，`platform='atask'` 隔离）。
 
@@ -69,13 +73,13 @@ nginx 在同一域名下做两件事：
 |---|---|
 | `POST /queue/{path:path}` | 受理：落库即返回 `202 + {task_id, status}`，带 `Location: /queue/{path}/{task_id}` 头；需 `Authorization` + 可选 `Idempotency-Key` |
 | `GET /queue/{path:path}` | 末段是本地 `task_id` → 任务视图（非终态按需探测上游，终态零上游往返）；末段不是本地 id → **免费透传**（原样转发上游，不落 tasks 行） |
-| `DELETE /queue/{path:path}` | 取消：本地 CAS 置 CANCELED + 尽力源头止损（末段不是本地 id 则 404） |
+| `DELETE /queue/{path:path}` | 取消：本地 CAS 置 CANCELED + 尽力源头止损 + 清令牌会话（末段不是本地 id 则 404） |
 | `GET /ops/queue` | 队列健康快照（积压/延迟/死信/状态分布） |
 | `GET /ops/tasks/{task_id}` | 任务内部诊断视图（令牌会话只给存在性与 TTL） |
 | `POST /ops/requeue/{task_id}` | 手动补投：立即把非终态任务重新放入提交队列 |
 | `POST /ops/dlq/replay` | 死信重放（补号） |
 | `GET /admin`、`GET /admin/api/*` | 管理看板：页面 + 其 JSON API（与 `/ops/*` **共用** `X-Admin-Token`） |
-| `GET /healthz/live`、`GET /healthz/ready` | 探针（ready = Redis PING + DB SELECT 1） |
+| `GET /healthz/live`、`GET /healthz/ready` | 探针（ready = Redis PING + SELECT 1） |
 
 `{path}` 是**上游原生路径**（如 new-api 视频生成的 `v1/tasks`），`{biz}` 段已从 URL
 彻底移除。**管理面 fail-closed**：`/ops/*` 与 `/admin/*` 共用 `X-Admin-Token`
@@ -128,6 +132,9 @@ curl -X POST https://gw.example.com/queue/v1/tasks \
 # → 202 {"task_id":"queue_5f2c...e91","status":"SUBMITTED"}
 #   Location: /queue/v1/tasks/queue_5f2c...e91
 
+# 回调地址也可以放在 body 顶层（上游 API 文档口径，如火山方舟 Seedance）
+# -d '{"model":"your-model","prompt":"a cat","callback_url":"https://app.example.com/webhook"}'
+
 # 查询：末段是本地 task_id → 任务视图（非终态按需探测上游）
 curl https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
   -H 'Authorization: Bearer sk-user-xxx'
@@ -137,8 +144,17 @@ curl -X DELETE https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
   -H 'Authorization: Bearer sk-user-xxx'
 ```
 
-用户可选的 `X-Callback-Url` 头在终态时被签名投递（见下节）；**网关不读 body 里
-的回调字段**（body 逐字节原样转发，网关不解析语义）。
+**用户回调地址**有两个等价通道：`X-Callback-Url` 头（**优先**）与 body 顶层
+`callback_url` 字段（**兜底**，上游 API 文档口径，如火山方舟 Seedance）。地址必须命中
+`CALLBACK_ALLOWLIST`（**为空即全部拒绝**，fail-closed），且私网/回环/链路本地**字面 IP
+一律拒绝**——否则等于给互联网开一个 SSRF 出站跳板。非法地址在**任何副作用之前**被拒
+（不落库、不占并发槽、不占幂等键）。
+
+默认「网关接管」模式下，body 里的 `callback_url` 会被**从转发体摘除**后再送上游，以消除
+「上游也回调 + 网关也回调」的双投递（转发改走 `data.submit_body`，`data.request_body`
+仍存原文）；置 `CALLBACK_PASSTHROUGH_UPSTREAM=true` 时改为原样转发、由上游自己回调。
+**客户端对接契约（签名、验签、幂等去重、与火山的差异）见
+[`docs/CALLBACK-CONTRACT.md`](docs/CALLBACK-CONTRACT.md)。**
 
 ## 计费、可靠性与收敛
 
@@ -154,13 +170,24 @@ curl -X DELETE https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
 - **单一终态收口点**：`relayflow._finalize_queue` 是视图路径 / worker 路径 / sweep
   路径共用的**唯一**收口实现——CAS 抢推进权 → 记一条状态迁移日志 → 落终态快照 →
   释放并发槽 → 投递用户回调 → 清令牌会话。CAS 抢不到即整段不执行，保证终态事件
-  「恰好一次」。
-- **用户回调**：受理时接受 `X-Callback-Url` 头，终态经 `app/services/notify.py`
-  以 HMAC-SHA256 签名（`X-Gateway-Signature: t=...,v1=...`）后投递，走既有
-  `queue.publish_notify`（重试 + 死信）。无回调 URL 则不投递。
+  「恰好一次」。**取消路径刻意不复用**它（多一步「尽力源头止损」且必须在清会话之前，
+  因为它要用会话里的 sk 发 `DELETE`），故**终态收口动作没有单一来源**——新增终态动作时
+  必须同时问「取消路径要不要」（本仓库 ADR-012 已知限制）。
+- **攒批放行**（本仓库 ADR-011）：受理落库为 `SUBMITTED` + `data.batch_state='waiting'`
+  入批等待，由「成员数达到 N」或「本批 deadline 到期」触发整批放行（另有 sweep 的超期
+  兜底）；放行动作在 `relayflow.release_batched_task`，批次索引在
+  `app/services/batching.py`。三条不要动的约定：① **等待期不占并发槽**（占槽点从受理
+  搬到放行，否则批次永远不可能大于并发上限）；② **两层幂等缺一不可**（批次级 Redis
+  原子摘取 + 成员级 DB 条件更新，少了成员级会让上游被调两次）；③ **还槽必须走
+  `taskstore.claim_slot_release`**（谁把 `data.slot_flags` 置零谁去 DECR）。
+- **用户回调投递**：**只在终态**推一次。地址按上节的通道与准入规则确定，终态经
+  `app/services/notify.py` 以 HMAC-SHA256 签名（`X-Gateway-Signature: t=...,v1=...`）后
+  投递，走既有 `queue.publish_notify`（重试 + 死信）。无回调地址则不投递。
+  **中间态不推**——网关是中继而非执行者，只在被轮询或巡检时才观测上游，中间态是抽样
+  而非事件流。**主动取消不推**（调用方自己发起，结果它已知）。
 - **后台收敛**：`queue_sweep_task`（cron 每分钟，`app/queue.py`）探测非终态任务并
   推进到终态，用独立重入锁 `K_QUEUE_SWEEP_LOCK` 防慢轮叠加；候选**最旧优先**
-  （`updated_at ASC`），因为它们最可能已在上游成功。
+  （`updated_at ASC`），因为它们最可能已在上游成功。同一条 sweep 也负责攒批的超期兜底。
 - **并发上限 + 限流**：并发槽按 token hash 计（不依赖内省与余额），上限走运行时
   热配置 `max_concurrent_tasks`；免费 GET 与受理按限流（`RATE_LIMIT_PER_MINUTE`）。
   实现：`app/deps/ratelimit.py`。
@@ -171,18 +198,25 @@ curl -X DELETE https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
   / `_secs()`）；**原生报文同构**与**终态快照回放**（终态零上游往返）；幂等原子
   占位；按 token hash 的并发上限。
 
-**已知限制**（登记在案，详见本仓库 ADR-010）：
+**已知限制**（登记在案，详见本仓库 ADR-010 与 ADR-012）：
 
 1. **令牌会话过期后任务无法自愈**：探测需用户 token，而网关只把 token 存 Redis
    会话（TTL = `SK_SESSION_TTL_SECONDS`，48h）。会话过期后 sweep 跳过该任务
    （DEBUG 级，不报错、**绝不判死、绝不释放并发槽**），任务停在非终态。
 2. **刻意不设 max-age 判死**：判死不可逆，会永久丢失一个可能已在上游成功的任务。
+   也因此不像上游那样提供「任务超时（expired）」类回调通知。
 3. **`X-Upstream-Base-Url` 头的可信性完全依赖 nginx 配置正确**：`UPSTREAM_ALLOWLIST`
    是第二道防线，**两道都必须配**。
 4. **取消语义退化**：`DELETE` 只做尽力源头止损 + 本地置 CANCELED；上游取消形态
-   （`DELETE {base}{path}/{id}`）属约定推断，未经上游文档验证。
-5. **body 里的回调字段不做拦截**：body 逐字节原样转发，用户若自行在 body 放回调
-   字段，可能与网关回调形成双投递。
+   （`DELETE {base}{path}/{id}`）属约定推断，未经上游文档验证。取消**不投递回调**。
+5. **转发体的「逐字节原样」有一个例外**：body 顶层带 `callback_url` 且处于默认
+   「网关接管」模式时，该字段被**摘除**后再转发（转发体走 `data.submit_body` 这个
+   语义等价重构体，键序/空白可能与原文不同；`data.request_body` 仍存原文）。
+   这样反而**消除了双投递**——若原样转发给上游，上游可能也回调一次。
+   `CALLBACK_PASSTHROUGH_UPSTREAM=true` 时无此例外。
+6. **回调地址不防 DNS rebinding**：白名单配域名时，若该域名被解析到内网则发现不了。
+   不做解析后校验是因为 TOCTOU——校验时的解析结果与 HTTP 客户端出站时的解析结果
+   不保证一致。信任边界交给白名单（只放行可信域名）。
 
 ## 观测
 
@@ -216,7 +250,8 @@ make            # 无参数列出全部命令
 - `tests/test_static_gates.py` —— 结构断言（**不写死条数**，条目会随迭代增长；
   写死就会出现「文档说九条、实际十四条」这种自我漂移）：ruff 洁净、
   源码与文档无 emoji、**tasks 表 SQL 只能出现在 `app/services/taskstore.py`**、
-  **`os.environ` 只允许出现在白名单**（`gunicorn.conf.py` 与 `app/config.py`）、
+  **`os.environ` 只允许出现在一处**（`gunicorn.conf.py`——它在 pydantic 单例之前
+  由 master 进程加载；门禁按 AST 判定属性访问，docstring 里提到它不算）、
   **全仓不得含真实凭据**、`app/services` 不得有无调用方的公开函数、
   不得有无人在抛的异常类、配置项与 `.env.example` 必须对齐、
   配置键名不带前缀（`env_prefix` 保持为空）、通配路由必须最后注册等。
@@ -227,9 +262,14 @@ make            # 无参数列出全部命令
 ## 决策记录
 
 关键决策（含被否决的替代方案、真实踩过的坑、上游源码事实）在
-[`docs/decisions/`](docs/decisions/)：ADR-001 ~ ADR-010 + `OPEN-DECISIONS.md`
+[`docs/decisions/`](docs/decisions/)：ADR-001 ~ ADR-012 + `OPEN-DECISIONS.md`
 （未决事项登记册）。**现行架构的权威是本仓库 ADR-010**
-（`docs/decisions/ADR-010-queue-path-zero-billing.md`）。
+（`docs/decisions/ADR-010-queue-path-zero-billing.md`）；攒批见
+`docs/decisions/ADR-011-batch-release-gating.md`，用户回调的地址准入与投递见
+`docs/decisions/ADR-012-callback-address-admission.md`。
+
+面向调用方的接口契约：任务链路见 [`docs/SPEC.md`](docs/SPEC.md)，
+**回调对接见 [`docs/CALLBACK-CONTRACT.md`](docs/CALLBACK-CONTRACT.md)**。
 
 注意：**本仓库与 stask-service 各有一套独立的 ADR 编号**，同一编号在两仓库含义
 不同，交叉引用时必须写明仓库名（见 `docs/decisions/README.md`）。
@@ -245,7 +285,7 @@ make            # 无参数列出全部命令
 > 为必填。
 
 ```bash
-cp .env.example .env       # 填库地址、上游白名单与回调签名密钥
+cp .env.example .env       # 填库地址、上游白名单、回调白名单与回调签名密钥
 docker compose up --build  # gateway + taskiq worker（内嵌 scheduler）+ redis + taskiq-admin
 ```
 
@@ -258,6 +298,8 @@ docker compose up --build  # gateway + taskiq worker（内嵌 scheduler）+ redi
 - `REDIS_URL`
 - `UPSTREAM_BASE_URL` + `UPSTREAM_ALLOWLIST`（上游寻址与防 SSRF 白名单，
   **白名单为空即全部拒绝**）
+- `CALLBACK_ALLOWLIST`（回调地址白名单，**不配则带回调地址的提交直接 400**——
+  回调是网关的**出站**请求，默认开放等于默认暴露）
 - `CALLBACK_SIGN_SECRET`（用户回调 HMAC 密钥，**必须强随机**）
 - `ADMIN_TOKEN`（管理面 `X-Admin-Token`；未配则整个管理面 404）
 - `TASKIQ_ADMIN_API_TOKEN`（taskiq-admin 看板）
@@ -265,3 +307,6 @@ docker compose up --build  # gateway + taskiq worker（内嵌 scheduler）+ redi
 `gunicorn.conf.py` 是全项目**唯一**允许直读 `os.environ` 的地方（它在 pydantic
 单例之前由 master 进程加载）；其 worker 数与 timeout 由「与 new-api 共享 MySQL 的
 连接预算」和「最长合法请求」反推，改之前先读文件头。
+
+**发布前必做**：`CALLBACK_ALLOWLIST` 与 `UPSTREAM_ALLOWLIST` 都是 fail-closed 开关，
+上线前先确认两者都已按实际对接方配置；`BATCH_SIZE` 保持默认 `0` 时无需其他改动。
