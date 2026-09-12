@@ -11,3 +11,11 @@ dist/
 build/
 *.log
 .DS_Store
+
+# 本机私有状态——**绝不允许入库**：
+#   .workbuddy/ 是 AI 协作记忆，里面**记录了已泄露凭据的值**（当初为轮换可追溯而留）。
+#   注意 tests/test_static_gates.py 的凭据门禁**按设计跳过这个目录**（否则会天天报
+#   自己的笔记），所以「它被提交」不会有任何门禁来拦——只能靠这条忽略规则 +
+#   另一条门禁（test_local_private_dirs_are_not_tracked）双重兜住。
+.workbuddy/
+.idea/

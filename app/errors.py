@@ -1,7 +1,8 @@
 """统一错误响应：所有非 2xx 归一为 OpenAI 风格 ``{"error": {...}}`` 形制。
 
 路由内 ``raise HTTPException(status, message)`` 即可，处理器统一包装；
-detail 已是 ``{"error": ...}`` 形制的原样透传（proxy 路由的直返场景）。
+``detail`` 已是 ``{"error": ...}`` 形制时原样透传——该分支当前**无触发路径**
+（旧 proxy 直返已随 ADR-010 删除），保留以固定对外错误体形状。
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ def _type_for(status_code: int) -> str:
     if status_code == 401:
         return "authentication_error"
     if status_code == 402:
+        # OpenAI 形制兼容位：计费已下沉上游，当前链路无 402 触发路径。
+        # 保留映射（不删）以固定对外错误体形状，避免改变既有客户端契约。
         return "billing_error"
     if status_code == 429:
         return "rate_limit_error"

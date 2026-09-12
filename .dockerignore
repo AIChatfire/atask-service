@@ -1,5 +1,11 @@
 # Docker 构建上下文裁剪（W6）
+# 目标：上下文最小化，同时**保证新 Dockerfile 分层所需的输入都在**——
+#   pyproject.toml（依赖声明）、README.md（setuptools 构建可能引用）、
+#   app/（应用代码）、gunicorn.conf.py（启动配置）。
+# 注意 *.md 被整体排除后必须用 !README.md 重新放行，否则分层 1 的
+# `COPY pyproject.toml README.md ./` 会因找不到 readme 而失败。
 .git
+.gitignore
 .venv
 venv
 __pycache__
@@ -7,6 +13,11 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .mypy_cache
+.coverage
+htmlcov
+build
+dist
+*.egg-info
 tests
 deploy
 alembic

@@ -1,5 +1,9 @@
 # atask-service 优化 Backlog（已收敛）
 
+> 状态：已归档（2026-09-12）。有效内容已沉淀进 `docs/decisions/`
+> （ADR-001 / ADR-003 / ADR-004 / ADR-005 / OPEN-DECISIONS），
+> 本文件仅作历史记录保留，不再更新。
+
 > **收敛日期：2026-08-19**。本清单为「提交异步化」改造的执行清单，全部条目
 > 已落地验收。过程性内容（链路文字版/收益估算/行号级修改指引）已删除，
 > 需要考古见 git 历史。背景一句话：创建请求内同步提交上游（最坏 4 分钟+）
@@ -24,7 +28,7 @@
   同步 502 改为异步 FAILURE（无调用方依赖同步 502，仅测试已同步改写）
 - [x] **[6] `public_view`**：SUBMITTED 对外原样呈现（"已受理、排队待提交"，
   videos 形态小写 `submitted`）；HELD→QUEUED 映射不变
-- [x] **[7] `orphan_active` 判死阈值**：`GW_ORPHAN_GRACE_SECONDS`
+- [x] **[7] `orphan_active` 判死阈值**：`ORPHAN_GRACE_SECONDS`
   **600 → 1800**，覆盖「队列积压 + 提交耗时」窗口（stale 每 300s 补投 +
   提交最坏 60s×3 重打 + 互斥锁 TTL 300s），防队列积压误杀在途任务
 - [x] **[8] `sweep_once` SUBMITTED 补投**：stale 且无 upstream_task_id 的
@@ -49,12 +53,12 @@
 
 - **KI2 提交互斥锁 TTL 与渠道 timeout 耦合——已根治**：锁 TTL 按路由动态
   派生（`submit_max_attempts` × 渠道 `timeout_sec` +
-  `GW_SUBMIT_LOCK_BUFFER_SECONDS`，换渠道重打时按新路由刷新，见
+  `SUBMIT_LOCK_BUFFER_SECONDS`，换渠道重打时按新路由刷新，见
   `app/services/submit.py::submit_lock_ttl`），不再硬编码 300s；sweep 补投
   前查 `gw:submit_lock:{task_id}`，锁在则本轮让路（`reconcile.sweep_once`）。
   两道防线叠加，「锁先于在飞提交过期 → 补投并发 → 上游双建」窗口闭合。
 - **KI3 幂等键并发窗——已根治**：preflight 改原子占位（SET NX 写
-  `pending`，短 TTL `GW_IDEM_PENDING_TTL_SECONDS`，见
+  `pending`，短 TTL `IDEM_PENDING_TTL_SECONDS`，见
   `app/services/idem.py`），「先查后写」变原子；同键并发请求短轮询等占位
   在同一键上回填为 task_id 后回放，超时/过期按 409 冲突（不放行重建，
   资金侧零风险）；创建链路失败 CAS 归还占位（preflight/flow/proxy 三处
@@ -87,7 +91,7 @@
 
 ## 原生路径拦截（2026-08-20 收敛）
 
-背景：`POST /minimax/v2/video_generation` 落通配透传 → 同步转发 → 客户端拿到
+背景：`POST /example/v2/video_generation` 落通配透传 → 同步转发 → 客户端拿到
 **上游** task_id + 上游 RTT，与「原生接口同构 + 本地 id + 秒级返回」的目标冲突。
 
 - [x] **[N1] 免费 GET 不再空 model 问 keypool**：`select(group, model)` 对空
@@ -162,34 +166,34 @@
 
 性能与稳定性审查（长期运行 + 任务量增长）发现的 5 项问题，全部落地：
 
-- [x] **[P1] 并发槽泄漏根治**（🔴 最高险：`gw:conc:*` INCR 无 TTL，「占槽后
+- [x] **[P1] 并发槽泄漏根治**（[高危] 最高险：`gw:conc:*` INCR 无 TTL，「占槽后
   崩溃」永久泄漏，累积到上限该用户永远 429，只能人工删键）：双保险——
-  ① `LUA_CONC_ACQUIRE` 挂 TTL 兜底（`GW_CONC_TTL_SECONDS`，默认 48h，每次
+  ① `LUA_CONC_ACQUIRE` 挂 TTL 兜底（`CONC_TTL_SECONDS`，默认 48h，每次
   acquire 刷新；须 > 最长任务在途时长）；② sweep 每轮 `conc_recalibrate()`
   （`app/deps/ratelimit.py`）按 tasks 表事实源（`taskstore.
   active_counts_by_token`，HELD 除外，口径同 acquire/release）回写：泄漏收回、
   少计补齐、归零删键。TTL 管兜底、校准管精确，两者独立成立。
-- [x] **[P2] sweep 重入锁**（🔴 cron 每分钟触发，慢轮——反向对账打上游——
+- [x] **[P2] sweep 重入锁**（[高危] cron 每分钟触发，慢轮——反向对账打上游——
   超 1 分钟时叠加并发轮 → 重复补投/重复 renew/重复对账）：`sweep_once` 加
-  `gw:sweep_lock` SET NX（TTL `GW_SWEEP_LOCK_TTL_SECONDS` 300s，崩溃自动
+  `gw:sweep_lock` SET NX（TTL `SWEEP_LOCK_TTL_SECONDS` 300s，崩溃自动
   释放），拿不到直接跳过本轮；finally 释放。
-- [x] **[P3] tidx 上游 id 反查索引**（🔴 `get_by_upstream_id` 的
+- [x] **[P3] tidx 上游 id 反查索引**（[高危] `get_by_upstream_id` 的
   `data ->> '$.upstream_task_id'` 无索引=全表扫描，零建表红线不能加虚拟列；
   原生查询按上游 id 轮询是热路径，表大后必炸）：Redis `gw:tidx:{upstream_
-  task_id}` → task_id（TTL `GW_UPSTREAM_INDEX_TTL_SECONDS` 7d）。写入点收口
+  task_id}` → task_id（TTL `UPSTREAM_INDEX_TTL_SECONDS` 7d）。写入点收口
   在 `taskstore.patch_data`（补丁含 upstream_task_id 自动写，覆盖 submit/
   held 恢复/proxy 回填三处，零调用点改动）；读取先索引（命中后校验
   `data.upstream_task_id` 一致防脏指向）→ miss 落 SQL 兜底 → SQL 命中回写。
   索引丢失只是退化为慢查询，正确性不依赖 Redis。
-- [x] **[P4] 硬编码参数配置化**（🟡 预留调参空间）：熔断阈值/窗口
-  （`GW_UPSTREAM_BREAKER_*`）、上游连接池（`GW_UPSTREAM_MAX_*`）、原生缓冲
-  上限（`GW_NATIVE_BUFFER_LIMIT_BYTES`）、sweep 各批次（`GW_SWEEP_*_BATCH`）
+- [x] **[P4] 硬编码参数配置化**（[中危] 预留调参空间）：熔断阈值/窗口
+  （`UPSTREAM_BREAKER_*`）、上游连接池（`UPSTREAM_MAX_*`）、原生缓冲
+  上限（`NATIVE_BUFFER_LIMIT_BYTES`）、sweep 各批次（`SWEEP_*_BATCH`）
   全部提为环境变量；poll ladder 加 300s 长尾档（长视频任务减少无效探测）；
   `upstream.client_for` 缓存键补 timeout 维度（渠道热更 timeout_sec 后新
   租约自动落新连接池，不再被旧池粘住）。
-- [x] **[P5] queue_stats 降频缓存**（🟡 每分钟 `_watch_queue` 全库
+- [x] **[P5] queue_stats 降频缓存**（[中危] 每分钟 `_watch_queue` 全库
   `scan gw:submit_lock:*` + tasks 全表 GROUP BY）：快照缓存进 `gw:queue_
-  stats`（TTL `GW_QUEUE_STATS_CACHE_SECONDS` 55s），/ops/queue 与 sweep 共
+  stats`（TTL `QUEUE_STATS_CACHE_SECONDS` 55s），/ops/queue 与 sweep 共
   用；缓存不可用降级直算。
 - [x] **[P6] 测试**：`tests/test_perf_hardening.py` 13 用例（校准泄漏收回/
   归零删键/少计补齐/一致跳过+HELD 口径/acquire 挂 TTL；sweep 锁被占跳过且

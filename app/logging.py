@@ -6,14 +6,13 @@
   （``app.queue.ObservabilityMiddleware.startup``）入口各调用一次：
   重建 stderr sink，并把 stdlib logging（uvicorn / sqlalchemy / taskiq /
   gunicorn hooks）桥接进 loguru，全进程日志同一格式同一出口；
-- 级别由 ``GW_LOG_LEVEL`` 控制（默认 INFO；高频探测成功路径一律 DEBUG，
+- 级别由 ``LOG_LEVEL`` 控制（默认 INFO；高频探测成功路径一律 DEBUG，
   排障时调到 DEBUG 即可看全链路）。
 
-安全纪律（红线：用户令牌/上游 key 不进日志）：
+安全纪律（红线：用户令牌只进 Redis 令牌会话，绝不落库、绝不进日志）：
 - ``backtrace=False, diagnose=False``——异常回溯不带局部变量值
-  （billing 任务参数含用户 sk，开启 diagnose 会把帧变量打进日志）；
-- 业务日志只打 task_id / user_id / channel_id / 金额 / 状态，绝不打
-  raw token 与上游 key。
+  （开启 diagnose 会把帧变量打进日志，可能带出用户令牌）；
+- 业务日志只打 task_id / user_id / 状态，绝不打 raw token。
 """
 
 from __future__ import annotations
@@ -68,7 +67,7 @@ def _logfire_sink_filter(record: dict[str, Any]) -> bool:
     taskiq-admin 看板上报（started/executed）每个任务两次 POST，httpx 的
     INFO 请求日志经 stdlib→loguru→logfire 桥接后高频刷屏、零信息量——
     按已配置的管理台 URL 前缀精准丢弃；其余 httpx 日志（上游 4xx 排障
-    靠它）照常进 logfire。未配置 ``GW_TASKIQ_ADMIN_URL`` 时全放行。
+    靠它）照常进 logfire。未配置 ``TASKIQ_ADMIN_URL`` 时全放行。
     """
     admin = settings.taskiq_admin_url.rstrip("/")
     if not admin:
@@ -131,7 +130,7 @@ def attach_logfire_handler() -> None:
 
 
 def logfire_event(level: str, event: str, **fields: Any) -> None:
-    """logfire 结构化事件公共发射点（``GW_LOGFIRE_ENABLED`` 时才真正发出）。
+    """logfire 结构化事件公共发射点（``LOGFIRE_ENABLED`` 时才真正发出）。
 
     与 stderr 文本日志互补：字段化（可查询、可告警）、与 span 同 trace。
     任何失败静默——观测链路绝不影响业务主流程。

@@ -1,81 +1,36 @@
-"""状态变更记录器：**任务状态变化的唯一 logfire 记录点**。
+"""状态迁移日志：``/batch`` 链路**状态变化的唯一记录点**。
 
-GET 轮询 / Poller 探测 / Callback 共用"只在状态变化时记录"逻辑：
-Redis 记录每个任务最近一次已上报的状态，变化才产出一条 task_status_changed
-（多个观察者共享同一键，谁先发现变化谁记录，天然去重）。
+旧链路的 ``statelog`` 靠 Redis「最近已上报状态」键去抖，因为它的状态推进有多个
+平等观察者（GET 轮询 / Poller / Callback）互相竞争。ADR-010 后的新链路把推进权
+收敛到 **CAS 单点**（``taskstore.cas`` 的 rowcount 判定）：同一迁移的重复/迟到
+观察者拿不到推进权、不会走到本模块，所以「状态变化 → **恰好一条**日志」由 CAS
+本身保证，不再需要额外的去重键。
 
-降噪纪律（运行期每几秒一轮探测也不会刷事件）：
-- 状态不变 → 零日志零事件（``record_if_changed`` 返回 False）；
-- 状态变化 → 恰好一条（本地 INFO + logfire.info，GW_LOGFIRE_ENABLED 时）；
-- 队列执行层（taskiq 中间件）不重复记录状态语义，只兜执行失败。
+纪律：
+- **只在 CAS 抢到推进权的那一次调用里记录**（调用方负责放在 ``cas(...) is True``
+  分支内）——把本函数放到 CAS 之外会让重复观察者各记一条，恰好一次就破了；
+- 本地 INFO 一条 + logfire 结构化事件（``LOGFIRE_ENABLED`` 时才真正发出），
+  两者同源同参数，便于按 ``task_id`` 在日志与 trace 间对齐；
+- 不记录上游探测回显的原话状态（``data.upstream_status``）——那是高频道上游
+  回显、不是本地状态机迁移，记它等于每次轮询都刷一条。
 """
 
-from app.config import settings
-from app.logging import log
-from app.redis import r
+from __future__ import annotations
 
-K_SEEN = "gw:status_seen:{task_id}"
-SEEN_TTL = 48 * 3600
-
-K_FAIL = "gw:fail_count:{subject}"       # 连续失败计数（轮询降噪）
-FAIL_ESCALATION = (1, 5, 20)             # 仅这些档位产出 warning/事件
+from app.logging import log, logfire_event
 
 
-async def record_if_changed(task_id: str, status: str, detail: str = "") -> bool:
-    """状态变化才记录并返回 True；未变化返回 False（零日志零事件）。"""
-    key = K_SEEN.format(task_id=task_id)
-    try:
-        last = await r.get(key)
-        if last == status:
-            return False
-        await r.set(key, status, ex=SEEN_TTL)
-    except Exception:
-        log.opt(exception=True).debug("statelog redis error")
-        last = None
+def record_transition(task_id: str, from_status: str | None, to_status: str,
+                      source: str, detail: str = "") -> None:
+    """记录一次**已抢到推进权**的状态迁移：恰好一条本地 INFO + 一条 logfire 事件。
 
-    if settings.logfire_enabled:
-        try:
-            import logfire
-
-            logfire.info(
-                "task_status_changed",
-                task_id=task_id, from_status=last, to_status=status, source=detail,
-            )
-        except Exception:
-            pass
-    log.info("task_status_changed: {} {} -> {} ({})", task_id, last, status, detail)
-    return True
-
-
-async def record_failure_escalated(subject: str, detail: str = "") -> int:
-    """连续失败计数 +1，**仅在 1/5/20 档**产出 warning + logfire 事件（轮询降噪：
-    探测每几秒一轮，连续失败时日志量从每轮一条降到三档三条）。
-    恢复成功后由 ``reset_failure`` 清零。返回当前计数。"""
-    key = K_FAIL.format(subject=subject)
-    try:
-        count = int(await r.incr(key))
-        await r.expire(key, SEEN_TTL)
-    except Exception:
-        log.opt(exception=True).debug("statelog redis error")
-        return 0
-    if count in FAIL_ESCALATION:
-        log.warning("failure escalation: {} count={} ({})", subject, count, detail)
-        if settings.logfire_enabled:
-            try:
-                import logfire
-
-                logfire.warn("failure_escalated",
-                             subject=subject, count=count, detail=detail[:200])
-            except Exception:
-                pass
-    else:
-        log.debug("failure counted: {} count={} ({})", subject, count, detail)
-    return count
-
-
-async def reset_failure(subject: str) -> None:
-    """成功后清零失败计数（下次故障从第 1 档重新升档）。"""
-    try:
-        await r.delete(K_FAIL.format(subject=subject))
-    except Exception:
-        log.opt(exception=True).debug("statelog redis error")
+    ``source`` 是推进来源（``batch_submit`` / ``batch_probe`` / ``batch_finalize``
+    / ``batch_cancel``），用于定位是哪条路径推进的；``detail`` 只放面向排障的短
+    文案（失败原因等），**绝不放用户令牌**。
+    """
+    log.info("task_status_changed: {} {} -> {} ({}{})",
+             task_id, from_status, to_status, source,
+             f": {detail}" if detail else "")
+    logfire_event("info", "task_status_changed", task_id=task_id,
+                  from_status=from_status, to_status=to_status,
+                  source=source, detail=detail)

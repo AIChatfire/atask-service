@@ -33,7 +33,6 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi==0.56b0",
     "opentelemetry-instrumentation-httpx==0.56b0",
     # 计费表达式沙箱（>=1.0.6 修复 GHSA-vp47-9734-prjw，订阅 GHSA）
-    "asteval==1.0.9",
 ]
 
 [project.optional-dependencies]

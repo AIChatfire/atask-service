@@ -1,14 +1,13 @@
-"""幂等键：客户端重试不产生重复任务/重复扣费。
+"""幂等键：客户端重试不产生重复任务。
 
 原子占位（KI3 根治）：原「先查重放、落库后回填」在两请求真并发时都查
-不到 → 双建任务双冻结。现 preflight 先 SET NX 写占位标记（pending，短
+不到 → 双建任务。现受理链路先 SET NX 写占位标记（pending，短
 TTL），把「先查后写」变原子——同 Idempotency-Key 的并发请求只有占位者
 继续创建链路；其余短轮询等占位在同一键上回填为真实 task_id 后回放，
-超时/占位过期按 409 冲突处理（不放行重建：重建会双建双冻结，409 让
-客户端原键重试，资金侧零风险）。
+超时/占位过期按 409 冲突处理（不放行重建：重建会双建任务，409 让
+客户端原键重试）。
 
 状态流转全部在同一 Redis 键上完成：``pending`` → ``task_id``。
-Redis 丢失的极端情况由 billing 的 request_id 唯一约束兜底。
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import time
 from app.config import settings
 from app.redis import K_IDEM, LUA_CAS_DELETE, r
 
-#: 占位标记：创建链路在飞（preflight → 落库 → 回填）期间的键值；
+#: 占位标记：创建链路在飞（受理 → 落库 → 回填）期间的键值；
 #: task_id 形态为 ``{biz}_{uuid4hex}``，绝不与本标记碰撞
 PENDING = "pending"
 
@@ -58,7 +57,7 @@ async def acquire(token_hash: str, idem_key: str) -> tuple[bool, str | None]:
 async def wait_task_id(token_hash: str, idem_key: str) -> str | None:
     """短轮询等他方占位回填为真实 task_id。
 
-    超时（``GW_IDEM_REPLAY_WAIT_SECONDS``）或占位消失（创建方失败已归还/
+    超时（``IDEM_REPLAY_WAIT_SECONDS``）或占位消失（创建方失败已归还/
     占位 TTL 过期）→ None，调用方按 409 冲突处理，绝不放行重建。
     """
     deadline = time.monotonic() + settings.idem_replay_wait_seconds

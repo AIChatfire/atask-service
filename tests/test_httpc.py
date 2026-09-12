@@ -1,7 +1,7 @@
 """httpc 共享客户端池：同参复用（keep-alive 连接池）/ 已关闭重建 / close_all 释放。
 
-复用是提交链路性能前提：preflight 每次提交的 inspect/lease/freeze 控制面
-调用若各自新建 AsyncClient，会逐请求付出完整 TCP+TLS 握手。
+复用是出站热路径的性能前提：``relay.call_upstream`` 每次提交/探测若各自新建
+``AsyncClient``，会逐请求付出完整 TCP+TLS 握手（无 keep-alive）。
 """
 
 import asyncio

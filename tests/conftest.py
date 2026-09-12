@@ -1,7 +1,7 @@
 """统一测试基建：内存版 Redis / 内存 taskstore / respx 出站拦截 / 受控 settings。
 
-原则：单测不依赖真实 MySQL/Redis/上游/三微服务；外部边界只有两处——
-- HTTP 出站（providers 与 upstream 引擎）：respx 拦截；
+原则：单测不依赖真实 MySQL/Redis/上游；外部边界只有两处——
+- HTTP 出站（relay 出站）：respx 拦截；
 - Redis：FakeRedis（decode_responses=True 语义，覆盖网关用到的命令子集）。
 """
 
@@ -195,33 +195,34 @@ def fake_redis() -> FakeRedis:
 
 @pytest.fixture
 def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeRedis:
-    """把网关所有 ``from app.redis import r`` 的消费方统一切换到 FakeRedis。"""
-    import app.deps.auth
+    """把网关所有 ``from app.redis import r`` 的消费方统一切换到 FakeRedis。
+
+    **清单必须与「import ``app.redis`` 的模块全集」一致**——这是手工维护的清单，
+    历史上已漂移过（``app.main`` / ``services.dynconf`` / ``services.relayflow``
+    被漏掉，导致未挂本夹具的用例静默打到真 Redis）。现已由静态门禁
+    ``tests/test_static_gates.py::test_redis_patch_list_covers_importers`` 机械保证，
+    新增模块若 import 了 ``app.redis``，忘加这里会直接让门禁转红。
+    """
+    # 注意 app.main **不在此列**：它在 lifespan() 里**嵌套**导入 r，模块顶层没有
+    # 这个属性，`monkeypatch.setattr` 会直接 AttributeError。门禁
+    # test_redis_patch_list_covers_importers 只要求覆盖「顶层导入」的模块，正是
+    # 为了把这种形态区别对待——按名字强塞会炸掉整套测试。
     import app.deps.ratelimit
     import app.healthz
     import app.queue
-    import app.routers.callback
+    import app.services.dynconf
     import app.services.idem
-    import app.services.reconcile
-    import app.services.routecache
-    import app.services.statelog
-    import app.services.submit
-    import app.services.taskstore
+    import app.services.relayflow
     import app.services.tokensession
     import app.services.upstream
 
     for module in (
-        app.deps.auth,
         app.deps.ratelimit,
         app.healthz,
         app.queue,
-        app.routers.callback,
+        app.services.dynconf,
         app.services.idem,
-        app.services.reconcile,
-        app.services.routecache,
-        app.services.statelog,
-        app.services.submit,
-        app.services.taskstore,
+        app.services.relayflow,
         app.services.tokensession,
         app.services.upstream,
     ):
@@ -250,10 +251,6 @@ def respx_router() -> Iterator[respx.MockRouter]:
 def test_settings(monkeypatch: pytest.MonkeyPatch):
     from app.config import settings
 
-    monkeypatch.setattr(settings, "key_svc_url", "http://keypool.test")
-    monkeypatch.setattr(settings, "key_svc_token", "kp-token")
-    monkeypatch.setattr(settings, "billing_svc_url", "http://billing.test")
-    monkeypatch.setattr(settings, "gateway_public_base_url", "https://gw.test")
     monkeypatch.setattr(settings, "logfire_enabled", False)
     return settings
 
@@ -264,16 +261,18 @@ def test_settings(monkeypatch: pytest.MonkeyPatch):
 
 
 class InMemoryTaskStore:
-    """tasks 表内存实现：create/get/cas/patch_data/mark_settled 语义对齐。"""
+    """tasks 表内存实现：create/get/cas/patch_data/counts_by_status 语义对齐。"""
 
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
 
     async def create(self, task_id: str, user_id: int, channel_id: int,
                      action: str, data: dict) -> None:
+        from app.config import settings   # 惰性导入：与真实 taskstore 同一取值点
+
         now = int(time.time())
         self.rows[task_id] = {
-            "task_id": task_id, "platform": "gateway", "action": action,
+            "task_id": task_id, "platform": settings.gateway_platform, "action": action,
             "status": "SUBMITTED", "progress": "0%", "fail_reason": "",
             "data": json.loads(json.dumps(data, ensure_ascii=False)),
             "user_id": user_id, "channel_id": channel_id,
@@ -284,12 +283,6 @@ class InMemoryTaskStore:
     async def get(self, task_id: str) -> dict | None:
         row = self.rows.get(task_id)
         return dict(row) if row else None
-
-    async def get_by_upstream_id(self, upstream_task_id: str) -> dict | None:
-        for row in self.rows.values():
-            if (row.get("data") or {}).get("upstream_task_id") == upstream_task_id:
-                return dict(row)
-        return None
 
     async def cas(self, task_id: str, from_statuses: tuple[str, ...], to_status: str,
                   patch: dict | None = None, fail_reason: str = "") -> bool:
@@ -308,37 +301,14 @@ class InMemoryTaskStore:
         return True
 
     async def patch_data(self, task_id: str, patch: dict,
-                         status: str | None = None,
-                         channel_id: int | None = None) -> None:
+                         status: str | None = None) -> None:
         row = self.rows.get(task_id)
         if not row:
             return
         if status:
             row["status"] = status
-        if channel_id:
-            row["channel_id"] = channel_id
         row["data"].update(patch)
         row["updated_at"] = int(time.time())
-
-    async def mark_settled(self, task_id: str, amount: float) -> None:
-        await self.patch_data(task_id, {"settled": True, "settled_amount": amount})
-
-    # ---- sweeper 查询（语义对齐 app.services.taskstore）----
-
-    async def stale_active(self, stale_seconds: int, limit: int = 200) -> list[str]:
-        cutoff = int(time.time()) - stale_seconds
-        return [t["task_id"] for t in self.rows.values()
-                if t["status"] in ("SUBMITTED", "QUEUED", "IN_PROGRESS")
-                and t["updated_at"] < cutoff][:limit]
-
-    async def terminal_unsettled(self, limit: int = 200) -> list[dict]:
-        out = []
-        for t in self.rows.values():
-            if t["status"] in ("SUCCESS", "FAILURE", "CANCELED") \
-                    and not t["data"].get("settled"):
-                out.append({"task_id": t["task_id"], "status": t["status"],
-                            "data": dict(t["data"])})
-        return out[:limit]
 
     async def counts_by_status(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -346,78 +316,14 @@ class InMemoryTaskStore:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
         return counts
 
-    async def active_counts_by_token(self) -> dict[str, int]:
-        """并发槽校准事实源（口径同真实实现：活跃且非 HELD，按 token_hash）。"""
-        counts: dict[str, int] = {}
-        for t in self.rows.values():
-            th = str((t.get("data") or {}).get("token_hash") or "")
-            if th and t["status"] in ("SUBMITTED", "QUEUED", "IN_PROGRESS"):
-                counts[th] = counts.get(th, 0) + 1
-        return counts
-
-    async def orphan_active(self, older_than_seconds: int, limit: int = 50) -> list[str]:
-        cutoff = int(time.time()) - older_than_seconds
-        return [t["task_id"] for t in self.rows.values()
-                if t["status"] in ("SUBMITTED", "QUEUED", "IN_PROGRESS")
-                and not t["data"].get("upstream_task_id")
-                and t["created_at"] < cutoff][:limit]
-
-    async def expiring_freezes(self, margin_seconds: int, limit: int = 100) -> list[dict]:
-        deadline = int(time.time()) + margin_seconds
-        out = []
-        for t in self.rows.values():
-            d = t["data"]
-            exp = int(d.get("freeze_expires_at") or 0)
-            if (t["status"] in ("SUBMITTED", "QUEUED", "IN_PROGRESS", "HELD")
-                    and 0 < exp <= deadline and not d.get("settled")):
-                out.append({"task_id": t["task_id"], "data": dict(d)})
-        return out[:limit]
-
-    async def oldest_held(self) -> str | None:
-        held = [t for t in self.rows.values() if t["status"] == "HELD"]
-        if not held:
-            return None
-        return min(held, key=lambda t: t["created_at"])["task_id"]
-
-    async def held_expired(self, max_age_seconds: int,
-                           rate_limited_max_age_seconds: int = 3600,
-                           limit: int = 100) -> list[str]:
-        now = int(time.time())
-        cutoff, cutoff_rl = now - max_age_seconds, now - rate_limited_max_age_seconds
-        out = []
-        for t in self.rows.values():
-            if t["status"] != "HELD":
-                continue
-            rl = t["data"].get("held_reason") == "rate_limited"
-            if t["updated_at"] < (cutoff_rl if rl else cutoff):
-                out.append(t["task_id"])
-        return out[:limit]
-
-    async def reconcile_candidates(self, window_seconds: int, recheck_seconds: int,
-                                   limit: int = 20) -> list[dict]:
-        now = int(time.time())
-        out = []
-        for t in self.rows.values():
-            d = t["data"]
-            if (t["status"] == "FAILURE" and d.get("settled")
-                    and not d.get("reconciled") and d.get("upstream_task_id")
-                    and (t.get("finish_time") or 0) > now - window_seconds
-                    and int(d.get("reconcile_checked_at") or 0) < now - recheck_seconds):
-                out.append({"task_id": t["task_id"], "data": dict(d)})
-        return out[:limit]
-
 
 @pytest.fixture
 def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
-    """把 app.services.taskstore 模块函数替换为内存实现（flow/polling 共用）。"""
+    """把 app.services.taskstore 模块函数替换为内存实现（relayflow 共用）。"""
     import app.services.taskstore as ts
 
     store = InMemoryTaskStore()
-    for name in ("create", "get", "get_by_upstream_id", "cas", "patch_data",
-                 "mark_settled", "stale_active", "terminal_unsettled",
-                 "counts_by_status", "orphan_active", "expiring_freezes",
-                 "reconcile_candidates", "oldest_held", "held_expired",
-                 "active_counts_by_token"):
+    for name in ("create", "get", "cas", "patch_data", "counts_by_status"):
         monkeypatch.setattr(ts, name, getattr(store, name))
     return store
 
@@ -429,94 +335,19 @@ def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
 
 @pytest.fixture
 def queue_events(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
-    """拦截 app.queue 发布门面，记录调用参数（submit/settle/cancel/notify/poll）。"""
+    """拦截 app.queue 发布门面，记录调用参数（batch submit / notify）。"""
     from unittest.mock import AsyncMock
 
     import app.queue as q
 
-    events: dict[str, list] = {"submit": [], "settle": [], "cancel": [], "notify": [],
-                               "poll": [], "resume_held": []}
+    events: dict[str, list] = {"batch_submit": [], "notify": []}
 
-    async def _submit(task_id):
-        events["submit"].append(task_id)
+    async def _batch_submit(task_id: str) -> None:
+        events["batch_submit"].append(task_id)
 
-    async def _settle(request_id, actual_amount, user_sk, units=None, attrs=None):
-        events["settle"].append({
-            "request_id": request_id, "actual_amount": actual_amount,
-            "user_sk": user_sk, "units": units, "attrs": attrs,
-        })
-
-    async def _cancel(request_id, user_sk):
-        events["cancel"].append({"request_id": request_id, "user_sk": user_sk})
-
-    async def _notify(task_id, url, payload):
+    async def _notify(task_id: str, url: str, payload: dict) -> None:
         events["notify"].append({"task_id": task_id, "url": url, "payload": payload})
 
-    async def _poll(task_id, delay):
-        events["poll"].append({"task_id": task_id, "delay": delay})
-
-    async def _resume_held(delay):
-        events["resume_held"].append({"delay": delay})
-
-    monkeypatch.setattr(q, "publish_submit", AsyncMock(side_effect=_submit))
-    monkeypatch.setattr(q, "publish_settle", AsyncMock(side_effect=_settle))
-    monkeypatch.setattr(q, "publish_cancel", AsyncMock(side_effect=_cancel))
+    monkeypatch.setattr(q, "publish_batch_submit", AsyncMock(side_effect=_batch_submit))
     monkeypatch.setattr(q, "publish_notify", AsyncMock(side_effect=_notify))
-    monkeypatch.setattr(q, "schedule_poll", AsyncMock(side_effect=_poll))
-    monkeypatch.setattr(q, "schedule_resume_held", AsyncMock(side_effect=_resume_held))
-    # polling.py / held.py 是 from-import 直接绑定名字，需同步打补丁
-    import app.services.held as held_mod
-    import app.services.polling as polling_mod
-
-    monkeypatch.setattr(polling_mod, "schedule_poll", AsyncMock(side_effect=_poll))
-    monkeypatch.setattr(held_mod, "schedule_poll", AsyncMock(side_effect=_poll))
-    monkeypatch.setattr(held_mod, "schedule_resume_held", AsyncMock(side_effect=_resume_held))
     return events
-
-
-# ---------------------------------------------------------------------------
-# 工厂 fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def key_lease_factory():
-    """KeyLease 工厂（含渠道覆盖与 setting.gateway 提取配置）。"""
-    from app.schemas import KeyLease
-
-    def _make(**overrides: Any) -> KeyLease:
-        kwargs: dict[str, Any] = {
-            "key_id": 7, "key_index": 0, "key": "sk-upstream-key",
-            "base_url": "http://upstream.test", "epoch": "a1b2c3d4",
-            "channel": {
-                "id": 7, "name": "upstream-a", "base_url": "http://upstream.test",
-                "setting": {},
-            },
-        }
-        kwargs.update(overrides)
-        return KeyLease(**kwargs)
-
-    return _make
-
-
-@pytest.fixture
-def route_factory():
-    """RouteConfig 工厂（MiniMax-H3 提取配置为默认形态）。"""
-    from app.schemas import RouteConfig
-
-    def _make(**overrides: Any) -> RouteConfig:
-        kwargs: dict[str, Any] = {
-            "biz": "minimax",
-            "upstream_base_url": "http://upstream.test",
-            "submit_path": "/v2/video_generation",
-            "probe_path": "/v2/query/video_generation/{upstream_task_id}",
-            "task_id_path": "task_id",
-            "status_path": "task.status",
-            "result_path": "task.content.url",
-            "error_path": "task.error",
-            "settle_usage_map": {"duration": "task.usage.output_seconds"},
-        }
-        kwargs.update(overrides)
-        return RouteConfig(**kwargs)
-
-    return _make

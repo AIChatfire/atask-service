@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>atask-service 控制台</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #fff; --border: #e3e2dd; --border-strong: #c9c8c1;
+    --text: #23231f; --muted: #6b6a64; --faint: #94938c;
+    --blue: #185fa5; --blue-bg: #e6f1fb;
+    --green: #0f6e56; --green-bg: #e1f5ee;
+    --red: #a32d2d; --red-bg: #fcebeb;
+    --amber: #854f0b; --amber-bg: #faeeda;
+    --gray-bg: #f1efe8;
+    --r: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  a { color: var(--blue); }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 24px 20px 64px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0; }
+  h2 { font-size: 14px; font-weight: 500; margin: 0 0 12px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .card { background: var(--surface); border: 1px solid var(--border);
+          border-radius: var(--r); padding: 16px; margin-bottom: 16px; }
+  .grid { display: grid; gap: 12px; }
+  .g4 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .kpi { background: var(--surface); border: 1px solid var(--border);
+         border-radius: var(--r); padding: 14px 16px; }
+  .kpi .label { font-size: 12px; color: var(--muted); }
+  .kpi .value { font-size: 24px; font-weight: 500; margin-top: 6px;
+                letter-spacing: -0.3px; }
+  .kpi .foot { font-size: 12px; color: var(--faint); margin-top: 2px; }
+  button { font: inherit; font-size: 13px; padding: 6px 12px; cursor: pointer;
+           background: var(--surface); color: var(--text);
+           border: 1px solid var(--border-strong); border-radius: 7px; }
+  button:hover { background: var(--gray-bg); }
+  button.primary { background: var(--text); color: #fff; border-color: var(--text); }
+  button.primary:hover { opacity: .88; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input, select { font: inherit; font-size: 13px; padding: 6px 9px; color: var(--text);
+                  background: var(--surface); border: 1px solid var(--border-strong);
+                  border-radius: 7px; min-width: 0; }
+  input:focus, select:focus { outline: 2px solid var(--blue-bg); border-color: var(--blue); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { font-weight: 500; color: var(--muted); font-size: 12px; background: var(--gray-bg); }
+  tbody tr:hover { background: #fafaf8; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 20px;
+         font-size: 12px; border: 1px solid transparent; white-space: nowrap; }
+  .t-SUCCESS  { background: var(--green-bg); color: var(--green); }
+  .t-FAILURE  { background: var(--red-bg);   color: var(--red); }
+  .t-CANCELED { background: var(--gray-bg);  color: var(--muted); }
+  .t-QUEUED, .t-IN_PROGRESS, .t-SUBMITTED, .t-HELD { background: var(--blue-bg); color: var(--blue); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tabs button[aria-selected="true"] { background: var(--text); color: #fff; border-color: var(--text); }
+  .panel[hidden] { display: none; }
+  .bar { height: 8px; border-radius: 4px; background: var(--gray-bg); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--blue); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); font-size: 12px; }
+  .err { background: var(--red-bg); color: var(--red); padding: 10px 12px;
+         border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .ok { background: var(--green-bg); color: var(--green); padding: 10px 12px;
+        border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .cfg { display: grid; grid-template-columns: 1fr auto; gap: 10px 14px; align-items: center; }
+  .cfg .name { font-size: 13px; }
+  .cfg .note { font-size: 12px; color: var(--faint); }
+  .cfg input { width: 220px; text-align: right; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
+         display: inline-block; }
+  dialog { border: 1px solid var(--border); border-radius: 12px; padding: 0;
+           max-width: 760px; width: 92vw; }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  .dlg-head { padding: 14px 18px; border-bottom: 1px solid var(--border);
+              display: flex; justify-content: space-between; align-items: center; }
+  .dlg-body { padding: 18px; max-height: 68vh; overflow: auto; }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 6px 14px; font-size: 13px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-all; }
+  .login { max-width: 380px; margin: 15vh auto; }
+</style>
+</head>
+<body>
+
+<div class="wrap" id="login" hidden>
+  <div class="card login">
+    <h2>atask-service 控制台</h2>
+    <p class="faint" style="margin-top:-6px">
+      需要管理令牌（<span class="mono">ADMIN_TOKEN</span>）。令牌只存本页会话
+      （sessionStorage），不写入地址栏。
+    </p>
+    <div id="loginErr"></div>
+    <div class="row">
+      <input type="password" id="keyInput" placeholder="管理令牌" style="flex:1"
+             autocomplete="current-password">
+      <button class="primary" id="loginBtn">进入</button>
+    </div>
+  </div>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <header>
+    <h1>atask-service</h1>
+    <span class="tag t-QUEUED mono" id="verTag">-</span>
+    <span style="flex:1"></span>
+    <button id="refreshBtn">刷新</button>
+    <button id="logoutBtn">退出</button>
+  </header>
+  <div class="sub mono" id="envLine">-</div>
+
+  <div id="banner"></div>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" data-tab="ov" aria-selected="true">概览</button>
+    <button role="tab" data-tab="tk" aria-selected="false">任务</button>
+    <button role="tab" data-tab="cf" aria-selected="false">配置</button>
+  </div>
+
+  <section class="panel" id="p-ov">
+    <div class="grid g4" id="kpis"></div>
+    <div class="card">
+      <h2>任务状态分布</h2>
+      <div id="statusDist"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-tk" hidden>
+    <div class="card">
+      <div class="row" style="margin-bottom:12px">
+        <select id="fStatus">
+          <option value="">全部状态</option>
+          <option>SUBMITTED</option><option>QUEUED</option><option>IN_PROGRESS</option>
+          <option>HELD</option><option>SUCCESS</option><option>FAILURE</option>
+          <option>CANCELED</option>
+        </select>
+        <input id="fModel" placeholder="模型" style="width:170px">
+        <input id="fTaskId" placeholder="完整 task_id（精确匹配）" style="width:240px">
+        <button class="primary" id="searchBtn">查询</button>
+        <span style="flex:1"></span>
+        <span class="faint" id="tkTotal"></span>
+      </div>
+      <div class="faint" style="margin:-6px 0 10px">
+        task_id 只做精确匹配，不支持前缀或片段搜索——通配会让索引失效、全表扫描
+        拖垮看板与生产库。
+      </div>
+      <div id="tkErr"></div>
+      <div style="overflow:auto;max-height:60vh">
+        <table>
+          <thead><tr>
+            <th>task_id</th><th>状态</th><th>模型</th><th>biz</th>
+            <th>失败原因</th><th class="num">耗时</th><th>创建</th>
+          </tr></thead>
+          <tbody id="tkBody"></tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="prevBtn">上一页</button>
+        <button id="nextBtn">下一页</button>
+        <span class="faint" id="pageInfo"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-cf" hidden>
+    <div class="card">
+      <div class="spread" style="margin-bottom:14px">
+        <div>
+          <h2 style="margin:0">运行时热配置</h2>
+          <div class="faint">
+            改动立即生效（Redis 覆盖 &gt; .env &gt; 默认），无需重启。
+            <span class="dot"></span> 表示该项已被覆盖。多副本部署时其余进程最多
+            5 秒后生效。校验失败会整批拒绝，不会出现半套生效。
+          </div>
+        </div>
+        <div class="row">
+          <button id="cfgReload">重新读取</button>
+          <button id="cfgResetAll">全部回落 .env</button>
+          <button class="primary" id="cfgSave">保存改动</button>
+        </div>
+      </div>
+      <div id="cfgErr"></div>
+      <div id="cfgGroups"></div>
+    </div>
+    <div class="card">
+      <h2>只读项（安全边界，不可在此修改）</h2>
+      <div class="faint" style="margin-bottom:10px">
+        这些项要改必须改 <span class="mono">.env</span> 并重启。开放它们等于把
+        安全防线（连接串 / 密钥 / 渠道准入 / 平台标识）挂到网上。
+      </div>
+      <table><tbody id="immutable"></tbody></table>
+    </div>
+  </section>
+</div>
+
+<dialog id="dlg">
+  <div class="dlg-head">
+    <strong class="mono" id="dlgTitle" style="font-weight:500"></strong>
+    <button onclick="document.getElementById('dlg').close()">关闭</button>
+  </div>
+  <div class="dlg-body"><dl class="kv" id="dlgBody"></dl></div>
+</dialog>
+
+<script>
+"use strict";
+const KEY_STORE = "atask_admin_key";
+const $ = (id) => document.getElementById(id);
+// sessionStorage 在无痕模式 / 沙箱 iframe / file:// 下访问会抛 SecurityError。
+// 裸调用会让整个脚本第一行就停止执行（页面全白）。故统一包 try/catch 降级。
+const store = {
+  get(k) { try { return sessionStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* 降级为仅本页有效 */ } },
+  del(k) { try { sessionStorage.removeItem(k); } catch { /* 同上 */ } },
+};
+let KEY = store.get(KEY_STORE);
+let offset = 0, limit = 50, lastTotal = 0, cfgDirty = {};
+const TERMINAL = ["SUCCESS", "FAILURE", "CANCELED"];
+
+// 所有插值一律过 esc()：后端字段（模型名、失败原因、task_id）可能含
+// <>&" 等字符，直接 innerHTML 拼接即 XSS。
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function ago(ts) {
+  if (!ts) return "-";
+  const d = Math.floor(Date.now() / 1000) - ts;
+  if (d < 60) return d + " 秒前";
+  if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+  if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+  return Math.floor(d / 86400) + " 天前";
+}
+function dur(s) { return s ? (s < 60 ? s + "s" : Math.floor(s / 60) + "m" + (s % 60) + "s") : "-"; }
+
+async function api(path, opts = {}) {
+  const res = await fetch("/admin/api" + path, {
+    ...opts,
+    headers: { "X-Admin-Token": KEY, "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  if (res.status === 401) { logout("管理令牌无效或已失效"); throw new Error("unauthorized"); }
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || data?.detail || ("HTTP " + res.status));
+  return data;
+}
+
+function banner(msg, kind) {
+  $("banner").innerHTML = msg ? `<div class="${kind || "err"}">${esc(msg)}</div>` : "";
+  if (msg) setTimeout(() => { $("banner").innerHTML = ""; }, 6000);
+}
+function logout(msg) {
+  KEY = ""; store.del(KEY_STORE);
+  $("app").hidden = true; $("login").hidden = false;
+  $("loginErr").innerHTML = msg ? `<div class="err">${esc(msg)}</div>` : "";
+}
+
+const kpi = (label, value, foot) => `
+  <div class="kpi"><div class="label">${esc(label)}</div>
+    <div class="value">${esc(value)}</div>
+    <div class="foot">${esc(foot)}</div></div>`;
+
+async function loadOverview() {
+  const d = await api("/overview?window=3600");
+  const s = d.service || {}, q = d.queue || {}, counts = d.tasks_by_status || {};
+  $("verTag").textContent = "v" + (s.version || "?");
+  $("envLine").textContent =
+    `env=${s.env}  platform=${s.platform}  key_group=${s.key_group}  配置覆盖=${s.override_count}`;
+  const active = (counts.QUEUED || 0) + (counts.IN_PROGRESS || 0) + (counts.SUBMITTED || 0);
+  $("kpis").innerHTML =
+    kpi("队列积压 (pending)", q.pending, "待执行的提交/结算/探测消息") +
+    kpi("延迟任务 (delayed)", q.delayed, "退避中的探测/重试") +
+    kpi("死信 (dlq)", q.dlq, "大于 0 需要人工介入") +
+    kpi("窗口内失败数", d.recent_failures === null ? "-" : d.recent_failures, "近 1 小时 FAILURE") +
+    kpi("当前在途", active, "SUBMITTED + QUEUED + IN_PROGRESS");
+  const max = Math.max(1, ...Object.values(counts));
+  const order = ["SUCCESS", "FAILURE", "IN_PROGRESS", "QUEUED", "SUBMITTED", "HELD", "CANCELED"];
+  const keys = order.filter((k) => counts[k]).concat(
+    Object.keys(counts).filter((k) => !order.includes(k)));
+  $("statusDist").innerHTML = keys.length ? keys.map((k) => `
+    <div style="margin-bottom:10px">
+      <div class="spread" style="font-size:13px;margin-bottom:4px">
+        <span class="tag t-${esc(k)}">${esc(k)}</span>
+        <span class="mono">${counts[k]}</span>
+      </div>
+      <div class="bar"><i style="width:${(counts[k] / max * 100).toFixed(1)}%"></i></div>
+    </div>`).join("") : '<div class="faint">暂无数据</div>';
+}
+
+async function loadTasks() {
+  const q = new URLSearchParams({ limit, offset });
+  if ($("fStatus").value) q.set("status", $("fStatus").value);
+  if ($("fModel").value.trim()) q.set("model", $("fModel").value.trim());
+  if ($("fTaskId").value.trim()) q.set("task_id", $("fTaskId").value.trim());
+  q.set("since", "604800");
+  $("tkErr").innerHTML = "";
+  let d;
+  try {
+    d = await api("/tasks?" + q);
+  } catch (e) {
+    if (e.message !== "unauthorized") $("tkErr").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    $("tkBody").innerHTML = '<tr><td colspan="7" class="faint">查询未执行</td></tr>';
+    $("tkTotal").textContent = ""; $("pageInfo").textContent = "";
+    return;
+  }
+  lastTotal = d.total || 0;
+  $("tkTotal").textContent = `共 ${lastTotal} 条`;
+  $("tkBody").innerHTML = (d.items && d.items.length) ? d.items.map((t) => `
+    <tr>
+      <td><a href="#" class="mono" data-tid="${esc(t.task_id)}"
+             style="text-decoration:none">${esc(String(t.task_id).slice(0, 24))}…</a></td>
+      <td><span class="tag t-${esc(t.status)}">${esc(t.status)}</span></td>
+      <td>${esc(t.model || "-")}</td>
+      <td class="mono faint">${esc(t.biz || "-")}</td>
+      <td class="faint">${esc(String(t.fail_reason || "").slice(0, 60) || "-")}</td>
+      <td class="num">${dur(t.duration)}</td>
+      <td class="faint">${ago(t.created_at)}</td>
+    </tr>`).join("") : '<tr><td colspan="7" class="faint">无匹配任务</td></tr>';
+  $("pageInfo").textContent = lastTotal ? `${offset + 1} – ${Math.min(offset + limit, lastTotal)}` : "";
+  $("prevBtn").disabled = offset === 0;
+  $("nextBtn").disabled = offset + limit >= lastTotal;
+  $("tkBody").querySelectorAll("a[data-tid]").forEach((a) =>
+    a.onclick = (e) => { e.preventDefault(); showTask(a.dataset.tid); });
+}
+
+async function showTask(id) {
+  const d = await api("/tasks/" + encodeURIComponent(id));
+  $("dlgTitle").textContent = d.task_id;
+  const data = d.data || {};
+  const session = d.token_session || {};
+  const rows = [
+    ["状态", `<span class="tag t-${esc(d.status)}">${esc(d.status)}</span>`],
+    ["模型", esc(data.model || "-")],
+    ["biz / source", esc((data.biz || "-") + " / " + (data.source || "-"))],
+    ["用户 / 渠道", esc(`${d.user_id} / ${d.channel_id}`)],
+    ["上游状态", esc(data.upstream_status || "-")],
+    ["冻结 / 已结算", esc(`${data.freeze_amount ?? 0} / ${data.settled_amount ?? 0}`)],
+    ["已结算", data.settled ? "是" : "否"],
+    ["失败原因", d.fail_reason ? `<div class="err" style="margin:0">${esc(d.fail_reason)}</div>` : "-"],
+    ["创建 / 更新", esc(`${ago(d.created_at)} / ${ago(d.updated_at)}`)],
+    ["令牌会话", session.exists
+      ? `存在，剩余 ${session.ttl_seconds}s（令牌本体不出 Redis）`
+      : "不存在（已清理或已过期）"],
+  ];
+  let html = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
+  if (!TERMINAL.includes(d.status)) {
+    html += `<dt>操作</dt><dd>
+      <button id="rq">重投探测</button>
+      <div class="faint" style="margin-top:6px">
+        只对非终态任务可用；仅重发探测消息，不改资金与结算状态。
+      </div></dd>`;
+  }
+  $("dlgBody").innerHTML = html;
+  const rq = $("rq");
+  if (rq) rq.onclick = async () => {
+    rq.disabled = true;
+    try {
+      await api(`/tasks/${encodeURIComponent(d.task_id)}/requeue`, { method: "POST" });
+      banner("已重投探测队列", "ok"); $("dlg").close(); loadTasks();
+    } catch (e) { banner(e.message); rq.disabled = false; }
+  };
+  $("dlg").showModal();
+}
+
+async function loadConfig() {
+  const d = await api("/config");
+  cfgDirty = {};
+  $("cfgGroups").innerHTML = d.groups.map((g) => `
+    <div style="margin-bottom:20px">
+      <div class="spread" style="border-bottom:1px solid var(--border);
+           padding-bottom:6px;margin-bottom:10px">
+        <strong style="font-weight:500;font-size:13px">${esc(g.name)}</strong>
+      </div>
+      <div class="cfg">
+        ${g.items.map((it) => `
+          <div>
+            <div class="name">${esc(it.label)}
+              ${it.overridden ? '<span class="dot" title="已覆盖"></span>' : ""}
+            </div>
+            <div class="note mono">${esc(it.key)}${it.note ? " · " + esc(it.note) : ""}</div>
+          </div>
+          <input class="mono" data-key="${esc(it.key)}" value="${esc(it.value)}"
+                 ${it.min !== null && it.min !== undefined ? `min="${esc(it.min)}"` : ""}
+                 ${it.max !== null && it.max !== undefined ? `max="${esc(it.max)}"` : ""}>
+        `).join("")}
+      </div>
+    </div>`).join("");
+  $("cfgGroups").querySelectorAll("[data-key]").forEach((el) => {
+    el.addEventListener("change", () => { cfgDirty[el.dataset.key] = el.value; });
+  });
+  $("immutable").innerHTML = d.immutable.map((i) =>
+    `<tr><td class="mono" style="width:230px">${esc(i.key)}</td>
+         <td class="faint">${esc(i.reason)}</td></tr>`).join("");
+}
+
+const LOADERS = { ov: loadOverview, tk: loadTasks, cf: loadConfig };
+let current = "ov";
+async function show(tab) {
+  current = tab;
+  document.querySelectorAll('[role="tab"]').forEach((b) =>
+    b.setAttribute("aria-selected", String(b.dataset.tab === tab)));
+  ["ov", "tk", "cf"].forEach((t) => { $("p-" + t).hidden = t !== tab; });
+  try { await LOADERS[tab](); } catch (e) { banner(e.message); }
+}
+
+document.querySelectorAll('[role="tab"]').forEach((b) => b.onclick = () => show(b.dataset.tab));
+$("refreshBtn").onclick = () => show(current);
+$("logoutBtn").onclick = () => logout("");
+$("searchBtn").onclick = () => { offset = 0; loadTasks().catch((e) => banner(e.message)); };
+$("prevBtn").onclick = () => { offset = Math.max(0, offset - limit); loadTasks(); };
+$("nextBtn").onclick = () => { if (offset + limit < lastTotal) { offset += limit; loadTasks(); } };
+$("fTaskId").addEventListener("keydown", (e) => { if (e.key === "Enter") $("searchBtn").click(); });
+
+$("cfgReload").onclick = () => loadConfig().catch((e) => banner(e.message));
+$("cfgSave").onclick = async () => {
+  if (!Object.keys(cfgDirty).length) { banner("没有改动", "ok"); return; }
+  $("cfgErr").innerHTML = "";
+  try {
+    await api("/config", { method: "PUT", body: JSON.stringify(cfgDirty) });
+    banner("配置已生效", "ok");
+    await loadConfig();
+  } catch (e) { $("cfgErr").innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+};
+$("cfgResetAll").onclick = async () => {
+  if (!confirm("清空所有运行时覆盖，全部回落 .env 与代码默认值？")) return;
+  try {
+    await api("/config/reset", { method: "POST", body: JSON.stringify(null) });
+    banner("已全部回落", "ok"); await loadConfig();
+  } catch (e) { banner(e.message); }
+};
+
+$("loginBtn").onclick = async () => {
+  const v = $("keyInput").value.trim();
+  if (!v) return;
+  KEY = v;
+  try {
+    await api("/overview?window=3600");
+    store.set(KEY_STORE, v);
+    $("login").hidden = true; $("app").hidden = false;
+    show("ov");
+  } catch (e) {
+    if ($("login").hidden) logout(e.message || "无法连接服务");
+    else $("loginErr").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+};
+$("keyInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
+
+(async () => {
+  if (!KEY) { $("login").hidden = false; return; }
+  try {
+    await api("/overview?window=3600");
+    $("app").hidden = false;
+    show("ov");
+  } catch (e) {
+    if ($("app").hidden && $("login").hidden) logout(e.message || "无法连接服务");
+  }
+})();
+</script>
+</body>
+</html>

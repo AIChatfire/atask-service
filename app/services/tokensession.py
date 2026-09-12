@@ -1,16 +1,16 @@
 """用户令牌会话：**task_id → 用户 sk- 令牌**的唯一查询处。
 
-为什么需要它：任务状态存在两条免鉴权观察路径——对外 GET 查询（task_id 即
-凭证）与 new-api 渠道侧轮询（不带用户 sk）——终态都在请求上下文之外异步
-到达，而终态 settle/cancel 必须携带**用户本人的 sk- 令牌**（billing 服务
-只认令牌身份，跨用户 403）。因此冻结成功后按 task_id 把令牌暂存进 Redis
-（TTL 48h），终态结算/解冻按 task_id 查询取用后立即清除。
+为什么需要它：中继链路的出站（提交 / 探测 / 取消）都发生在**请求上下文之外**——
+提交由 worker 执行、探测由后台 sweep 或后续 GET 触发——而每次出站都必须携带
+**用户本人的 sk- 令牌**（网关不做鉴权内省，令牌的有效性判定在上游）。所以受理
+成功后按 task_id 把令牌暂存进 Redis（TTL 48h），出站前按 task_id 取用，终态收口
+时立即清除。ADR-010 后网关零资金动作，本模块**不再服务于任何 billing 结算**。
 
 安全口径：令牌只放 Redis（AOF everysec），不落 tasks 表、不进日志、
-不出任何 HTTP 响应（ops 诊断端点只暴露存在性与 TTL，不见
-``app.routers.ops``）；Redis 丢失的最坏后果是 settle 无法执行——billing
-侧 freeze 有 TTL，过期由 billing sweeper 自动解冻，资金不会锁死
-（对账以 billing 台账为准）。
+不出任何 HTTP 响应（``session_info`` 诊断视图只暴露存在性与 TTL，见
+``app.routers.ops``）。Redis 丢失的最坏后果是「该任务再也无法探测/取消」——
+任务由客户端轮询或后台 sweep 在会话有效期内收敛；会话过期后任务停在原状态、
+不自愈（ADR-010 已登记为已知限制），绝不误判终态。
 """
 
 from __future__ import annotations

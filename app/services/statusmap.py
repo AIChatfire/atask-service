@@ -1,11 +1,11 @@
 """上游任务状态自动映射 → 内部状态（兼容 NewAPI tasks 状态枚举）。
 
-三级体系，优先级从高到低：
-  1. 路由配置里的显式 status_map（配置中心/YAML/Redis 均可下发，免发版扩展）
-  2. 内置字典全枚举（归一化后精确匹配，覆盖常见上游措辞）
-  3. 前缀猜测（归一化后前缀命中，应对没见过的新状态）
-未命中 → 返回 None 并日志告警（每进程每种状态只报一次），
-日志中收集到的未知状态先加到该 biz 的 status_map 应急，稳定后回流到本文件字典。
+两级体系，优先级从高到低：
+  1. 内置字典全枚举（归一化后精确匹配，覆盖常见上游措辞）
+  2. 前缀猜测（归一化后前缀命中，应对没见过的新状态）
+未命中 → 返回 None 并日志告警（每进程每种状态只报一次）。
+
+ADR-010 后渠道级 ``status_map`` 随 RouteConfig 一并放弃，映射只吃上游原话。
 
 归一化：小写、非字母数字折叠为下划线、剥离常见命名空间前缀
 （task_/job_/status_/state_/stage_/generation_/video_/result_），
@@ -21,7 +21,6 @@ from app.schemas import (
     IN_PROGRESS,
     QUEUED,
     SUCCESS,
-    RouteConfig,
 )
 
 # ---- 内置字典（归一化后的精确枚举）----
@@ -74,7 +73,7 @@ def _normalize(raw: str) -> str:
     return s
 
 
-def map_status(route: RouteConfig | None, raw: object) -> str | None:
+def map_status(raw: object) -> str | None:
     """上游原始状态 → 内部状态；未识别返回 None"""
     if raw is None:
         return None
@@ -82,25 +81,18 @@ def map_status(route: RouteConfig | None, raw: object) -> str | None:
     if not raw_str:
         return None
 
-    # 1) 显式配置（per-biz，配置中心可热更）
-    if route and route.status_map:
-        hit = route.status_map.get(raw_str) or route.status_map.get(raw_str.lower())
-        if hit:
-            return hit.upper()
-
     norm = _normalize(raw_str)
 
-    # 2) 内置字典精确枚举
+    # 1) 内置字典精确枚举
     if norm in _ENUM:
         return _ENUM[norm]
 
-    # 3) 前缀猜测
+    # 2) 前缀猜测
     for prefix, target in _PREFIX:
         if norm.startswith(prefix):
             return target
 
     if raw_str not in _seen_unknown:
         _seen_unknown.add(raw_str)
-        log.warning("unknown upstream status {!r} (biz={}) — 请加入 status_map 或内置字典",
-                    raw_str, route.biz if route else "?")
+        log.warning("unknown upstream status {!r} — 请加入内置字典", raw_str)
     return None

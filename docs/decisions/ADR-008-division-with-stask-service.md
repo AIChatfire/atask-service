@@ -1,0 +1,99 @@
+# ADR-008: 与 stask-service 的分工——不合并，但共用一张表、对齐工程外壳
+
+## Status: Accepted (2026-09-12)
+
+**分工表述已按本仓库 ADR-010 重写（2026-09-12）**：分工不再是「有无资金动作」
+（两边现在都零资金动作），而是「包哪种上游 + 占哪个 URL 前缀」。下文对比表与
+「不要合并」的理由据此更新；跨仓库编号独立、共用表 `platform` 隔离、「不合并」
+三条结论不变。
+
+## Background
+
+仓库里有两个网关：**atask-service**（本仓库）与 **stask-service**。两者都
+「复用 new-api tasks 表」，都跑 taskiq worker，命名相似，容易被当成重复
+建设。但它们解决的问题不同，合并会让两套语义互相污染。
+
+名称本身也在误导：`atask` 与 `stask` 不是「异步/同步」的字面分工，
+而是两条不同的**任务化（task-ification）**路径。
+
+## Decision
+
+**两个网关不是重复建设，也不要把两者合并。** 分工如下（按 ADR-010 重写）：
+
+| | stask-service | atask-service（本仓库） |
+|---|---|---|
+| 包哪种上游 | **同步** HTTP 接口（出图/TTS），加 `/async` 前缀即任务化 | **异步**任务型接口（视频生成等），再包一层统一受理 |
+| 对外前缀 | `/async/{path}`（nginx `location /async/`） | `/batch/{path}`（**必须避开 `/async/`**，它已归 stask） |
+| 上游形态 | 同步接口（一次调用出结果） | 异步任务（提交拿 task_id，再探测/回调取结果） |
+| 鉴权 | 用户 sk 直透上游，零内省 | 用户 token 原样透传上游，零内省 |
+| 计费 | 均下沉上游：零资金动作，配额在 new-api 原生 relay 内闭环 | 同左：零 freeze / settle / cancel（ADR-010 §3） |
+| 状态机 | `SUBMITTED → QUEUED → IN_PROGRESS → 终态`，无冻结/孤儿/HELD | 同一套枚举，无冻结/HELD；另有后台 sweep 收敛与可选用户回调 |
+| `tasks.platform` | `'stask'` | `'gateway'` |
+| 关键配置位 | `/async` 前缀白名单、upstream allowlist | `/batch` 路径准入 deny-list、upstream allowlist（零渠道配置） |
+
+一句话概括：**stask 把「本来同步的东西」变成任务，atask 把「本来就是任务
+的东西」统一收口**。
+
+### 共用 `tasks` 表的隔离
+
+两者共写一张表但 `platform` 不同，靠 platform 过滤互不可见
+（**atask-service ADR-001**）。stask 仓库的 `ADR-001` / `SPEC.md` 声称用
+`data.freeze_amount:0` + `settled:true` 让 atask sweeper 跳过——但
+atask sweeper 本来就按 `platform='gateway'` 过滤，**不依赖这两个键**；
+且 stask 当前代码并不写这两个键（详见 atask-service ADR-001 与
+`OPEN-DECISIONS.md`）。
+
+### 明确「不要合并」的三条理由
+
+1. **失败语义冲突**：stask 的失败分流是「5xx 保守关重试（stask ADR-002）」，
+   atask 的失败分流是「模糊失败留活重试」（ADR-010 三档，核心原则承自
+   ADR-005）。两套原则相反，合到一个进程里必须处处判断「现在是哪种上游」。
+2. **URL 前缀与分流冲突**：同域名下 nginx 按前缀分流——`/async/` 归 stask、
+   `/batch/` 归 atask，两个服务**不可能共用同一前缀**（ADR-010 §1）。前缀的
+   存在本身就是「这是两个服务」的契约：合并会让前缀失去分流意义，也把「同步
+   转异步」与「异步再网关」两种受理语义压进同一个入口，只能在运行时反复分叉。
+3. **上游形态冲突**：stask 包的是同步接口（调用即得结果，响应即终态），
+   atask 包的是异步任务接口（提交拿 task_id、再探测/回调取结果）。状态机与
+   收敛模型不同，合并会让「这条任务怎么推进、怎么判终态」变成运行时分支——
+   这正是最容易出错、也最难用测试覆盖的分叉。
+
+### 本轮的工程实践对齐方向（借鉴，不改造）
+
+两仓库已共用同一套工程外壳（`Makefile` 的 `check: lint type test` 门禁、
+ruff + mypy + pytest、CI docker-image）。本轮 atask 对齐的是 stask 的
+**决策记录纪律**：
+
+- 建立 `docs/decisions/` ADR 体系（本次交付）与 `OPEN-DECISIONS.md`
+  未决登记册；
+- 参照 stask ADR 的写作风格：写「为什么」而不是「是什么」，
+  记录被否决的替代方案、真实踩过的坑、上游源码事实、关键数字不可改的理由。
+
+**这不是把 atask 改造成 stask**：两服务仍各自独立演进。ADR-010 之后，atask
+在「上游寻址（`X-Upstream-Base-Url` + allowlist）」与「零资金动作」这两点上
+与 stask 采了同一组取舍——这是**有意的对齐**，不是合并：两套受理语义、两套失败
+分流、两个 URL 前缀仍保持分离。atask **不采用** stask 的 `/async` 前缀，理由
+不是「拒绝 stask 的做法」，而是**前缀必须区分以免 nginx 分流冲突**——`/async/`
+已归 stask，atask 另占 `/batch/`（ADR-010 §1）。
+
+## Consequences
+
+- 正面：两个网关各司其职，受理语义与失败分流互不污染。
+- 正面：共用 `tasks` 表使两者的看板/巡检经验可复用（platform 过滤下各自
+  独立）。
+- 正面：决策记录纪律统一后，跨仓库交叉引用有据可依（编号各自独立，
+  引用必带仓库名）。
+- 负面：两个服务都写 shared table，任何一方漏加 `platform` 过滤都是事故。
+  缓解：两仓库都以 `taskstore.py` 为唯一数据访问点。
+- 负面：两边 ADR 编号重叠（都有 ADR-001/006/008），阅读时易混淆。
+  缓解：本 ADR 与 `OPEN-DECISIONS.md` 开头都写明「独立系列，引用带仓库名」，
+  且两套 ADR 标题语义不同。
+- 负面：相似命名持续误导新人。缓解：本 ADR 用一张对照表把分工钉死。
+
+## Related ADRs
+
+- **atask-service ADR-010**（本决策分工表述的重写来源：`/batch` 前缀、零资金动作、鉴权下沉）
+- **atask-service ADR-001**（复用 tasks 表：platform 隔离细节）
+- **atask-service ADR-005**（模糊失败留活重试——已由 ADR-010 取代，但「留活」原则仍有效）
+- stask-service ADR-001 / ADR-002 / ADR-006 / ADR-008（另一仓库，编号独立）
+- `docs/stask-service-design.md`（stask 的 v1.1 设计）
+- `README.md`；`AGENTS.md`（红线）

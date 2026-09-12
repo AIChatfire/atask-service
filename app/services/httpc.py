@@ -1,28 +1,22 @@
-"""HTTP 客户端工厂：控制面（billing/keypool 两微服务）客户端按需挂 Logfire 埋点。
-数据面（上游提交/探测）客户端不走这里 —— 探测调用高频，全量 trace 无意义，
-状态变化由 statelog 负责记录。
+"""HTTP 客户端工厂：按构造参数缓存进程级共享客户端（连接池 keep-alive 复用）。
 
-控制面客户端一律走 ``shared_client``（进程级连接池复用）：每次调用新建
-AsyncClient 会让每个请求都付出完整 TCP + TLS 握手（无 keep-alive），
-preflight 一次提交就有 inspect/lease/freeze 三个控制面调用，握手开销会
-叠加成提交链路的主要延迟来源之一。
+中继链路出站（``app.services.relay``）走 ``shared_client``：每次请求新建
+``AsyncClient`` 都要重付一轮 TCP + TLS 握手（无 keep-alive），数据面热路径上
+握手开销会直接叠加到提交延迟。调用方不得 aclose() 返回值；进程退出由
+``close_all()``（lifespan）统一释放。新建客户端默认挂 Logfire 埋点
+（``app.observability`` 单点）。
 """
 
 import httpx
 
-from app.config import settings
+from app import observability
 from app.logging import log
 
 
 def new_client(**kwargs) -> httpx.AsyncClient:
+    """新建客户端并按需挂 Logfire 埋点（委托 ``app.observability`` 单点）。"""
     client = httpx.AsyncClient(**kwargs)
-    if settings.logfire_enabled:
-        try:
-            import logfire
-
-            logfire.instrument_httpx(client)
-        except Exception:
-            pass
+    observability.instrument_httpx(client)
     return client
 
 

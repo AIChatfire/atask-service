@@ -12,8 +12,6 @@ from sqlalchemy import CursorResult, bindparam, text
 
 from app.config import settings
 from app.db import get_session_factory
-from app.logging import log
-from app.redis import K_TIDX, r
 from app.schemas import ACTIVE, TERMINAL
 
 
@@ -34,10 +32,10 @@ _TIME_COLUMNS = ("submit_time", "start_time", "finish_time", "created_at", "upda
 def _secs(column: str) -> str:
     """SQL 侧时间列归一表达式（毫秒 → 秒）。
 
-    读侧的 Python 归一救不了**在 SQL 里做的比较**（stale/孤儿/HELD 判死/
-    对账窗口全是 `col < :cutoff`）：cutoff 恒为秒，列里混进毫秒值会让判定
-    彻底失真——毫秒行永远躲过判死，而秒行一旦被拿去与毫秒口径比较就会被
-    瞬间判死（"任务秒失败"）。所有时间比较统一套这个表达式，口径只有一种。
+    读侧的 Python 归一救不了**在 SQL 里做的比较**（stale 判定/检索窗口全是
+    `col < :cutoff`）：cutoff 恒为秒，列里混进毫秒值会让判定彻底失真——毫秒行
+    永远躲过判定，而秒行一旦被拿去与毫秒口径比较就会被瞬间误判。所有时间比较
+    统一套这个表达式，口径只有一种。
     """
     return f"IF({column} > {_UNIX_MS_THRESHOLD}, {column} DIV 1000, {column})"
 
@@ -51,6 +49,16 @@ def as_unix_seconds(value: Any) -> int:
     if ts > _UNIX_MS_THRESHOLD:
         ts //= 1000
     return ts
+
+
+def duration_seconds(task: dict) -> int:
+    """耗时 = 终态时间 - 创建时间（统一秒）。终态时间缺失（非终态/为 0）或
+    字段异常时返回 0——绝不产出天文数字。"""
+    finish = as_unix_seconds(task.get("finish_time"))
+    created = as_unix_seconds(task.get("created_at"))
+    if not finish or not created:
+        return 0
+    return max(0, finish - created)
 
 
 async def create(
@@ -112,46 +120,6 @@ async def get(task_id: str) -> dict | None:
     return _row_to_dict(row)
 
 
-async def get_by_upstream_id(upstream_task_id: str) -> dict | None:
-    """按上游任务 id 反查本地任务（客户端持上游 id 轮询的兼容入口；
-    权威 id 仍是本地 task_id，data.upstream_task_id 为两者的关联点）。
-
-    先查 Redis 反查索引（``gw:tidx:*``，回填 upstream_task_id 时写入）——
-    ``data ->> '$.upstream_task_id'`` 无索引（零建表红线，不能加虚拟列），
-    SQL 兜底是全表扫描，表大后必须靠索引挡住热路径。"""
-    try:
-        local_id = await r.get(K_TIDX.format(upstream_task_id=upstream_task_id))
-        if local_id:
-            task = await get(str(local_id))
-            if task and str((task.get("data") or {}).get("upstream_task_id")) \
-                    == upstream_task_id:
-                return task     # 命中且校验一致（防索引指向被复用/脏数据）
-    except Exception:
-        log.opt(exception=True).debug("tidx lookup failed, falling back to SQL")
-    async with get_session_factory()() as db:
-        row = (
-            await db.execute(
-                text(
-                    """
-                    SELECT * FROM tasks
-                    WHERE platform = :p AND data ->> '$.upstream_task_id' = :u
-                    ORDER BY id DESC LIMIT 1
-                    """
-                ),
-                {"p": settings.gateway_platform, "u": upstream_task_id},
-            )
-        ).mappings().first()
-    if not row:
-        return None
-    task = _row_to_dict(row)
-    try:    # SQL 兜底命中：回写索引（下次直达），失败不影响返回
-        await r.set(K_TIDX.format(upstream_task_id=upstream_task_id),
-                    task["task_id"], ex=settings.upstream_index_ttl_seconds)
-    except Exception:
-        pass
-    return task
-
-
 async def cas(
     task_id: str,
     from_statuses: tuple[str, ...],
@@ -201,19 +169,12 @@ async def cas(
         return res.rowcount == 1
 
 
-async def patch_data(task_id: str, patch: dict, status: str | None = None,
-                     channel_id: int | None = None) -> None:
-    """非迁移性的数据合并（如回填 upstream_task_id）；可选顺带更新状态列。
-    ``channel_id``：提交重打落到别的渠道时同步对账口径列。
-
-    补丁含 ``upstream_task_id`` 时顺带维护 Redis 反查索引（上游 id → 本地
-    id，TTL ``GW_UPSTREAM_INDEX_TTL_SECONDS``）——覆盖 submit/held 恢复/
-    proxy 回填三个写入点，get_by_upstream_id 靠它免全表扫描。"""
+async def patch_data(task_id: str, patch: dict, status: str | None = None) -> None:
+    """非迁移性的数据合并（如回填 ``upstream_task_id``）；可选顺带更新状态列。"""
     set_status = "status = :status, " if status else ""
-    set_channel = "channel_id = :channel_id, " if channel_id else ""
     sql = f"""
         UPDATE tasks
-        SET {set_status}{set_channel}updated_at = :now,
+        SET {set_status}updated_at = :now,
             data = JSON_MERGE_PATCH(COALESCE(data, JSON_OBJECT()), CAST(:patch AS JSON))
         WHERE task_id = :tid
     """
@@ -224,43 +185,60 @@ async def patch_data(task_id: str, patch: dict, status: str | None = None,
     }
     if status:
         params["status"] = status
-    if channel_id:
-        params["channel_id"] = channel_id
     async with get_session_factory()() as db:
         await db.execute(text(sql), params)
         await db.commit()
-    upstream_task_id = str(patch.get("upstream_task_id") or "")
-    if upstream_task_id:
-        try:
-            await r.set(K_TIDX.format(upstream_task_id=upstream_task_id),
-                        task_id, ex=settings.upstream_index_ttl_seconds)
-        except Exception:
-            log.opt(exception=True).debug("tidx write failed (SQL fallback covers)")
 
 
-async def mark_settled(task_id: str, amount: float) -> None:
-    await patch_data(task_id, {"settled": True, "settled_amount": amount})
+async def stale_batch_active(stale_seconds: int, limit: int = 50) -> list[dict]:
+    """``/batch`` 中继链路的收敛候选：``data.source='batch'`` 且**非终态**、
+    最后更新时间超过 ``stale_seconds`` 的任务行（ADR-010 后台收敛）。
 
+    返回的是**探测/终态收口所需的字段投影**，供 ``relayflow.sweep_batch_once``
+    使用。
 
-async def stale_active(stale_seconds: int, limit: int = 200) -> list[str]:
-    """Sweeper：非终态且长时间未更新的任务（HELD 除外——挂起由 resume 排空与
-    hold_max_age 判死两条专用路径处理，探测重投对它无意义）"""
+    纪律（照 ``search_tasks``，每条都有原因）：
+    - **绝不 ``SELECT data``**——``data`` 含 ``token_hash`` 与 ``request_body``
+      全文，整列捞出会把用户令牌暴露给调用栈；逐字段 ``data ->> '$.xxx'`` 投影；
+    - **不带 ``WHERE token_hash``**——按 token_hash 过滤需要先知道值，而它正是
+      投影出来的字段，语义上只能取回后在 Python 侧使用；
+    - 时间比较走 ``_secs('updated_at')``——tasks 是共享表，混入的毫秒写入方
+      会让裸比较失真（毫秒行永远躲过 stale 判定），见 ADR-004；
+    - **排序 ``ASC``（最旧优先）**——收敛扫描的语义是「先把最老的收掉」：这些
+      最老的任务最可能已在上游成功、只差没有客户端回来轮询。用 DESC + limit
+      会让最旧的一批长期排在批次尾部、永远轮不到探测（饿死）；
+    - 过滤掉没有 ``upstream_task_id`` 的行：这类任务无上游可问，sweep 无法推进，
+      留在结果里会长期占据有限批次，其补投由 ``submit_batch_task`` 的
+      重试/DLQ 路径负责。
+    """
     cutoff = _now() - stale_seconds
+    lim = max(1, min(int(limit), 200))
     async with get_session_factory()() as db:
         rows = (
             await db.execute(
                 text(
                     f"""
-                    SELECT task_id FROM tasks
-                    WHERE platform = :p AND status IN :acts AND status <> 'HELD'
+                    SELECT task_id, status,
+                           data ->> '$.upstream_base_url' AS upstream_base_url,
+                           data ->> '$.request_path' AS request_path,
+                           data ->> '$.upstream_task_id' AS upstream_task_id,
+                           data ->> '$.callback_url' AS callback_url,
+                           data ->> '$.token_hash' AS token_hash,
+                           data ->> '$.source' AS source
+                    FROM tasks
+                    WHERE platform = :p AND data ->> '$.source' = 'batch'
+                      AND status IN :acts
+                      AND COALESCE(data ->> '$.upstream_task_id', '') <> ''
                       AND {_secs('updated_at')} < :cutoff
+                    ORDER BY {_secs('updated_at')} ASC
                     LIMIT :lim
                     """
                 ).bindparams(bindparam("acts", expanding=True)),
-                {"p": settings.gateway_platform, "acts": ACTIVE, "cutoff": cutoff, "lim": limit},
+                {"p": settings.gateway_platform, "acts": ACTIVE,
+                 "cutoff": cutoff, "lim": lim},
             )
-        ).scalars().all()
-    return list(rows)
+        ).mappings().all()
+    return [dict(row) for row in rows]
 
 
 async def counts_by_status() -> dict[str, int]:
@@ -277,179 +255,72 @@ async def counts_by_status() -> dict[str, int]:
     return {row[0]: row[1] for row in rows}
 
 
-async def active_counts_by_token() -> dict[str, int]:
-    """活跃任务数按 token_hash 分布（并发槽校准的事实源）。
+# ---------------------------------------------------------------------------
+# 管理面检索（app/routers/admin.py 的列表端点后端）
+# ---------------------------------------------------------------------------
 
-    HELD 不计——挂起任务的槽已在转 HELD 时释放（resume 重占），
-    与 conc_acquire/release 的占用口径保持一致。"""
+#: ``search_tasks`` 的列投影白名单。**绝不 ``SELECT data`` 整列**——``data`` 里
+#: 含 ``token_hash`` 与 ``request_body`` 全文，管理面把它透出等于经看板泄露用户
+#: 令牌（本项目红线）。只按名取白名单字段。
+_SEARCH_COLUMNS = (
+    "task_id, status, progress, action, channel_id, user_id, "
+    f"{_secs('created_at')} AS created_at, "
+    f"{_secs('finish_time')} AS finish_time, "
+    f"{_secs('updated_at')} AS updated_at, "
+    "data ->> '$.model' AS model, "
+    "data ->> '$.biz' AS biz, "
+    "data ->> '$.source' AS source, "
+    "data ->> '$.result' AS result, "
+    "data ->> '$.freeze_amount' AS freeze_amount, "
+    "data ->> '$.settled' AS settled"
+)
+
+
+async def search_tasks(status: str = "", model: str = "", task_id: str = "",
+                       since_seconds: int = 0, limit: int = 50,
+                       offset: int = 0) -> tuple[list[dict], int]:
+    """管理面任务检索：分页 + 精确筛选，只返回白名单列。返回 ``(items, total)``。
+
+    纪律（每条都有原因，别省）：
+    - ``platform = :p`` 恒带——tasks 是与 new-api 共享的表，不带会读到别人的行；
+    - ``task_id`` **精确匹配**，绝不前缀/通配——``LIKE '%...'`` 会让 task_id
+      索引失效退化成全表扫描，把看板查询变成生产库的负载源；
+    - ``model`` 走 ``data ->> '$.model'`` 等值；
+    - 排序用 ``_secs('created_at')``——共享表可能混入毫秒时间戳，直接排会让
+      毫秒行错位（见 ``_secs`` 的 docstring）；
+    - items 与 total **共用同一份 where 与 params**，保证分页计数一致；
+    - ``limit`` 钳到 1..200、``offset`` 非负。
+    """
+    where = ["platform = :p"]
+    params: dict[str, Any] = {"p": settings.gateway_platform}
+    if status:
+        where.append("status = :status")
+        params["status"] = status
+    if task_id:
+        where.append("task_id = :task_id")
+        params["task_id"] = task_id
+    if model:
+        where.append("data ->> '$.model' = :model")
+        params["model"] = model
+    if since_seconds:
+        where.append(f"{_secs('created_at')} >= :since")
+        params["since"] = _now() - int(since_seconds)
+    clause = " AND ".join(where)
+
+    lim = max(1, min(int(limit), 200))
+    off = max(0, int(offset))
+
     async with get_session_factory()() as db:
+        total = int((await db.execute(
+            text(f"SELECT COUNT(*) FROM tasks WHERE {clause}"), params
+        )).scalar() or 0)
         rows = (
             await db.execute(
                 text(
-                    """
-                    SELECT data ->> '$.token_hash' AS th, COUNT(*) AS n FROM tasks
-                    WHERE platform = :p AND status IN :acts AND status <> 'HELD'
-                      AND COALESCE(data ->> '$.token_hash', '') <> ''
-                    GROUP BY th
-                    """
-                ).bindparams(bindparam("acts", expanding=True)),
-                {"p": settings.gateway_platform, "acts": ACTIVE},
-            )
-        ).all()
-    return {str(row[0]): int(row[1]) for row in rows}
-
-
-async def terminal_unsettled(limit: int = 200) -> list[dict]:
-    """Sweeper：终态但结算标记未落的任务（事件丢失的兜底重发）"""
-    async with get_session_factory()() as db:
-        rows = (
-            await db.execute(
-                text(
-                    """
-                    SELECT task_id, status, data FROM tasks
-                    WHERE platform = :p AND status IN :terms
-                      AND COALESCE(data ->> '$.settled', 'false') <> 'true'
-                    LIMIT :lim
-                    """
-                ).bindparams(bindparam("terms", expanding=True)),
-                {"p": settings.gateway_platform, "terms": TERMINAL, "lim": limit},
+                    f"SELECT {_SEARCH_COLUMNS} FROM tasks WHERE {clause} "
+                    f"ORDER BY {_secs('created_at')} DESC LIMIT :lim OFFSET :off"
+                ),
+                {**params, "lim": lim, "off": off},
             )
         ).mappings().all()
-    out = []
-    for row in rows:
-        item = dict(row)
-        if isinstance(item.get("data"), str):
-            item["data"] = json.loads(item["data"])
-        out.append(item)
-    return out
-
-
-async def orphan_active(older_than_seconds: int, limit: int = 50) -> list[str]:
-    """孤儿任务：非终态但长时间没有 upstream_task_id（submit 前崩溃的残留，
-    永远不会有上游任务，冻结必须由 sweeper 收口解冻）。
-    HELD 除外——挂起任务设计上就没有 upstream_task_id，由 hold_max_age 判死。"""
-    cutoff = _now() - older_than_seconds
-    async with get_session_factory()() as db:
-        rows = (
-            await db.execute(
-                text(
-                    f"""
-                    SELECT task_id FROM tasks
-                    WHERE platform = :p AND status IN :acts AND status <> 'HELD'
-                      AND COALESCE(data ->> '$.upstream_task_id', '') = ''
-                      AND {_secs('created_at')} < :cutoff
-                    LIMIT :lim
-                    """
-                ).bindparams(bindparam("acts", expanding=True)),
-                {"p": settings.gateway_platform, "acts": ACTIVE, "cutoff": cutoff, "lim": limit},
-            )
-        ).scalars().all()
-    return list(rows)
-
-
-async def oldest_held() -> str | None:
-    """最老一个 HELD 任务（金丝雀排空每次只试一只）。"""
-    async with get_session_factory()() as db:
-        row = (
-            await db.execute(
-                text(
-                    f"""
-                    SELECT task_id FROM tasks
-                    WHERE platform = :p AND status = 'HELD'
-                    ORDER BY {_secs('created_at')} LIMIT 1
-                    """
-                ),
-                {"p": settings.gateway_platform},
-            )
-        ).scalars().first()
-    return row
-
-
-async def held_expired(max_age_seconds: int, rate_limited_max_age_seconds: int = 3600,
-                       limit: int = 100) -> list[str]:
-    """挂起超上限的 HELD 任务（hold_max_age 判死：续期也救不回的挂起收口）。
-    限流挂起（held_reason=rate_limited）用独立的更短上限（默认 1h）。"""
-    cutoff = _now() - max_age_seconds
-    cutoff_rl = _now() - rate_limited_max_age_seconds
-    async with get_session_factory()() as db:
-        rows = (
-            await db.execute(
-                text(
-                    f"""
-                    SELECT task_id FROM tasks
-                    WHERE platform = :p AND status = 'HELD' AND {_secs('updated_at')} <
-                        CASE WHEN COALESCE(data ->> '$.held_reason', '') = 'rate_limited'
-                             THEN :cutoff_rl ELSE :cutoff END
-                    LIMIT :lim
-                    """
-                ),
-                {"p": settings.gateway_platform, "cutoff": cutoff,
-                 "cutoff_rl": cutoff_rl, "lim": limit},
-            )
-        ).scalars().all()
-    return list(rows)
-
-
-async def expiring_freezes(margin_seconds: int, limit: int = 100) -> list[dict]:
-    """冻结临期的非终态任务（sweep 续期扫描）：freeze_expires_at 距今不足
-    margin 且未结算。freeze_expires_at=0（免费/旧数据）不参与。"""
-    deadline = _now() + margin_seconds
-    async with get_session_factory()() as db:
-        rows = (
-            await db.execute(
-                text(
-                    """
-                    SELECT task_id, data FROM tasks
-                    WHERE platform = :p AND status IN :acts
-                      AND CAST(COALESCE(data ->> '$.freeze_expires_at', '0') AS UNSIGNED)
-                          BETWEEN 1 AND :deadline
-                      AND COALESCE(data ->> '$.settled', 'false') <> 'true'
-                    LIMIT :lim
-                    """
-                ).bindparams(bindparam("acts", expanding=True)),
-                {"p": settings.gateway_platform, "acts": ACTIVE,
-                 "deadline": deadline, "lim": limit},
-            )
-        ).mappings().all()
-    out = []
-    for row in rows:
-        item = dict(row)
-        if isinstance(item.get("data"), str):
-            item["data"] = json.loads(item["data"])
-        out.append(item)
-    return out
-
-
-async def reconcile_candidates(window_seconds: int, recheck_seconds: int,
-                               limit: int = 20) -> list[dict]:
-    """反向对账候选：本地 FAILURE 且已退款、有 upstream_task_id、窗口期内完成、
-    距上次核对超过 recheck 周期的任务（比对"上游其实成功了"的亏损面）。"""
-    since = _now() - window_seconds
-    recheck_before = _now() - recheck_seconds
-    async with get_session_factory()() as db:
-        rows = (
-            await db.execute(
-                text(
-                    f"""
-                    SELECT task_id, data FROM tasks
-                    WHERE platform = :p AND status = 'FAILURE'
-                      AND COALESCE(data ->> '$.settled', 'false') = 'true'
-                      AND COALESCE(data ->> '$.reconciled', 'false') <> 'true'
-                      AND COALESCE(data ->> '$.upstream_task_id', '') <> ''
-                      AND {_secs('finish_time')} > :since
-                      AND CAST(COALESCE(data ->> '$.reconcile_checked_at', '0') AS UNSIGNED)
-                          < :recheck
-                    LIMIT :lim
-                    """
-                ),
-                {"p": settings.gateway_platform, "since": since,
-                 "recheck": recheck_before, "lim": limit},
-            )
-        ).mappings().all()
-    out = []
-    for row in rows:
-        item = dict(row)
-        if isinstance(item.get("data"), str):
-            item["data"] = json.loads(item["data"])
-        out.append(item)
-    return out
+    return [dict(row) for row in rows], total
