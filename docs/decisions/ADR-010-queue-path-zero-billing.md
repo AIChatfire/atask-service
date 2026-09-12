@@ -104,7 +104,8 @@ nginx 在同一域名下做两件事：① **按路径分流**——同步类上
 1. **nginx**：`location /batch/` 改为 `location /queue/`（宝塔面板代管，不在本仓库）；
 2. **stask-service**：`ST_ASYNC_DENY_PREFIXES` 里硬拒的 `/batch/` 改为 `/async/`（否则
    atask 的新前缀可能被 stask 抢路由或反之）；
-3. **客户端**：调用路径改打 `/queue/{上游原生路径}`。存量 `batch_*` 任务行与
+3. **客户端**：调用路径改打 `/async/{上游原生路径}`（**对外前缀**；网关自身端点是
+   `/queue/...`，由 nginx 重写。原文此处写 `/queue` 是笔误，2026-09-13 按用户裁决订正）。存量 `batch_*` 任务行与
    `source='batch'` 行按「不迁移」处置（在途任务由运维按需 `DELETE`，同 ADR-001 对旧
    `platform` 行的立场）。
 
