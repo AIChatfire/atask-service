@@ -522,8 +522,13 @@ def test_local_private_dirs_are_not_tracked():
         "所以它们一旦入库不会被任何门禁拦住：\n  " + "\n  ".join(tracked)
     )
     for entry in _LOCAL_PRIVATE_DIRS:
+        # 问 `{entry}/`（带尾斜杠）而不是裸名：**在「该目录不存在」的检出里**
+        # （CI 正是这种情形——它被忽略所以从不被检出）裸路径既非文件也非目录，
+        # dir-only 模式匹配不上，`check-ignore` 会返回 1，于是门禁在本地绿、
+        # 在 CI 红（实测踩过）。带尾斜杠等于声明「这是个目录」，两种情形都成立；
+        # 且它对「不带尾斜杠」的忽略模式同样命中，写法无关。
         ignored = subprocess.run(
-            ["git", "check-ignore", "-q", entry], cwd=ROOT, capture_output=True
+            ["git", "check-ignore", "-q", f"{entry}/"], cwd=ROOT, capture_output=True
         )
         assert ignored.returncode == 0, (
             f"{entry} 未被 .gitignore 覆盖——下一次 `git add -A` 会把它整个提交上去"

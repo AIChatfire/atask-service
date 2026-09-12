@@ -17,5 +17,7 @@ build/
 #   注意 tests/test_static_gates.py 的凭据门禁**按设计跳过这个目录**（否则会天天报
 #   自己的笔记），所以「它被提交」不会有任何门禁来拦——只能靠这条忽略规则 +
 #   另一条门禁（test_local_private_dirs_are_not_tracked）双重兜住。
-.workbuddy/
-.idea/
+# 写成**不带尾斜杠**的形式：`dir/` 是 dir-only 模式，在「该目录尚不存在」的检出里
+# （CI 就是这种情况，它被忽略所以从不被检出）匹配不上裸路径；不带斜杠则两种情形都命中。
+.workbuddy
+.idea
