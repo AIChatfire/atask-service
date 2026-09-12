@@ -1,7 +1,7 @@
 # Spec — atask-service v2.0（规格即契约）
 
 > 生成日期：2026-09-12
-> 依据：当前实现（`app/`）+ **本仓库 ADR-010**（对外形态统一为 `/queue/{上游路径}`，鉴权与计费全部下沉上游）+ `AGENTS.md` + `README.md`
+> 依据：当前实现（`app/`）+ **本仓库 ADR-010**（对外统一 `/async`、网关自身端点为 `/queue/{上游路径}`，鉴权与计费全部下沉上游）+ `AGENTS.md` + `README.md`
 > 状态：已确认（本版按 ADR-010 整篇重写；ADR-010 取代**本仓库 ADR-002 / ADR-005 / ADR-006 / ADR-007**，并重写**本仓库 ADR-008** 的分工表述）
 > 文档版本 v2.0；包版本以 `pyproject.toml` 为准（当前 0.2.0）
 
@@ -113,7 +113,7 @@
 `healthz → ops → admin → /queue/{path:path}`。
 通配 `queue_task_router` 永远最后；`/ops/*` 与 `/admin/*` 必须先于通配，否则会被当成 `path` 吞掉（AC-40，`tests/test_static_gates.py::test_router_mount_order`）。
 
-### 5.1 对外唯一形态：`/queue/{path:path}`
+### 5.1 网关自身端点唯一形态：`/queue/{path:path}`（对外由 nginx 暴露为 `/async/{path}`）
 
 `{path}` 是**上游原生路径**（如 new-api 视频生成 `v1/tasks`）。**`{biz}` 段已从 URL 移除**。
 同一路径按**方法 + 末段是否为本地 task_id** 分派：
@@ -525,12 +525,13 @@ curl -s -X POST http://127.0.0.1:8000/queue/v1/tasks \
 
 | 日期 | 变更 | 原因 | 影响范围 |
 |---|---|---|---|
-| 2026-09-12 | Spec v2.0 按 **本仓库 ADR-010** 整篇重写 | 架构换向：对外形态统一为 `/batch/{上游路径}`（该前缀于 2026-09-13 改名为 `/queue`，见下行），鉴权与计费全部下沉上游；旧版 Spec 描述的 keypool + 计费 + `/{biz}` 路由架构已整体删除 | 全量 |
+| 2026-09-12 | Spec v2.0 按 **本仓库 ADR-010** 整篇重写 | 架构换向：对外形态统一为 `/batch/{上游路径}`（该前缀于 2026-09-13 改为**对外 `/async`、网关自身端点 `/queue`**，见下行），鉴权与计费全部下沉上游；旧版 Spec 描述的 keypool + 计费 + `/{biz}` 路由架构已整体删除 | 全量 |
 | 2026-09-12 | 验收标准重编号（AC-01 ~ AC-43） | 五级失败分流降为三档；移除 HELD / 冻结 / 租约 / 对账类 AC，新增 `/batch` 受理-探测-取消-收敛类 AC | §9 |
 | 2026-09-12 | §11 改为 ADR-010「已知限制」5 条 + 稳定坑 | 旧版未决项登记已随被取代的 ADR 失效；已知限制须写进运维文档 | §11 |
 | 2026-09-13 | 定位口径修订：**两个服务都是任务队列服务**；atask 侧明确为**排队异步**（**上游异步 → 本地异步**：本地 task_id、入队排队、后台推进到终态），stask 侧为**同步接口任务化**（同产本地异步）；「异步 / 同步」是**当前准入的任务类型**而非转换方向 | 原文「异步转异步 / 同步转异步」的提法会被读成「谁转谁」，与本服务实际身份不符（用户指正） | §1（产品定义）、§14（与 stask 的分工） |
 | 2026-09-13 | 新增提交回填的 **CAS 守卫**（在飞取消不复活终态） | 竞态缺陷：上游提交在飞期间取消 → 裸回填把 `CANCELED` 复活成 `QUEUED`（`QUEUED + progress=100% + finish_time 已写`），随后 sweep 会给已取消的任务投「成功」回调；旧链路 KI-D 修过同一问题，ADR-010 重写时丢失守卫 | §2（提交链路）、§9（AC-16）、`relayflow.submit_queue_task` |
 | 2026-09-13 | **路由前缀 `/batch` → `/async`**，概念词根一次改净（env `QUEUE_*`、Redis `atask:queue_sweep_lock`、taskiq `queue_*`、task_id 前缀 `queue_`、`data.source='queue'`） | 命名对齐定位：本服务是任务队列、做的是排队异步，`batch` 是换向前的遗留词；用户定调「命名优先于兼容性」 | §2（对外形态）、全量文档；**需仓库外同步**：nginx、stask deny-list、客户端 |
+| 2026-09-13 | **对外前缀口径正式统一为 `/async`**（本服务自身端点为 `/queue`）——用户裁决，据此关闭 `OPEN-DECISIONS` 的 `external-prefix-doc-drift` | 本表此前有两行对同一次改名给出不同终态（一行写「改为 `/queue`」、一行写「改为 `/async`」），按文档部署的人会被引向错误前缀 | §5.1 标题、本表上行、`AGENTS.md`、`overview.md`、`docs/decisions/OPEN-DECISIONS.md` |
 | 2026-09-13 | **Redis 键前缀 `gw:` → `atask:`**，并收敛到 `app/redis.py::KEY_PREFIX` 单一构造点（`queue.py` / `dynconf.py` / `tokensession.py` 不再各自拼前缀） | `gw:`（gateway）是换向前的遗留缩写：`GW_` 环境变量前缀早已移除、渠道分组概念也随 ADR-010 退场，「gateway」在本仓库已无对应实体；改后与 `GATEWAY_PLATFORM='atask'` 及同族 stask 的 `REDIS_KEY_PREFIX`（默认 `st`）一致 | 全仓键名、全量文档；**部署影响**：见 §10（队列键一并改名，切换前必须排空队列） |
 | 2026-09-13 | 新增**攒批放行**：`BATCH_*` 配置项、`X-Batch-Size` / `X-Batch-Wait` / `X-Batch-Key` 三个头、`data.batch_*` 与 `data.slot_flags` 字段、`GET /ops/batches`、`app/services/batching.py` | 削掉提交突发、成组推进，对齐同族 stask-service 的既有能力；**等待期不占并发槽**故攒批路径受理不再 429（改为排队），这是唯一的行为变更。决策见 `docs/decisions/ADR-011-batch-release-gating.md` | §5.3、§5.5、§6、§7、§10（边界与运维速查）、受理与放行链路 |
 | 2026-09-13 | §10 更正**提交体上限**的描述：实际有 `BODY_MAX_BYTES`（默认 1 MiB，超限 `413`），且校验在任何副作用之前；并补上 `atask:batch:*` 键 | 原文写「提交体当前无显式上限…旧链路 1 MiB 上限随 preflight 删除」，与代码（`relayflow._read_body_limited`）不符——是一条文档与实现的漂移 | §10 |

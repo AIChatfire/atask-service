@@ -8,7 +8,7 @@
 
 ## 已完成
 
-### 对外形态统一为 `/queue/{上游原生路径}`
+### 对外统一 `/async`，网关自身端点统一为 `/queue/{上游原生路径}`
 
 - 唯一形态三件套（`app/routers/queue_task.py`，通配路由最后注册）：
   `POST /queue/{path}`（受理，`202 + {task_id, status}` + `Location` 头）、
@@ -126,11 +126,12 @@ $ .venv/bin/python -m pytest tests/ -q
 
 ## 重要契约变化
 
-1. **[破坏性] 对外形态从 `/{biz}/...` 改为 `/queue/{path}`**
+1. **[破坏性] 对外形态从 `/{biz}/...` 改为 `/async/{path}`**
    旧形态 `POST /{biz}/v1/tasks`、`/{biz}/v1/videos`、通配 `/{biz}/{原生路径}` 全部
    删除，`{biz}` 段不再出现在 URL 中；`DELETE` 取代旧的
    `POST /{biz}/v1/tasks/{task_id}/cancel` 取消形态。**不提供任何旧形态兼容**——
-   客户端必须改打到 `/queue/{上游原生路径}`。
+   客户端必须改打到 **`/async/{上游原生路径}`**（nginx 按路径分流并重写为本服务的内部
+   端点 `/queue/{上游原生路径}`；两者不可混用，见本仓库 ADR-010 §1）。
 
 2. **[破坏性] 网关零资金动作，不再有计费接口**
    不再调用任何 freeze / settle / cancel；`tasks.data` 不再写

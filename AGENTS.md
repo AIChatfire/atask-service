@@ -7,9 +7,11 @@
 **当前准入范围只接受异步任务**，做的是**排队异步**（**上游异步 → 本地异步**：本地
 task_id、入队排队、后台推进到终态）；「异步 / 同步」是**准入的任务类型**，不是「转」的
 方向（同族的 stask-service 只接受同步任务、由它完成任务化，见本仓库 ADR-008）。
-**对外唯一形态是 `POST /queue/{path}`**、
+**对外统一前缀是 `/async`**（与 stask 一致，客户端只记一个；由 nginx 按路径分流并**重写**
+为本服务的内部端点）；**本服务自身的端点形态是 `POST /queue/{path}`**、
 `GET /queue/{path}/{task_id}`、`DELETE /queue/{path}/{task_id}`——`{path}` 是上游原生
-路径（如 `v1/tasks`）。
+路径（如 `v1/tasks`）。两层前缀为什么这样分、代价是什么（分流依据在运维侧手写的 nginx
+路径表），见本仓库 ADR-010 §1。
 
 **外部协同：没有外部微服务**。这是本仓库 ADR-010 换向的结果——旧架构里的
 keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billing-service
@@ -57,8 +59,9 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
 
 ## 关键约定
 
-- **对外形态唯一**：`/queue/{上游原生路径}`。`{biz}` 段已从 URL 移除；不做任何旧形态
-  兼容（本仓库 ADR-010）。提交 `POST {base}{path}` 原样转发 method / query / body；
+- **形态唯一**：网关自身端点是 `/queue/{上游原生路径}`，**对外由 nginx 暴露为
+  `/async/{上游原生路径}`**（两层前缀的取舍见本仓库 ADR-010 §1）；`{biz}` 段已从 URL
+  移除，不做任何旧形态兼容。提交 `POST {base}{path}` 原样转发 method / query / body；
   提取上游任务 id 取 `id`、缺失回退 `task_id`；探测 / 取消
   `{base}{path}/{upstream_task_id}`；状态字段 `status`；鉴权固定 Bearer。
 - **零渠道配置**：去掉 keypool 后，渠道路由元数据（`task_id_path` / `probe_path` /

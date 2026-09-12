@@ -27,7 +27,8 @@
 | 2026-09-12 | `tests/test_static_gates.py` 注释 | 历史文档退役：`AI_TODO.md` / `OPTIMIZATION_BACKLOG.md` 的「无 emoji」门禁豁免。本次已去除两文件的 emoji 状态标记（对勾/红圆/黄圆标记分别改为 `[完成]` / `[高危]` / `[中危]`）并加归档说明，但门禁扫描范围仍只含 `app/*.py` 与 `docs/decisions/*.md` | 历史文档仅作记录，不应长期豁免门禁 | 待把这两文件纳入 `test_no_emoji_*` 扫描（或删除文件） | 门禁是否扩展扫描根目录 `.md` 的决策（team-lead 负责，见任务「把纪律做成测试门禁」） | **已满足（2026-09-12 核实）**：`test_no_emoji_in_docs` 的扫描范围早已是「仓库根级 `*.md` + `docs/**/*.md`」，`AI_TODO.md` / `OPTIMIZATION_BACKLOG.md` 均在扫描范围内且不含 emoji，该门禁全绿；无须再扩展 | CLOSED (2026-09-12) |
 
 | 2026-09-13 | 攒批实现（ADR-011）+ Redis 键前缀改名 | **Redis 键前缀 `gw:` → `atask:` 需部署侧配合：切换前必须排空队列**。队列键本身也在改名范围内（`atask:taskiq` / `atask:sched:*` / `atask:events:dlq`），旧键不会被新进程读写 | 幂等键（24h）与令牌会话的丢失只影响在飞窗口（任务停在非终态，ADR-010 已知限制 L-1 的待遇）；**队列丢失是真丢任务**（积压消息、延迟任务、死信一并成孤儿键） | 保持不兼容（干净的一侧，与路由改名同一立场，不做双前缀并存） | 需运维：确认 `gw:taskiq` / `gw:sched:*` 队列深度为 0 后再切 | 线上跑 `atask:` 前缀后，`/ops/queue` 的 `pending`/`delayed` 从 0 正常增长，且无 `gw:taskiq` 残留消费 | OPEN（`redis-prefix-drain-required`） |
-| 2026-09-13 | 本次攒批实现中的核对 | 文档口径不一：**对外路由前缀到底是 `/queue` 还是 nginx 层的 `/async`**？三处说法冲突——`docs/SPEC.md` §13 有一行写「`/batch` → `/async`」，同表上一行与 `route-rename-external-sync` 都写「`/batch` → `/queue`」，而 `docs/ARCH-queue-relay-lifecycle.md` §14 写「对外前缀共用 `/async`（由 nginx 按路径分流并重写，atask 内部端点是 `/queue`）」 | 仓库内代码只有 `/queue`（`app/routers/queue_task.py`）；若对外确实靠 nginx 重写成 `/async`，则「三件外部同步」里的客户端路径与 deny-list 写法都要按 `/async` 复核 | 以「仓库内 `/queue` + nginx 可选重写为 `/async`」并存理解，但**未擅自改任何一处**（改哪一处都会掩盖另外两处） | 需用户/运维确认对外形态 | 三处文档口径一致，且线上按确认后的前缀可受理 | OPEN（`external-prefix-doc-drift`） |
+| 2026-09-13 | 本次攒批实现中的核对 | 文档口径不一：**对外路由前缀到底是 `/queue` 还是 nginx 层的 `/async`**？三处说法冲突——`docs/SPEC.md` §13 有一行写「`/batch` → `/async`」，同表上一行与 `route-rename-external-sync` 都写「`/batch` → `/queue`」，而 `docs/ARCH-queue-relay-lifecycle.md` §14 写「对外前缀共用 `/async`（由 nginx 按路径分流并重写，atask 内部端点是 `/queue`）」 | 仓库内代码只有 `/queue`（`app/routers/queue_task.py`）；若对外确实靠 nginx 重写成 `/async`，则「三件外部同步」里的客户端路径与 deny-list 写法都要按 `/async` 复核 | 以「仓库内 `/queue` + nginx 可选重写为 `/async`」并存理解，但**未擅自改任何一处**（改哪一处都会掩盖另外两处） | 需用户/运维确认对外形态 | **已由用户裁决（2026-09-13）：对外统一 `/async`、网关自身端点为 `/queue`**；`docs/SPEC.md` / `AGENTS.md` / `overview.md` 的口径已统一 | CLOSED (2026-09-13) |
+| 2026-09-13 | 对外前缀统一为 `/async` 后的复查 | **受理响应的 `Location` 头不会被 nginx 自动重写**：网关按自身形态组装为 `/queue/{path}/{task_id}`，而对外域名只配了 `/async/` 的 location——客户端若跟随该头，会落到兜底 location（打到 new-api）而不是本服务 | 与「两层前缀」同源，但更隐蔽：**分流表管的是请求路径，管不到响应头里的路径**。ADR-010 §1 当年只登记了「分流表要手写」这一项代价 | 二选一：① nginx 配 `proxy_redirect /queue/ /async/;`；② 文档固化「不要跟随 `Location`」——README 已按此写明并建议用响应体 `task_id` 自拼查询地址 | 需运维确认线上 nginx 当前是否已配 `proxy_redirect` | 线上受理后返回的 `Location` 在客户端可直接访问，或确认客户端未依赖它（走 `task_id` 自拼） | OPEN（`location-header-not-rewritten`） |
 
 > **ADR-010 的 5 条已知限制不在本册重复登记**（令牌会话过期后任务无法自愈；
 > 刻意不设 max-age 判死；`X-Upstream-Base-Url` 头的可信性依赖 nginx 配置；
@@ -53,6 +54,10 @@
 - `redis-prefix-drain-required`：本仓库内已改净、但需运维先排空队列才能安全切换的键空间改名
   （与上一条同族：都是「代码侧干净、外部动作未完成」）
 - `external-prefix-doc-drift`：多份文档对同一对外形态各说一套，未确认前不擅改任何一处
+  （**已无未决项引用**：2026-09-13 用户裁决「对外 `/async`、网关自身端点 `/queue`」，
+  口径已统一，见上表）
+- `location-header-not-rewritten`：**响应头里的路径不在 nginx 分流表的管辖内**——
+  `Location` 由网关按自身形态生成，不会被自动重写为对外前缀；需运维确认 `proxy_redirect`
 - `deploy-topology-confirm`：部署拓扑待运维确认（发布端口 / 反代位置这类「代码侧只能选一侧默认值」的项）
 - `doc-retirement-pending`：历史文档内容已沉淀，但退役收尾（门禁/删除）未完成。
   **本项已无未决项引用**（2026-09-12 关闭，见上表最后一行）；保留说明供追溯

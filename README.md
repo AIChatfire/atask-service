@@ -123,26 +123,34 @@ nginx 在同一域名下做两件事：
 
 ```bash
 # 受理：立刻拿到本地 task_id（不等上游）
-curl -X POST https://gw.example.com/queue/v1/tasks \
+# 对外域名打 /async（nginx 按路径分流并重写为本服务的 /queue）；直连网关时才用 /queue
+curl -X POST https://gw.example.com/async/v1/tasks \
   -H 'Authorization: Bearer sk-user-xxx' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: my-key-1' \
   -H 'X-Callback-Url: https://app.example.com/webhook' \
   -d '{"model":"your-model","prompt":"a cat"}'
 # → 202 {"task_id":"queue_5f2c...e91","status":"SUBMITTED"}
-#   Location: /queue/v1/tasks/queue_5f2c...e91
+#   Location: /queue/v1/tasks/queue_5f2c...e91（网关自身形态，见下方「Location 头」说明）
 
 # 回调地址也可以放在 body 顶层（上游 API 文档口径，如火山方舟 Seedance）
 # -d '{"model":"your-model","prompt":"a cat","callback_url":"https://app.example.com/webhook"}'
 
 # 查询：末段是本地 task_id → 任务视图（非终态按需探测上游）
-curl https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
+curl https://gw.example.com/async/v1/tasks/queue_5f2c...e91 \
   -H 'Authorization: Bearer sk-user-xxx'
 
 # 取消
-curl -X DELETE https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
+curl -X DELETE https://gw.example.com/async/v1/tasks/queue_5f2c...e91 \
   -H 'Authorization: Bearer sk-user-xxx'
 ```
+
+> **`Location` 头（部署注意）**：受理响应的 `Location` 由网关按**自身端点形态**组装为
+> `/queue/{path}/{task_id}`，对外域名下**不会自动变成** `/async/...`。客户端若要直接
+> 跟随该头，nginx 需配 `proxy_redirect /queue/ /async/;`，或客户端自行替换前缀。
+> **建议客户端直接用 202 响应体里的 `task_id` 拼查询地址**
+> （`GET /async/{上游路径}/{task_id}`），不依赖 `Location`。
+> 该缺口已登记在 `docs/decisions/OPEN-DECISIONS.md`。
 
 **用户回调地址**有两个等价通道：`X-Callback-Url` 头（**优先**）与 body 顶层
 `callback_url` 字段（**兜底**，上游 API 文档口径，如火山方舟 Seedance）。地址必须命中
