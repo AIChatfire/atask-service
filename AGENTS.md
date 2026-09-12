@@ -105,9 +105,15 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
   `TASK_STALE_SECONDS` 探测非终态任务并推进——候选**最旧优先**（`updated_at ASC`），
   用 DESC 会让最旧那批永远轮不到探测，而它们最可能已在上游成功。
   令牌会话过期则跳过（DEBUG 级，绝不判死、绝不释放并发槽，见 ADR-010 已知限制）。
-- **用户回调**：受理时接受 `X-Callback-Url` 头，终态经 `app/services/notify.py`
-  HMAC-SHA256 签名后投递，走既有 `queue.publish_notify`（重试 + 死信）。
-  **不读 body 里的回调字段**（body 原样转发，网关不解析语义）。
+- **用户回调**：地址来源 = `X-Callback-Url` 头（**优先**）+ body 顶层 `callback_url` 字段
+  （**兜底**，上游 API 文档口径，如火山方舟 Seedance）；两者都过
+  `app/services/callback_addr.py` 的 fail-closed 准入（`CALLBACK_ALLOWLIST` 空即全拒、
+  私网/回环/链路本地字面 IP 无条件拒、校验在**任何副作用之前**且被拒不留痕）。
+  默认「网关接管」把该字段**从转发体摘除**以消除与上游的双投递（转发改走
+  `data.submit_body`）；`CALLBACK_PASSTHROUGH_UPSTREAM=true` 时取值与校验一起跳过、
+  body 原样转发、网关不投递。终态经 `app/services/notify.py` HMAC-SHA256 签名后投递，
+  走既有 `queue.publish_notify`（重试 + 死信）。**只推终态**（中间态是抽样观测）、
+  **主动取消不推**。客户端对接契约见 `docs/CALLBACK-CONTRACT.md`（本仓库 ADR-012）。
 - **原生报文同构 + 终态零上游往返**：探测响应把上游 id 逐字节改写回本地 id
   （`nativeapi.rewrite_ids`），报文其余部分 100% 同构；终态把上游原始报文落
   `data.upstream_snapshot`（`capture_snapshot`，≤8KB，空报文不落键），查询直接回放。
