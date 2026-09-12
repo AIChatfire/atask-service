@@ -142,6 +142,9 @@ class FakeRedis:
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
         from app.redis import (
+            LUA_BATCH_CLAIM,
+            LUA_BATCH_JOIN,
+            LUA_BATCH_LEAVE,
             LUA_CAS_DELETE,
             LUA_CONC_ACQUIRE,
             LUA_CONC_RELEASE,
@@ -180,7 +183,92 @@ class FakeRedis:
             cur = int(self._data.get(key, "0")) if self._alive(key) else 0
             self._data[key] = str(max(0, cur - 1))
             return 1
+        if script == LUA_BATCH_JOIN:
+            # KEYS = [成员 ZSET, 到期 ZSET]；ARGV = [task_id, now, due_at, key, ttl]
+            # 返回顺序与 Lua 一致：**可能为 nil 的 ZSCORE 排最后**（表在 nil 处截断）。
+            members_key, due_key = args[0], args[1]
+            task_id, now, due_at, group, ttl = argv[:5]
+            await self.zadd(members_key, {task_id: float(now)})
+            added = await self.zadd(due_key, {group: float(due_at)}, nx=True)
+            await self.expire(members_key, int(ttl))
+            count = await self.zcard(members_key)
+            score = await self.zscore(due_key, group)
+            return [count, added] if score is None else [count, added, score]
+        if script == LUA_BATCH_CLAIM:
+            # 摘取即互斥：摘成员与清到期索引在「同一次 EVAL」里完成
+            members_key, due_key = args[0], args[1]
+            out = await self.zrange(members_key, 0, -1)
+            await self.delete(members_key)
+            await self.zrem(due_key, argv[0])
+            return out
+        if script == LUA_BATCH_LEAVE:
+            members_key, due_key = args[0], args[1]
+            await self.zrem(members_key, argv[0])
+            if await self.zcard(members_key) == 0:
+                await self.delete(members_key)
+                await self.zrem(due_key, argv[1])
+            return 1
         raise AssertionError(f"unexpected Lua script: {script[:60]}")
+
+    # ---- ZSET（攒批的成员索引 / 到期索引）----
+
+    def _zset(self, key: str) -> dict[str, float]:
+        """返回底层 dict 本体（不是副本）：zrem/zadd 必须落到同一份存储上。"""
+        if not self._alive(key):
+            return {}
+        value = self._data.get(key)
+        return value if isinstance(value, dict) else {}
+
+    async def zadd(self, key: str, mapping: dict, nx: bool = False, **_: Any) -> int:
+        if not self._alive(key):
+            pass                                   # 过期即清空，下面重建
+        cur = self._data.get(key)
+        if not isinstance(cur, dict):
+            cur = {}
+            self._data[key] = cur
+        added = 0
+        for member, score in mapping.items():
+            member = self._s(member)
+            if nx and member in cur:
+                continue
+            if member not in cur:
+                added += 1
+            cur[member] = float(score)
+        return added
+
+    async def zcard(self, key: str) -> int:
+        return len(self._zset(key))
+
+    async def zscore(self, key: str, member: str) -> float | None:
+        return self._zset(key).get(self._s(member))
+
+    async def zrem(self, key: str, *members: str) -> int:
+        cur = self._zset(key)
+        removed = 0
+        for member in members:
+            if cur.pop(self._s(member), None) is not None:
+                removed += 1
+        return removed
+
+    async def zrange(self, key: str, start: int = 0, stop: int = -1) -> list[str]:
+        members = [m for m, _ in self._sorted(key)]
+        return members[start:] if stop == -1 else members[start:stop + 1]
+
+    async def zrangebyscore(self, key: str, min: Any, max: Any,
+                            start: int | None = None,
+                            num: int | None = None) -> list[str]:
+        lo = float("-inf") if min in ("-inf", float("-inf")) else float(min)
+        hi = float("inf") if max in ("+inf", float("inf")) else float(max)
+        out = [m for m, score in self._sorted(key) if lo <= score <= hi]
+        if start is not None:
+            out = out[start:]
+        if num is not None:
+            out = out[:num]
+        return out
+
+    def _sorted(self, key: str) -> list[tuple[str, float]]:
+        # 真 Redis 的 ZSET 同分按成员字典序，批次成员的 score 可能相同（同一秒入批）
+        return sorted(self._zset(key).items(), key=lambda kv: (kv[1], kv[0]))
 
     # ---- 测试辅助 ----
 
@@ -207,9 +295,14 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
     # 这个属性，`monkeypatch.setattr` 会直接 AttributeError。门禁
     # test_redis_patch_list_covers_importers 只要求覆盖「顶层导入」的模块，正是
     # 为了把这种形态区别对待——按名字强塞会炸掉整套测试。
+    #
+    # 攒批上线后新增 services.batching（顶层 import r）：它是**放行链路的唯一入口**，
+    # 漏登记的后果不是「用例打不到桩」而是「用例静默操作真 Redis 里的真实批次索引」
+    # ——本地恰好有 Redis 时全绿、CI 里莫名红，是测试虚假绿灯的典型形态。
     import app.deps.ratelimit
     import app.healthz
     import app.queue
+    import app.services.batching
     import app.services.dynconf
     import app.services.idem
     import app.services.relayflow
@@ -220,6 +313,7 @@ def patch_redis(monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis) -> FakeR
         app.deps.ratelimit,
         app.healthz,
         app.queue,
+        app.services.batching,
         app.services.dynconf,
         app.services.idem,
         app.services.relayflow,
@@ -316,14 +410,101 @@ class InMemoryTaskStore:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
         return counts
 
+    # ---- 攒批（batching）相关的放行权 / 还槽权 / 兜底查询 ----
+    #
+    # 这几个必须与原实现**同语义**，否则攒批用例会「绿在假实现上」：
+    #   - claim_for_release 是条件更新（起点不符即 False），不是无条件赋值；
+    #   - claim_slot_release 的**缺键视为已占槽**（COALESCE(...,1)）是刻意语义，
+    #     不是随手写的默认值（本特性上线前的在途任务没有 slot_flags 键）。
+
+    async def get_batch_meta(self, task_id: str) -> dict | None:
+        row = self.rows.get(task_id)
+        if not row:
+            return None
+        data = row["data"]
+        return {
+            "task_id": task_id,
+            "status": row["status"],
+            "token_hash": data.get("token_hash"),
+            "batch_state": data.get("batch_state"),
+            "slot_flags": data.get("slot_flags", 0),
+            "batch_key": data.get("batch_key"),
+            "requeue_attempts": data.get("requeue_attempts", 0),
+        }
+
+    async def claim_for_release(self, task_id: str) -> bool:
+        from app.services.taskstore import BATCH_WAITING_STATES
+
+        row = self.rows.get(task_id)
+        if not row or row["status"] != "SUBMITTED":
+            return False
+        if row["data"].get("batch_state") not in BATCH_WAITING_STATES:
+            return False
+        row["data"]["batch_state"] = "releasing"
+        row["updated_at"] = int(time.time())
+        return True
+
+    async def unclaim_for_release(self, task_id: str, restore: str = "waiting") -> None:
+        row = self.rows.get(task_id)
+        if not row or row["status"] != "SUBMITTED":
+            return
+        if row["data"].get("batch_state") != "releasing":
+            return
+        row["data"]["batch_state"] = restore
+        row["updated_at"] = int(time.time())
+
+    async def claim_slot_release(self, task_id: str) -> bool:
+        row = self.rows.get(task_id)
+        if not row:
+            return False
+        if int(row["data"].get("slot_flags", 1) or 0) <= 0:
+            return False
+        row["data"]["slot_flags"] = 0
+        row["updated_at"] = int(time.time())
+        return True
+
+    async def stale_batch_waiting(self, stale_seconds: int,
+                                  limit: int = 200) -> list[dict]:
+        from app.services.taskstore import BATCH_WAITING_STATES
+
+        cutoff = int(time.time()) - max(0, int(stale_seconds))
+        out: list[dict] = []
+        for task_id, row in self.rows.items():
+            data = row["data"]
+            if data.get("source") != "queue" or row["status"] != "SUBMITTED":
+                continue
+            state = data.get("batch_state")
+            due = int(data.get("batch_due_at") or 0)
+            waiting_due = state in BATCH_WAITING_STATES and 0 < due <= cutoff
+            # 卡在 releasing 的判定用 updated_at（抢权时刷新），**不能用 batch_due_at**：
+            # 放行正是由到期触发的，它的 due 必然已是过去时刻，拿它判会把正在飞的放行
+            # 也捞出来（真 SQL 里有同样的注释）。
+            stuck_releasing = (state == "releasing"
+                               and int(row.get("updated_at") or 0) <= cutoff)
+            if not (waiting_due or stuck_releasing):
+                continue
+            out.append({
+                "task_id": task_id, "status": row["status"],
+                "token_hash": data.get("token_hash"),
+                "batch_state": state, "batch_due_at": due,
+            })
+        out.sort(key=lambda item: item["batch_due_at"])
+        return out[:max(1, min(int(limit), 500))]
+
 
 @pytest.fixture
 def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
-    """把 app.services.taskstore 模块函数替换为内存实现（relayflow 共用）。"""
+    """把 app.services.taskstore 模块函数替换为内存实现（relayflow / batching 共用）。
+
+    **清单必须与原实现的消费面同步**：漏登记的函数会打到真 MySQL——本地可能恰好有库
+    而绿，CI 里红，更糟的是「跑在真实状态上却报绿」。新增放行相关函数时记得加。
+    """
     import app.services.taskstore as ts
 
     store = InMemoryTaskStore()
-    for name in ("create", "get", "cas", "patch_data", "counts_by_status"):
+    for name in ("create", "get", "cas", "patch_data", "counts_by_status",
+                 "get_batch_meta", "claim_for_release", "unclaim_for_release",
+                 "claim_slot_release", "stale_batch_waiting"):
         monkeypatch.setattr(ts, name, getattr(store, name))
     return store
 
@@ -335,19 +516,19 @@ def task_store(monkeypatch: pytest.MonkeyPatch) -> InMemoryTaskStore:
 
 @pytest.fixture
 def queue_events(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
-    """拦截 app.queue 发布门面，记录调用参数（batch submit / notify）。"""
+    """拦截 app.queue 发布门面，记录调用参数（queue submit / notify）。"""
     from unittest.mock import AsyncMock
 
     import app.queue as q
 
-    events: dict[str, list] = {"batch_submit": [], "notify": []}
+    events: dict[str, list] = {"queue_submit": [], "notify": []}
 
-    async def _batch_submit(task_id: str) -> None:
-        events["batch_submit"].append(task_id)
+    async def _queue_submit(task_id: str) -> None:
+        events["queue_submit"].append(task_id)
 
     async def _notify(task_id: str, url: str, payload: dict) -> None:
         events["notify"].append({"task_id": task_id, "url": url, "payload": payload})
 
-    monkeypatch.setattr(q, "publish_batch_submit", AsyncMock(side_effect=_batch_submit))
+    monkeypatch.setattr(q, "publish_queue_submit", AsyncMock(side_effect=_queue_submit))
     monkeypatch.setattr(q, "publish_notify", AsyncMock(side_effect=_notify))
     return events

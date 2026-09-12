@@ -1,4 +1,4 @@
-"""``/batch`` 提交的失败三档（ADR-010 把旧五级分流降为三档）。
+"""``/queue`` 提交的失败三档（ADR-010 把旧五级分流降为三档）。
 
 ``errclass.py`` 随旧链路删除是合理的——前提是三档逻辑真的内联实现且可测。本文件
 就是那三个「前提」的断言：
@@ -25,7 +25,7 @@ from app.services import relay, relayflow, tokensession
 AUTH = {"Authorization": "Bearer sk-user-1"}
 UP_BASE = "http://upstream.test"
 TOKEN_HASH = hashlib.sha256(b"sk-user-1").hexdigest()
-CONC_KEY = f"gw:conc:{TOKEN_HASH}"
+CONC_KEY = f"atask:conc:{TOKEN_HASH}"
 
 
 def _client() -> httpx.AsyncClient:
@@ -34,7 +34,7 @@ def _client() -> httpx.AsyncClient:
 
 
 @pytest.fixture
-def batch_settings(monkeypatch: pytest.MonkeyPatch):
+def queue_settings(monkeypatch: pytest.MonkeyPatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "upstream_allowlist", "upstream.test")
@@ -44,17 +44,17 @@ def batch_settings(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def batch_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+def queue_queue(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.queue as q
 
     async def _noop(*_a, **_k) -> None:
         return None
 
-    monkeypatch.setattr(q, "publish_batch_submit", _noop)
+    monkeypatch.setattr(q, "publish_queue_submit", _noop)
 
 
 async def _seed(client: httpx.AsyncClient) -> str:
-    resp = await client.post("/batch/v1/tasks", json={"model": "m"},
+    resp = await client.post("/queue/v1/tasks", json={"model": "m"},
                              headers={**AUTH, "X-Upstream-Base-Url": UP_BASE})
     assert resp.status_code == 202, resp.text
     return resp.json()["task_id"]
@@ -66,7 +66,7 @@ async def _seed(client: httpx.AsyncClient) -> str:
 
 
 async def test_4xx_is_failure_releases_slot_and_clears_session(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(400, json={"error": "bad request"})
@@ -76,7 +76,7 @@ async def test_4xx_is_failure_releases_slot_and_clears_session(
         assert await patch_redis.get(CONC_KEY) == "1"
         assert await tokensession.get(task_id) == "sk-user-1"
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     row = task_store.rows[task_id]
     assert row["status"] == "FAILURE"
@@ -92,7 +92,7 @@ async def test_4xx_is_failure_releases_slot_and_clears_session(
 
 
 async def test_5xx_is_ambiguous_keeps_task_alive_and_slot_held(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(503, json={"error": "upstream busy"})
@@ -101,7 +101,7 @@ async def test_5xx_is_ambiguous_keeps_task_alive_and_slot_held(
         task_id = await _seed(client)
 
     with pytest.raises(relay.RelayError) as exc:
-        await relayflow.submit_batch_task(task_id)
+        await relayflow.submit_queue_task(task_id)
 
     assert exc.value.status == 503
     row = task_store.rows[task_id]
@@ -112,14 +112,14 @@ async def test_5xx_is_ambiguous_keeps_task_alive_and_slot_held(
 
 
 async def test_transport_error_is_599_ambiguous_keeps_task_alive(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(side_effect=httpx.ConnectError("boom"))
     async with _client() as client:
         task_id = await _seed(client)
 
     with pytest.raises(relay.RelayError) as exc:
-        await relayflow.submit_batch_task(task_id)
+        await relayflow.submit_queue_task(task_id)
 
     assert exc.value.status == 599
     assert task_store.rows[task_id]["status"] == "SUBMITTED"
@@ -132,7 +132,7 @@ async def test_transport_error_is_599_ambiguous_keeps_task_alive(
 
 
 async def test_2xx_missing_id_is_failure_releases_slot_and_clears_session(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(200, json={"status": "queued"})   # 无 id/task_id
@@ -140,7 +140,7 @@ async def test_2xx_missing_id_is_failure_releases_slot_and_clears_session(
     async with _client() as client:
         task_id = await _seed(client)
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     row = task_store.rows[task_id]
     assert row["status"] == "FAILURE"
@@ -155,7 +155,7 @@ async def test_2xx_missing_id_is_failure_releases_slot_and_clears_session(
 
 
 async def test_2xx_with_id_queues_and_keeps_slot(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(200, json={"id": "up-9", "status": "queued"})
@@ -163,7 +163,7 @@ async def test_2xx_with_id_queues_and_keeps_slot(
     async with _client() as client:
         task_id = await _seed(client)
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     row = task_store.rows[task_id]
     assert row["status"] == "QUEUED"

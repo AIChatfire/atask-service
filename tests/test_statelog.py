@@ -42,7 +42,7 @@ def _client() -> httpx.AsyncClient:
 
 
 @pytest.fixture
-def batch_settings(monkeypatch: pytest.MonkeyPatch):
+def queue_settings(monkeypatch: pytest.MonkeyPatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "upstream_allowlist", "upstream.test")
@@ -52,13 +52,13 @@ def batch_settings(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def batch_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+def queue_queue(monkeypatch: pytest.MonkeyPatch) -> None:
     import app.queue as q
 
     async def _noop(*_a, **_k) -> None:
         return None
 
-    monkeypatch.setattr(q, "publish_batch_submit", _noop)
+    monkeypatch.setattr(q, "publish_queue_submit", _noop)
 
 
 # ---------------------------------------------------------------------------
@@ -67,11 +67,11 @@ def batch_queue(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_record_transition_emits_exactly_one_info(transitions):
-    statelog.record_transition("t1", "QUEUED", "SUCCESS", "batch_finalize", detail="done")
+    statelog.record_transition("t1", "QUEUED", "SUCCESS", "queue_finalize", detail="done")
     assert len(transitions) == 1
     assert transitions[0]["level"].name == "INFO"
     assert "t1 QUEUED -> SUCCESS" in transitions[0]["message"]
-    assert "batch_finalize" in transitions[0]["message"]
+    assert "queue_finalize" in transitions[0]["message"]
     assert "done" in transitions[0]["message"]
 
 
@@ -80,12 +80,12 @@ def test_record_transition_calls_logfire_event_once(monkeypatch, transitions):
     monkeypatch.setattr(statelog, "logfire_event",
                         lambda level, event, **fields: calls.append((level, event, fields)))
 
-    statelog.record_transition("t1", "SUBMITTED", "QUEUED", "batch_submit")
+    statelog.record_transition("t1", "SUBMITTED", "QUEUED", "queue_submit")
 
     assert len(transitions) == 1
     assert calls == [("info", TRANSITION,
                       {"task_id": "t1", "from_status": "SUBMITTED",
-                       "to_status": "QUEUED", "source": "batch_submit", "detail": ""})]
+                       "to_status": "QUEUED", "source": "queue_submit", "detail": ""})]
 
 
 def test_logfire_event_noop_when_disabled(monkeypatch):
@@ -119,19 +119,19 @@ def test_logfire_event_emits_when_enabled(monkeypatch):
 
 
 async def test_terminal_transition_logged_exactly_once(
-    transitions, batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    transitions, queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     probe = respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
         return_value=httpx.Response(200, json={"id": "up-1", "status": "succeeded"})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers={**AUTH, "X-Upstream-Base-Url": UP_BASE})
                    ).json()["task_id"]
         await task_store.patch_data(task_id, {"upstream_task_id": "up-1"}, status="QUEUED")
 
-        first = await client.get(f"/batch/v1/tasks/{task_id}")     # 推进到终态
-        second = await client.get(f"/batch/v1/tasks/{task_id}")    # 已终态，零上游往返
+        first = await client.get(f"/queue/v1/tasks/{task_id}")     # 推进到终态
+        second = await client.get(f"/queue/v1/tasks/{task_id}")    # 已终态，零上游往返
 
     assert first.status_code == second.status_code == 200
     assert len(probe.calls) == 1                                  # 只探一次
@@ -142,27 +142,27 @@ async def test_terminal_transition_logged_exactly_once(
 
 
 async def test_non_terminal_transition_logged_exactly_once(
-    transitions, batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    transitions, queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     """非终态推进（queued→processing）也在 CAS 成功分支记一条；状态不变则不记。"""
     respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
         return_value=httpx.Response(200, json={"id": "up-1", "status": "processing"})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers={**AUTH, "X-Upstream-Base-Url": UP_BASE})
                    ).json()["task_id"]
         await task_store.patch_data(task_id, {"upstream_task_id": "up-1"}, status="QUEUED")
 
-        await client.get(f"/batch/v1/tasks/{task_id}")            # QUEUED -> IN_PROGRESS
-        await client.get(f"/batch/v1/tasks/{task_id}")            # 仍是 processing：不记
+        await client.get(f"/queue/v1/tasks/{task_id}")            # QUEUED -> IN_PROGRESS
+        await client.get(f"/queue/v1/tasks/{task_id}")            # 仍是 processing：不记
 
     assert [r["message"] for r in transitions if "-> IN_PROGRESS" in r["message"]] \
         and len([r for r in transitions if "-> IN_PROGRESS" in r["message"]]) == 1
 
 
 async def test_failed_finalize_does_not_log_twice(
-    transitions, batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    transitions, queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     """提交被 4xx 确定性拒绝：FAILURE 迁移恰好一条日志。"""
     from app.services import relayflow
@@ -171,11 +171,11 @@ async def test_failed_finalize_does_not_log_twice(
         return_value=httpx.Response(400, json={"error": "bad request"})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers={**AUTH, "X-Upstream-Base-Url": UP_BASE})
                    ).json()["task_id"]
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     failures = [r for r in transitions if "-> FAILURE" in r["message"]]
     assert len(failures) == 1

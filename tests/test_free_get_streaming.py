@@ -1,6 +1,6 @@
 """免费 GET 透传改为**流式转发**后的契约（``relay.stream_upstream`` + ``StreamingResponse``）。
 
-为什么要单独成篇：换向后的免费 GET（``GET /batch/{path}`` 末段不是本地 task_id）
+为什么要单独成篇：换向后的免费 GET（``GET /queue/{path}`` 末段不是本地 task_id）
 可能取的是图片/二进制产物，旧实现把 ``resp.content`` 整段读进内存——大产物会打爆
 进程。改流式后**很容易出现「看起来流式、实际仍全缓冲」的假绿**，所以这里的核心不是
 「内容对不对」，而是**实证它没有把 body 提前读满**：
@@ -13,7 +13,7 @@
 覆盖：
 1. 非全缓冲 + media_type 保真（relay 层）；
 2. 路由层二进制流式 + 媒体类型保真；
-3. 直接调 ``free_batch_get`` 断言返回的是 ``StreamingResponse``（body_iterator 可迭代）；
+3. 直接调 ``free_queue_get`` 断言返回的是 ``StreamingResponse``（body_iterator 可迭代）；
 4. 声明长度超上限 → 502 且**未开始流式**（body 不消费、连接已关）；
 5. 未声明长度（chunked）→ 正常流式，不因缺 Content-Length 被误拒；
 6. 守卫仍在：非白名单 host 400、空基址 599、缺 token 401、熔断打开零出站。
@@ -150,7 +150,7 @@ async def test_free_get_route_streams_binary_and_preserves_media_type(
     )
 
     async with _client() as client:
-        resp = await client.get("/batch/v1/assets/cover.png", headers=_headers())
+        resp = await client.get("/queue/v1/assets/cover.png", headers=_headers())
 
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "image/png"  # 不硬写 JSON
@@ -159,17 +159,17 @@ async def test_free_get_route_streams_binary_and_preserves_media_type(
     assert spy.closed is True
 
 
-async def test_free_batch_get_returns_streaming_response(
+async def test_free_queue_get_returns_streaming_response(
     stream_settings, patch_redis, respx_router,
 ):
-    """直接调 free_batch_get：拿到的是 StreamingResponse（body_iterator 可迭代）。"""
+    """直接调 free_queue_get：拿到的是 StreamingResponse（body_iterator 可迭代）。"""
     spy = SpyStream([b"part-1", b"part-2"])
     respx_router.get(f"{UP_BASE}/v1/stream.bin").mock(
         return_value=_stream_response(spy, content_type="application/octet-stream")
     )
 
-    response = await relayflow.free_batch_get(
-        "v1/stream.bin", _starlette_request("/batch/v1/stream.bin", _headers())
+    response = await relayflow.free_queue_get(
+        "v1/stream.bin", _starlette_request("/queue/v1/stream.bin", _headers())
     )
 
     assert isinstance(response, StreamingResponse)
@@ -214,7 +214,7 @@ async def test_free_get_route_declared_oversize_is_502(
     )
 
     async with _client() as client:
-        resp = await client.get("/batch/v1/big.bin", headers=_headers())
+        resp = await client.get("/queue/v1/big.bin", headers=_headers())
 
     assert resp.status_code == 502
     assert spy.pulled == 0
@@ -307,7 +307,7 @@ async def test_stream_upstream_breaker_open_blocks_without_outbound(
 ):
     """熔断打开时**拦截**（不是只记账）：``BreakerOpenError`` 且一个出站包都不发。"""
     stream_settings.upstream_breaker_threshold = 2
-    await patch_redis.set(K_BREAKER.format(biz="upstream.test"), 2)
+    await patch_redis.set(K_BREAKER.format(host="upstream.test"), 2)
 
     with pytest.raises(upstream.BreakerOpenError):
         await relay.stream_upstream("GET", UP_BASE, "v1/x", token="t")
@@ -317,6 +317,6 @@ async def test_stream_upstream_breaker_open_blocks_without_outbound(
 
 async def test_free_get_missing_token_is_401(stream_settings, patch_redis):
     async with _client() as client:
-        resp = await client.get("/batch/v1/models",
+        resp = await client.get("/queue/v1/models",
                                 headers={"X-Upstream-Base-Url": UP_BASE})
     assert resp.status_code == 401

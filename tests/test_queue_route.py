@@ -1,4 +1,4 @@
-"""``/batch`` 中继链路端到端（ADR-010）：受理 / 视图 / 取消 / 免费透传 / worker 提交。
+"""``/queue`` 中继链路端到端（ADR-010）：受理 / 视图 / 取消 / 免费透传 / worker 提交。
 
 用 ASGITransport 跑真实 app，出站由 respx 拦截，Redis / tasks 表走内存替身。
 重点断言 ADR-010 的三条硬不变量：
@@ -34,19 +34,19 @@ def _headers(**extra: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def batch_settings(monkeypatch: pytest.MonkeyPatch):
+def queue_settings(monkeypatch: pytest.MonkeyPatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "upstream_allowlist", "upstream.test")
     monkeypatch.setattr(settings, "upstream_base_url", UP_BASE)
     monkeypatch.setattr(settings, "relay_timeout_seconds", 60.0)
-    monkeypatch.setattr(settings, "batch_deny_prefixes", "/api/,/console/")
+    monkeypatch.setattr(settings, "queue_deny_prefixes", "/api/,/console/")
     return settings
 
 
 @pytest.fixture
-def batch_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
-    """拦截 ``queue.publish_batch_submit``（不触真 broker），记录 task_id。"""
+def queue_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
+    """拦截 ``queue.publish_queue_submit``（不触真 broker），记录 task_id。"""
     import app.queue as q
 
     events: dict[str, list] = {"submit": []}
@@ -54,7 +54,7 @@ def batch_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
     async def _publish(task_id: str) -> None:
         events["submit"].append(task_id)
 
-    monkeypatch.setattr(q, "publish_batch_submit", AsyncMock(side_effect=_publish))
+    monkeypatch.setattr(q, "publish_queue_submit", AsyncMock(side_effect=_publish))
     return events
 
 
@@ -64,25 +64,25 @@ def batch_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
 
 
 async def test_create_returns_202_location_and_zero_upstream_roundtrip(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     async with _client() as client:
-        resp = await client.post("/batch/v1/tasks", json={"model": "MiniMax-H3"},
+        resp = await client.post("/queue/v1/tasks", json={"model": "MiniMax-H3"},
                                  headers=_headers())
 
     assert resp.status_code == 202, resp.text
     view = resp.json()
     assert view["status"] == "SUBMITTED"
     task_id = view["task_id"]
-    assert task_id.startswith("batch_")
-    assert resp.headers["location"] == f"/batch/v1/tasks/{task_id}"
+    assert task_id.startswith("queue_")
+    assert resp.headers["location"] == f"/queue/v1/tasks/{task_id}"
     assert len(respx_router.calls) == 0              # 请求内零上游往返
-    assert batch_queue["submit"] == [task_id]        # 提交交给 worker
+    assert queue_queue["submit"] == [task_id]        # 提交交给 worker
 
     row = task_store.rows[task_id]
     assert row["action"] == "task" and row["status"] == "SUBMITTED"
     data = row["data"]
-    assert data["source"] == "batch"
+    assert data["source"] == "queue"
     assert data["model"] == "MiniMax-H3"
     assert data["request_method"] == "POST"
     assert data["request_path"] == "/v1/tasks"
@@ -99,9 +99,9 @@ async def test_create_returns_202_location_and_zero_upstream_roundtrip(
     assert await tokensession.get(task_id) == "sk-user-1"
 
 
-@pytest.mark.parametrize("path", ["/batch/api/models", "/batch/console/tasks"])
+@pytest.mark.parametrize("path", ["/queue/api/models", "/queue/console/tasks"])
 async def test_deny_prefixes_are_rejected(
-    path, batch_settings, patch_redis, task_store, batch_queue,
+    path, queue_settings, patch_redis, task_store, queue_queue,
 ):
     async with _client() as client:
         resp = await client.post(path, json={"model": "m"}, headers=_headers())
@@ -109,35 +109,35 @@ async def test_deny_prefixes_are_rejected(
     assert not task_store.rows
 
 
-async def test_empty_upstream_base_is_400(batch_settings, patch_redis, task_store, batch_queue):
-    batch_settings.upstream_base_url = ""
+async def test_empty_upstream_base_is_400(queue_settings, patch_redis, task_store, queue_queue):
+    queue_settings.upstream_base_url = ""
     async with _client() as client:
-        resp = await client.post("/batch/v1/tasks", json={"model": "m"}, headers=AUTH)
+        resp = await client.post("/queue/v1/tasks", json={"model": "m"}, headers=AUTH)
     assert resp.status_code == 400
     assert not task_store.rows
 
 
-async def test_host_outside_allowlist_is_400(batch_settings, patch_redis, task_store,
-                                             batch_queue):
+async def test_host_outside_allowlist_is_400(queue_settings, patch_redis, task_store,
+                                             queue_queue):
     async with _client() as client:
-        resp = await client.post("/batch/v1/tasks", json={"model": "m"},
+        resp = await client.post("/queue/v1/tasks", json={"model": "m"},
                                  headers={**AUTH, "X-Upstream-Base-Url": "http://evil.example"})
     assert resp.status_code == 400
     assert not task_store.rows
 
 
-async def test_empty_allowlist_fails_closed(batch_settings, patch_redis, task_store,
-                                            batch_queue):
-    batch_settings.upstream_allowlist = ""
+async def test_empty_allowlist_fails_closed(queue_settings, patch_redis, task_store,
+                                            queue_queue):
+    queue_settings.upstream_allowlist = ""
     async with _client() as client:
-        resp = await client.post("/batch/v1/tasks", json={"model": "m"}, headers=_headers())
+        resp = await client.post("/queue/v1/tasks", json={"model": "m"}, headers=_headers())
     assert resp.status_code == 400
     assert not task_store.rows
 
 
-async def test_missing_token_is_401(batch_settings, patch_redis, task_store, batch_queue):
+async def test_missing_token_is_401(queue_settings, patch_redis, task_store, queue_queue):
     async with _client() as client:
-        resp = await client.post("/batch/v1/tasks", json={"model": "m"},
+        resp = await client.post("/queue/v1/tasks", json={"model": "m"},
                                  headers={"X-Upstream-Base-Url": UP_BASE})
     assert resp.status_code == 401
 
@@ -148,16 +148,16 @@ async def test_missing_token_is_401(batch_settings, patch_redis, task_store, bat
 
 
 async def test_view_non_terminal_probes_and_rewrites_upstream_id(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers=_headers())).json()["task_id"]
         await task_store.patch_data(task_id, {"upstream_task_id": "up-1"}, status="QUEUED")
         probe = respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
             return_value=httpx.Response(200, json={"id": "up-1", "status": "processing"})
         )
-        got = await client.get(f"/batch/v1/tasks/{task_id}")
+        got = await client.get(f"/queue/v1/tasks/{task_id}")
 
     assert got.status_code == 200
     assert probe.calls                                  # 非终态走探测
@@ -170,15 +170,15 @@ async def test_view_non_terminal_probes_and_rewrites_upstream_id(
 
 
 async def test_view_terminal_has_zero_upstream_roundtrip(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers=_headers())).json()["task_id"]
         await task_store.patch_data(
             task_id, {"upstream_task_id": "up-1", "upstream_status": "succeeded"},
             status="SUCCESS")
-        got = await client.get(f"/batch/v1/tasks/{task_id}")
+        got = await client.get(f"/queue/v1/tasks/{task_id}")
 
     assert got.status_code == 200
     assert len(respx_router.calls) == 0                 # 终态零上游往返
@@ -186,21 +186,21 @@ async def test_view_terminal_has_zero_upstream_roundtrip(
 
 
 async def test_view_before_submit_returns_local_queued(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers=_headers())).json()["task_id"]
-        got = await client.get(f"/batch/v1/tasks/{task_id}")
+        got = await client.get(f"/queue/v1/tasks/{task_id}")
 
     assert got.status_code == 200
     assert len(respx_router.calls) == 0                 # 还没上游 id，不问上游
     assert got.json() == {"task_id": task_id, "status": "queued"}
 
 
-async def test_view_unknown_task_is_404(batch_settings, patch_redis, task_store):
+async def test_view_unknown_task_is_404(queue_settings, patch_redis, task_store):
     async with _client() as client:
-        got = await client.get("/batch/v1/tasks/task_" + "0" * 32)
+        got = await client.get("/queue/v1/tasks/task_" + "0" * 32)
     assert got.status_code == 404
 
 
@@ -210,16 +210,16 @@ async def test_view_unknown_task_is_404(batch_settings, patch_redis, task_store)
 
 
 async def test_cancel_sets_canceled_and_best_effort_upstream_delete(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     delete = respx_router.delete(f"{UP_BASE}/v1/tasks/up-1").mock(
         return_value=httpx.Response(200, json={"ok": True})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers=_headers())).json()["task_id"]
         await task_store.patch_data(task_id, {"upstream_task_id": "up-1"}, status="QUEUED")
-        resp = await client.delete(f"/batch/v1/tasks/{task_id}")
+        resp = await client.delete(f"/queue/v1/tasks/{task_id}")
 
     assert resp.status_code == 200
     assert task_store.rows[task_id]["status"] == "CANCELED"
@@ -228,19 +228,48 @@ async def test_cancel_sets_canceled_and_best_effort_upstream_delete(
 
 
 async def test_cancel_still_local_when_upstream_delete_fails(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.delete(f"{UP_BASE}/v1/tasks/up-1").mock(
         side_effect=httpx.ConnectError("boom")
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
                                      headers=_headers())).json()["task_id"]
         await task_store.patch_data(task_id, {"upstream_task_id": "up-1"}, status="QUEUED")
-        resp = await client.delete(f"/batch/v1/tasks/{task_id}")
+        resp = await client.delete(f"/queue/v1/tasks/{task_id}")
 
     assert resp.status_code == 200
     assert task_store.rows[task_id]["status"] == "CANCELED"    # 上游失败不影响本地结果
+
+
+async def test_cancel_clears_token_session_after_upstream_stop_loss(
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
+):
+    """取消是终态：必须清令牌会话，**且必须在尽力止损之后清**。
+
+    回归锁（本仓库 ADR-012 已知限制 ②）：`cancel_queue_task` 不复用 `_finalize_queue`，
+    原先漏掉这一步，明文 sk 会一直留到 `SK_SESSION_TTL_SECONDS`（48h）才被 Redis 回收，
+    违背「终态即清」纪律。
+
+    顺序也不能反过来：`_best_effort_upstream_cancel` 要用会话里的 sk 去发上游 `DELETE`，
+    先清会话会让它走 `if not token: return` **静默失效**——所以本条用例同时断言
+    「上游确实收到了那次 DELETE」，把清会话的**位置**一并钉住。
+    """
+    delete = respx_router.delete(f"{UP_BASE}/v1/tasks/up-1").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    async with _client() as client:
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m"},
+                                     headers=_headers())).json()["task_id"]
+        await task_store.patch_data(task_id, {"upstream_task_id": "up-1"}, status="QUEUED")
+        assert await tokensession.get(task_id) == "sk-user-1"    # 受理时已暂存
+
+        resp = await client.delete(f"/queue/v1/tasks/{task_id}")
+
+    assert resp.status_code == 200, resp.text
+    assert delete.calls                                          # 顺序：先止损
+    assert await tokensession.session_info(task_id) == {"exists": False, "ttl_seconds": -2}
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +278,13 @@ async def test_cancel_still_local_when_upstream_delete_fails(
 
 
 async def test_free_get_passthrough_does_not_create_task_row(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     route = respx_router.get(f"{UP_BASE}/v1/models").mock(
         return_value=httpx.Response(200, json={"data": [{"id": "m"}]})
     )
     async with _client() as client:
-        resp = await client.get("/batch/v1/models", headers=_headers())
+        resp = await client.get("/queue/v1/models", headers=_headers())
 
     assert resp.status_code == 200
     assert resp.json() == {"data": [{"id": "m"}]}
@@ -265,7 +294,7 @@ async def test_free_get_passthrough_does_not_create_task_row(
 
 
 async def test_free_get_passthrough_preserves_upstream_content_type(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     """免费转发可能是图片/二进制产物：必须透传上游 Content-Type，不硬写 JSON。"""
     respx_router.get(f"{UP_BASE}/v1/assets/cover.png").mock(
@@ -273,7 +302,7 @@ async def test_free_get_passthrough_preserves_upstream_content_type(
                                     headers={"content-type": "image/png"})
     )
     async with _client() as client:
-        resp = await client.get("/batch/v1/assets/cover.png", headers=_headers())
+        resp = await client.get("/queue/v1/assets/cover.png", headers=_headers())
 
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "image/png"
@@ -287,16 +316,16 @@ async def test_free_get_passthrough_preserves_upstream_content_type(
 
 
 async def test_worker_submit_forwards_body_and_backfills_upstream_id(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     submit = respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(200, json={"id": "up-9", "status": "queued"})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m1"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m1"},
                                      headers=_headers())).json()["task_id"]
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     row = task_store.rows[task_id]
     assert row["status"] == "QUEUED"
@@ -308,16 +337,16 @@ async def test_worker_submit_forwards_body_and_backfills_upstream_id(
 
 
 async def test_worker_submit_terminal_response_advances_locally(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(200, json={"id": "up-9", "status": "succeeded"})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m1"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m1"},
                                      headers=_headers())).json()["task_id"]
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     row = task_store.rows[task_id]
     assert row["status"] == "SUCCESS"
@@ -325,18 +354,55 @@ async def test_worker_submit_terminal_response_advances_locally(
 
 
 async def test_worker_submit_missing_upstream_id_is_failure_not_stuck(
-    batch_settings, patch_redis, task_store, batch_queue, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, respx_router,
 ):
     """约定被违反（2xx 但无 id/task_id）：立即可见 FAILURE，不静默挂在 QUEUED。"""
     respx_router.post(f"{UP_BASE}/v1/tasks").mock(
         return_value=httpx.Response(200, json={"status": "queued"})
     )
     async with _client() as client:
-        task_id = (await client.post("/batch/v1/tasks", json={"model": "m1"},
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m1"},
                                      headers=_headers())).json()["task_id"]
 
-    await relayflow.submit_batch_task(task_id)
+    await relayflow.submit_queue_task(task_id)
 
     row = task_store.rows[task_id]
     assert row["status"] == "FAILURE"
     assert "missing task id" in row["fail_reason"]
+
+
+async def test_worker_submit_success_must_not_resurrect_canceled_task(
+    queue_settings, patch_redis, task_store, queue_queue, monkeypatch,
+):
+    """回填守卫的回归锁（旧链路 KI-D；ADR-010 重写时丢失过，别再丢）。
+
+    窗口：**上游提交请求在飞期间**用户取消（最长 ``RELAY_TIMEOUT_SECONDS``）。
+    上游仍可能接单、且已在上游 relay 计费，但网关**终态不可逆**——回填必须走带
+    起点的 CAS：抢不到就只把孤儿 upstream id 记进 data 供运维追溯，绝不把
+    CANCELED 复活成 QUEUED。复活的具体危害（本用例的负例）：
+    ``QUEUED + progress=100% + finish_time 已写`` 的自相矛盾行 + 并发槽已在取消
+    时释放 + sweep 随后会给一个已被取消的任务投递「成功」回调。
+
+    注：取消发生在**提交开始之前**是另一条既有守卫（``submit_queue_task`` 首检
+    ``status not in ACTIVE`` 直接返回），不在本用例窗口内。
+    """
+    async with _client() as client:
+        task_id = (await client.post("/queue/v1/tasks", json={"model": "m1"},
+                                     headers=_headers())).json()["task_id"]
+
+    async def fake_call_upstream(method: str, base: str, path: str, **kw):
+        if method == "DELETE":                      # 取消的尽力止损：上游接受
+            return 204, b"", "application/json"
+        # 上游已接单，但这段在飞窗口里用户先取消了
+        await relayflow.cancel_queue_task(task_id)
+        return (200, json.dumps({"id": "up-9", "status": "queued"}).encode(),
+                "application/json")
+
+    monkeypatch.setattr(relayflow.relay, "call_upstream", fake_call_upstream)
+    await relayflow.submit_queue_task(task_id)
+
+    row = task_store.rows[task_id]
+    assert row["status"] == "CANCELED"                  # 终态没被复活
+    assert row["progress"] == "100%"                    # 取消写的终态口径不被改坏
+    assert row["data"]["upstream_task_id"] == "up-9"    # 孤儿上游单可追溯
+    assert row["data"]["upstream_status"] == "queued"

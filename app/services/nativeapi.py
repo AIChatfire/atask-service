@@ -1,4 +1,4 @@
-"""原生报文工具（中性件）：``/batch`` 链路用的纯函数。
+"""原生报文工具（中性件）：``/queue`` 链路用的纯函数。
 
 - :func:`normalize`：URL 路径规整；
 - :func:`is_local_id`：本地 task_id 形态判定（GET/DELETE 分派用）；
@@ -6,7 +6,7 @@
 - :func:`capture_snapshot`：终态上游报文的落库快照（≤8KB，供终态零上游往返回放）。
 
 零 I/O、零硬编码模型知识；旧链路（RouteConfig 驱动）删除后本模块只保留
-``/batch`` 链路实际使用的工具（见 ADR-010「原生报文同构」）。
+``/queue`` 链路实际使用的工具（见 ADR-010「原生报文同构」）。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import re
 #: 终态上游报文快照的落库上限（超限不存——探测报文正常 <2KB，防 data 列膨胀）
 SNAPSHOT_MAX_BYTES = 8192
 
-#: 本地 task_id 形态：``{biz_slug}_{uuid4hex}``（见 app.services.ids.new_task_id）
+#: 本地 task_id 形态：``{prefix}_{uuid4hex}``（现行固定 ``queue_``，见 app.services.ids.new_task_id）
 LOCAL_ID_RE = re.compile(r"^[a-z0-9-]{1,20}_[0-9a-f]{32}$")
 
 

@@ -4,7 +4,7 @@
 
 > **部分被取代（2026-09-12）**：**本仓库 ADR-010** 移除了本篇的一半前提。逐半看：
 >
-> - **保留**：「创建接口异步化」——`POST /batch/{上游路径}` 仍是落库即返回本地
+> - **保留**：「创建接口异步化」——`POST /queue/{上游路径}` 仍是落库即返回本地
 >   `task_id`、上游提交交 worker。这半截继续有效。
 > - **失效**：「双重提交窗口与孤儿收口」——`ORPHAN_GRACE_SECONDS`、渠道
 >   `client_request_id_param` 注入、提交互斥锁 TTL 动态派生，三者**全部随旧链路删除**。
@@ -81,7 +81,7 @@
 
 ### 提交互斥锁 TTL 按路由动态派生
 
-`gw:submit_lock:{task_id}` 是 SET NX 原子互斥，防 sweep 补投 / DLQ 重放与
+`atask:submit_lock:{task_id}` 是 SET NX 原子互斥，防 sweep 补投 / DLQ 重放与
 在飞提交并发双建。TTL **不硬编码**，按路由派生
 （`submit.submit_lock_ttl`，submit.py:48）：
 
@@ -150,7 +150,7 @@ sweep 补投前查锁让路（reconcile.py:195）。两道防线叠加，
 两条「不可自愈漂移」的根治（`OPTIMIZATION_BACKLOG.md` P1/P2），是长跑
 稳定性判据，不是一次性修复：
 
-- **并发槽泄漏双保险**：`gw:conc:*` 的 INCR 若「占槽后崩溃」会永久泄漏，
+- **并发槽泄漏双保险**：`atask:conc:*` 的 INCR 若「占槽后崩溃」会永久泄漏，
   累积到上限该用户永远 429，只能人工删键。两道防线**独立成立**：
   ① `LUA_CONC_ACQUIRE` 挂 TTL（`CONC_TTL_SECONDS`，默认 48h，每次
   acquire 刷新；**须 > 最长任务在途时长**）；② sweep 每轮
@@ -158,7 +158,7 @@ sweep 补投前查锁让路（reconcile.py:195）。两道防线叠加，
   （`taskstore.active_counts_by_token`，HELD 除外，口径同 acquire/release）
   回写——泄漏收回、少计补齐、归零删键。TTL 管兜底、校准管精确。
 - **sweep 重入锁**：sweep 每分钟触发，慢轮（反向对账打上游）可能超 1 分钟，
-  叠加并发轮会重复补投/重复 renew/重复对账。`gw:sweep_lock` 用 `SET NX`
+  叠加并发轮会重复补投/重复 renew/重复对账。`atask:sweep_lock` 用 `SET NX`
   （TTL `SWEEP_LOCK_TTL_SECONDS`，默认 300s，崩溃自动释放），拿不到
   直接跳过本轮，`finally` 释放。
 

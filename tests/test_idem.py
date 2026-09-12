@@ -1,6 +1,6 @@
 """``app/services/idem``：幂等原子占位（ADR-010 新链路核心不变量）。
 
-为什么单独成篇：``relayflow.create_batch_task`` 靠它防「同 Idempotency-Key 并发
+为什么单独成篇：``relayflow.create_queue_task`` 靠它防「同 Idempotency-Key 并发
 双建任务 + 双投递」。原 ``test_idem_concurrency.py`` 随旧链路删除时被一并删掉，
 这里是按新链路现状重建的独立断言（不复用旧用例，避免把旧语义带回来）。
 
@@ -42,7 +42,7 @@ def idem_settings(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "upstream_allowlist", "upstream.test")
     monkeypatch.setattr(settings, "upstream_base_url", UP_BASE)
     monkeypatch.setattr(settings, "relay_timeout_seconds", 60.0)
-    monkeypatch.setattr(settings, "batch_deny_prefixes", "/api/,/console/")
+    monkeypatch.setattr(settings, "queue_deny_prefixes", "/api/,/console/")
     monkeypatch.setattr(settings, "idem_pending_ttl_seconds", 30)
     monkeypatch.setattr(settings, "idem_ttl", 86400)
     return settings
@@ -57,7 +57,7 @@ def submit_events(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     async def _publish(task_id: str) -> None:
         events.append(task_id)
 
-    monkeypatch.setattr(q, "publish_batch_submit", AsyncMock(side_effect=_publish))
+    monkeypatch.setattr(q, "publish_queue_submit", AsyncMock(side_effect=_publish))
     return events
 
 
@@ -71,11 +71,11 @@ async def test_placeholder_owner_continues_then_replays(patch_redis, idem_settin
     assert (owned, replay) == (True, None)          # 占位者继续
     assert await idem.get_task_id("h1", "k1") is None   # pending 不算已回填
 
-    await idem.set_task_id("h1", "k1", "batch_abc")
-    assert await idem.get_task_id("h1", "k1") == "batch_abc"
+    await idem.set_task_id("h1", "k1", "queue_abc")
+    assert await idem.get_task_id("h1", "k1") == "queue_abc"
 
     owned2, replay2 = await idem.acquire("h1", "k1")
-    assert (owned2, replay2) == (False, "batch_abc")    # 回填后回放
+    assert (owned2, replay2) == (False, "queue_abc")    # 回填后回放
 
 
 async def test_distinct_keys_are_independent(patch_redis, idem_settings):
@@ -113,12 +113,12 @@ async def test_wait_returns_filled_id(patch_redis, idem_settings):
 
     async def _fill() -> None:
         await asyncio.sleep(0.05)
-        await idem.set_task_id("h1", "k1", "batch_filled")
+        await idem.set_task_id("h1", "k1", "queue_filled")
 
     filler = asyncio.create_task(_fill())
     got = await idem.wait_task_id("h1", "k1")
     await filler
-    assert got == "batch_filled"
+    assert got == "queue_filled"
 
 
 async def test_wait_returns_none_when_placeholder_released(patch_redis, idem_settings):
@@ -148,9 +148,9 @@ async def test_wait_times_out_on_pending(patch_redis, idem_settings):
 async def test_release_never_deletes_filled_task_id(patch_redis, idem_settings):
     """已回填的键绝不误删（否则并发等待方会误判「创建方失败」）。"""
     await idem.acquire("h1", "k1")
-    await idem.set_task_id("h1", "k1", "batch_keep")
+    await idem.set_task_id("h1", "k1", "queue_keep")
     await idem.release("h1", "k1")
-    assert await idem.get_task_id("h1", "k1") == "batch_keep"
+    assert await idem.get_task_id("h1", "k1") == "queue_keep"
 
 
 async def test_release_deletes_pending(patch_redis, idem_settings):
@@ -183,9 +183,9 @@ async def test_same_key_concurrent_requests_only_one_creates(
 
     async with _client() as client:
         a, b = await asyncio.gather(
-            client.post("/batch/v1/tasks", json={"model": "m"},
+            client.post("/queue/v1/tasks", json={"model": "m"},
                         headers=_headers(**{"Idempotency-Key": "same-key"})),
-            client.post("/batch/v1/tasks", json={"model": "m"},
+            client.post("/queue/v1/tasks", json={"model": "m"},
                         headers=_headers(**{"Idempotency-Key": "same-key"})),
         )
 
@@ -201,9 +201,9 @@ async def test_replay_returns_same_task_without_side_effects(
     idem_settings, patch_redis, task_store, submit_events, respx_router,
 ):
     async with _client() as client:
-        first = await client.post("/batch/v1/tasks", json={"model": "m"},
+        first = await client.post("/queue/v1/tasks", json={"model": "m"},
                                   headers=_headers(**{"Idempotency-Key": "k-replay"}))
-        second = await client.post("/batch/v1/tasks", json={"model": "m"},
+        second = await client.post("/queue/v1/tasks", json={"model": "m"},
                                    headers=_headers(**{"Idempotency-Key": "k-replay"}))
 
     assert first.status_code == 202 and second.status_code == 202
@@ -218,12 +218,12 @@ async def test_placeholder_released_when_create_chain_fails(
 ):
     """创建链路中途失败（403 路径准入）必须归还占位，同键重试仍可成功。"""
     async with _client() as client:
-        denied = await client.post("/batch/api/models", json={"model": "m"},
+        denied = await client.post("/queue/api/models", json={"model": "m"},
                                    headers=_headers(**{"Idempotency-Key": "k-retry"}))
         assert denied.status_code == 403
         assert not task_store.rows
         # 占位已归还：同键不是 409，而是真的重新走创建链路
-        retried = await client.post("/batch/v1/tasks", json={"model": "m"},
+        retried = await client.post("/queue/v1/tasks", json={"model": "m"},
                                     headers=_headers(**{"Idempotency-Key": "k-retry"}))
 
     assert retried.status_code == 202, retried.text

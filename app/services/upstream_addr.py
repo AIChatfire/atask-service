@@ -53,7 +53,7 @@ def resolve_upstream_base(request: Request) -> str:
     return (settings.upstream_base_url or "").strip()
 
 
-def _normalize_host(entry: str) -> str:
+def normalize_host(entry: str) -> str:
     """白名单条目的 host 归一：去掉 scheme 与端口，仅留小写 host。
 
     ``newapi.internal`` / ``newapi.internal:3000`` / ``https://newapi.internal``
@@ -85,7 +85,7 @@ def assert_upstream_allowed(base_url: str) -> None:
     allowlist = {
         normalized
         for entry in (settings.upstream_allowlist or "").split(",")
-        if (normalized := _normalize_host(entry))
+        if (normalized := normalize_host(entry))
     }
     if not allowlist:
         # fail-closed：空白名单不是「放行全部」而是「拒绝全部」。

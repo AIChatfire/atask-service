@@ -139,7 +139,7 @@ async def _make_task(store: Any, task_id: str, *, status: str = "SUBMITTED",
                      data: dict | None = None) -> None:
     await store.create(
         task_id=task_id, user_id=42, channel_id=7, action="generate",
-        data=data or {"biz": "minimax", "model": "MiniMax-H3"},
+        data=data or {"source": "queue", "model": "MiniMax-H3"},
     )
     if status != "SUBMITTED":
         assert await store.cas(task_id, ACTIVE, status) is True
@@ -203,11 +203,14 @@ async def test_admin_dashboard_served_and_self_contained(monkeypatch: pytest.Mon
 
 
 SECRET_DATA = {
-    "biz": "minimax",
+    "source": "queue",
     "model": "MiniMax-H3",
     "token_hash": "deadbeef" * 8,
     "request_body": {"prompt": "super-secret-prompt", "duration": 5},
     "upstream_task_id": "up-1",
+    # 以下三个是 ADR-010 的退役字段（渠道分组 / keypool / 资金），**故意留在语料里**：
+    # 它们现在的作用是证明白名单投影会把它们剥掉（而不是让它们以 null 形式透出）。
+    "biz": "minimax",
     "key_id": 7,
     "key_index": 1,
     "freeze_amount": 0.13,
@@ -229,6 +232,9 @@ async def test_admin_task_detail_desensitized(monkeypatch: pytest.MonkeyPatch,
         view = resp.json()
         assert view["task_id"] == "minimax_detail"
         assert view["data"]["model"] == "MiniMax-H3"
+        # 详情投影同样不含退役字段（含旧链路的 key_index）
+        assert not ({"biz", "key_index", "freeze_amount", "settled_amount"}
+                    & set(view["data"]))
         # 令牌会话只给存在性与 TTL
         assert view["token_session"]["exists"] is False
         # 未知任务 404
@@ -256,7 +262,10 @@ async def test_admin_task_list_desensitized(monkeypatch: pytest.MonkeyPatch,
         first = payload["items"][0]
         assert "token_hash" not in first and "request_body" not in first
         assert first["model"] in ("MiniMax-H3", "Other-Model")
-        assert first["biz"] == "minimax"
+        assert first["source"] == "queue"
+        # 退役字段（渠道分组 / 资金 / keypool）必须被投影剥掉，不是「回 null」
+        assert "biz" not in first and "freeze_amount" not in first
+        assert "settled" not in first
 
         # 精确匹配生效；不存在的 task_id 返回空
         exact = await c.get("/admin/api/tasks?task_id=minimax_one", headers=H)
@@ -284,7 +293,7 @@ async def test_admin_requeue_non_terminal_ok_terminal_rejected(
         ok = await c.post("/admin/api/tasks/t_active/requeue", headers=H)
         assert ok.status_code == 200, ok.text
         assert ok.json()["requeued"] is True
-        assert queue_events["batch_submit"][-1] == "t_active"
+        assert queue_events["queue_submit"][-1] == "t_active"
 
         bad = await c.post("/admin/api/tasks/t_done/requeue", headers=H)
         assert bad.status_code == 409, bad.text               # 终态拒绝
@@ -292,7 +301,7 @@ async def test_admin_requeue_non_terminal_ok_terminal_rejected(
 
         assert (await c.post("/admin/api/tasks/none/requeue", headers=H)).status_code == 404
         # 终态被拒时不得有任何重投副作用
-        assert "t_done" not in queue_events["batch_submit"]
+        assert "t_done" not in queue_events["queue_submit"]
 
 
 # ---------------------------------------------------------------------------
@@ -582,17 +591,17 @@ async def test_hot_effect_breaker_threshold(dynconf_redis, monkeypatch: pytest.M
 
     monkeypatch.setattr(settings, "upstream_breaker_threshold", 5)
     dc._invalidate()
-    key = K_BREAKER.format(biz="biz-hot")
+    key = K_BREAKER.format(host="host-hot")
     await upstream.r.set(key, 3)
 
-    await upstream.breaker_guard("biz-hot")                    # 3 < 5：不打开
+    await upstream.breaker_guard("host-hot")                    # 3 < 5：不打开
 
     await dc.set_many({"upstream_breaker_threshold": 2})
     with pytest.raises(upstream.BreakerOpenError):
-        await upstream.breaker_guard("biz-hot")                # 3 >= 2：打开
+        await upstream.breaker_guard("host-hot")                # 3 >= 2：打开
 
     await dc.set_many({"upstream_breaker_threshold": 10})
-    await upstream.breaker_guard("biz-hot")                    # 3 < 10：不再打开
+    await upstream.breaker_guard("host-hot")                    # 3 < 10：不再打开
 
 
 # ---------------------------------------------------------------------------

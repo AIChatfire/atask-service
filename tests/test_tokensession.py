@@ -2,7 +2,7 @@
 
 为什么单独成篇：新链路拿用户 token 去探测上游的唯一来源就是这里（``relay`` 出站
 必须携带用户本人 sk-）。原 ``test_ops_tokensession.py`` 随旧链路删除后被并删，
-现仅剩 ``test_batch_route`` 顺带碰一下。这里独立钉住会话的读写/过期/诊断与
+现仅剩 ``test_queue_route`` 顺带碰一下。这里独立钉住会话的读写/过期/诊断与
 「明文令牌只进 Redis、绝不外发」的红线。
 
 TTL 用 FakeRedis 的时间语义验证（直接操纵过期时刻），**不真等时钟**。
@@ -128,11 +128,11 @@ async def test_route_stores_session_and_terminal_clears_it(
     async def _noop(*_a, **_k) -> None:
         return None
 
-    monkeypatch.setattr(q, "publish_batch_submit", _noop)
+    monkeypatch.setattr(q, "publish_queue_submit", _noop)
 
     async with _client() as client:
         created = await client.post(
-            "/batch/v1/tasks", json={"model": "m"},
+            "/queue/v1/tasks", json={"model": "m"},
             headers={**AUTH, "X-Upstream-Base-Url": UP_BASE},
         )
         assert created.status_code == 202, created.text
@@ -143,7 +143,7 @@ async def test_route_stores_session_and_terminal_clears_it(
         respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
             return_value=httpx.Response(200, json={"id": "up-1", "status": "succeeded"})
         )
-        got = await client.get(f"/batch/v1/tasks/{task_id}")
+        got = await client.get(f"/queue/v1/tasks/{task_id}")
 
     assert got.status_code == 200
     assert task_store.rows[task_id]["status"] == "SUCCESS"

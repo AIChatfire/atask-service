@@ -8,9 +8,12 @@
 # - 本地以单 MySQL 模拟「与 new-api 共享实例」；tasks 表由 new-api AutoMigrate
 #   初始化。**零自有表**：网关不建任何表，自有状态全部在 Redis（AOF everysec）
 #   与环境变量。
-# - **零路由文件**：上游配置唯一事实源是 keypool 渠道元数据（group=biz 同名
-#   约定 + 渠道 setting.gateway 提取配置块），随租约实时下发。
-# - 两个外部微服务（keypool/newapi-billing）地址在 .env 配置。
+# - **零渠道配置**（ADR-010）：渠道元数据来源已整体放弃——上游寻址 = 请求头
+#   `X-Upstream-Base-Url`（由反代**无条件覆盖**注入）→ 回退 `UPSTREAM_BASE_URL`，
+#   host 必须命中 `UPSTREAM_ALLOWLIST`（空即全拒，fail-closed）。
+# - **零外部微服务**：keypool-service / newapi-billing-service 已随 ADR-010 删除，
+#   鉴权（用户 token 原样透传）与计费（上游原生 relay 预扣 + 实结）都在上游闭环，
+#   网关**零资金动作、不持有上游 key**，故这两个地址在 .env 里已不存在。
 
 # 两个应用服务（gateway/worker）共用同一镜像与运行基线，anchor 复用防漂移
 x-app-base: &app-base
@@ -36,7 +39,13 @@ services:
     <<: *app-base
     command: gunicorn -c gunicorn.conf.py app.main:app
     ports:
-      - "8000:8000"
+      # 只绑回环（与 taskiq-admin / redis 同一纪律）：反代与网关同栈时（nginx 走
+      # 容器服务名 atask:8000，见 docs/stask-service-design.md §7）宿主端口仅供本机
+      # 调试，不需要暴露到所有网卡。若反代在**别的主机**上、确需经宿主 IP 访问，
+      # 用 GATEWAY_BIND_IP 显式放宽（如 GATEWAY_BIND_IP=0.0.0.0）——默认刻意选
+      # 安全的一侧。注意容器内 BIND 仍是 0.0.0.0:8000（gunicorn 必须监听所有网卡
+      # 才能被这条发布规则转发），改的是宿主侧的绑定地址。
+      - "${GATEWAY_BIND_IP:-127.0.0.1}:8000:8000"
     depends_on:
       redis:
         condition: service_healthy
@@ -51,11 +60,17 @@ services:
     # 在飞的请求被硬截断。改 gunicorn.conf.py 的 timeout/graceful 推导时这里同步加大。
     stop_grace_period: 90s
 
-  worker:   # 探测/结算/通知执行器 + 内嵌 scheduler（延迟派发 + 每分钟 sweep）
+  worker:   # 探测/通知执行器 + 内嵌 scheduler（延迟派发 + 每分钟 sweep）
     <<: *app-base
     # scheduler 合并进同一容器（小规格形态）；**scheduler 必须单副本**——
     # worker 扩 replicas 时把 scheduler 拆回独立服务（command: taskiq scheduler
     # app.queue:scheduler），否则多份 scheduler 会重复触发 cron。
+    #
+    # --update-interval 1：让「延迟派发」有秒级精度。攒批（batching）的 T 触发走
+    # schedule_by_time，而 scheduler 默认按分钟对点唤醒（taskiq 0.11 的
+    # run_scheduler_loop），不设它时 batch_wait 的实际放行最坏晚 60s。正确性由
+    # sweep 的超期兜底保证（最坏多等一个周期），这一项只影响攒批的准点程度。
+    # 另两个部署形态请同步：Makefile 的 make scheduler、app/standalone.py。
     #
     # 用 bash 包一层是为了**信号转发与故障可见性**（原来的
     # `sh -c "... scheduler & exec worker"` 让 scheduler 成了孤儿：停机拿不到
@@ -74,7 +89,7 @@ services:
         set -e
         term() { kill -TERM "$$sched" "$$wk" 2>/dev/null || true; }
         trap term TERM INT
-        taskiq scheduler app.queue:scheduler &
+        taskiq scheduler app.queue:scheduler --update-interval 1 &
         sched=$$!
         taskiq worker app.queue:broker --max-async-tasks "${QUEUE_MAX_ASYNC_TASKS:-10240}" &
         wk=$$!

@@ -70,7 +70,7 @@ stask-service 的 `ADR-008`（stask 仓库）做了**相反**的决定：
 「写侧恒写秒 + 查询恒带 `platform='stask'`（只命中本服务的秒值行），
 毫秒值只存在于 new-api 自己写的行，那些行我们碰不到」。
 
-这个前提在 atask 这里**不成立**：atask 的 `platform='gateway'` 行本身
+这个前提在 atask 这里**不成立**：atask 的 `platform='atask'` 行本身
 就曾被 Java 漂移版写成毫秒（同一个 platform 值）。只要网关自己的行可能
 含毫秒，裸列比较就会重演「任务秒失败」。**所以 atask 保留 `_secs()` 包裹，
 不能照抄 stask 的 ADR-008**。代价是包裹列使 range 条件吃不到索引，

@@ -1,7 +1,7 @@
-# 架构总览 — `/batch` 中继生命周期
+# 架构总览 — `/queue` 中继生命周期
 
 **版本**：v2.0　**日期**：2026-09-12　**状态**：现行
-**上位决策**：本仓库 ADR-010（对外形态统一为 `/batch/{上游路径}`，鉴权与计费全部下沉上游）
+**上位决策**：本仓库 ADR-010（对外形态统一为 `/queue/{上游路径}`，鉴权与计费全部下沉上游）
 **取代**：本文件 v1.0（异步任务全生命周期与资金安全）**整篇作废**——它描述的渠道元数据、
 任务级精确直达、资金动作三档与失败五级分流，其载体模块已随本仓库 ADR-010 整体删除，
 留在文档里比删掉更危险。
@@ -14,19 +14,19 @@
 
 ## 0. 结论摘要
 
-- **对外只有一个形态**：`POST /batch/{path}`（受理）、`GET /batch/{path}/{task_id}`（查询）、
-  `DELETE /batch/{path}/{task_id}`（取消）。`{path}` 是**上游原生路径**，不是网关自定义路由。
+- **对外只有一个形态**：`POST /queue/{path}`（受理）、`GET /queue/{path}/{task_id}`（查询）、
+  `DELETE /queue/{path}/{task_id}`（取消）。`{path}` 是**上游原生路径**，不是网关自定义路由。
 - **鉴权不内省**：用户 token 以 `Authorization: Bearer <token>` **原样透传上游**，由上游判定
   有效性；网关只做本地限流、幂等、并发上限。用户 token 只进 Redis 会话，绝不落库。
 - **计费零资金动作**：网关不持有上游 key、不做任何额度操作，配额由上游 relay 扣减；
   `tasks.data` 里**没有**任何资金字段（本仓库 ADR-010 §3）。
 - **上游寻址按请求**：`X-Upstream-Base-Url` 头优先，回退 `UPSTREAM_BASE_URL`，host 必须命中
   `UPSTREAM_ALLOWLIST`（空即全拒）。头的可信性**完全依赖 nginx 无条件覆盖**。
-- **受理异步化**：`POST /batch/{path}` 落库即返回（客户端侧零上游往返），上游提交交 worker
-  （`batch_submit_task`）。
-- **终态收敛**：客户端 GET 按需探测 + 后台 `batch_sweep_task`（cron 每分钟、独立重入锁、
+- **受理异步化**：`POST /queue/{path}` 落库即返回（客户端侧零上游往返），上游提交交 worker
+  （`queue_submit_task`）。
+- **终态收敛**：客户端 GET 按需探测 + 后台 `queue_sweep_task`（cron 每分钟、独立重入锁、
   最旧优先）兜底；用户回调由 `X-Callback-Url` 驱动，终态时签名投递。
-- **单一终态收口点** `_finalize_batch`：快照落库、还并发槽、投递回调、清令牌会话，多条路径
+- **单一终态收口点** `_finalize_queue`：快照落库、还并发槽、投递回调、清令牌会话，多条路径
   共用同一份实现，绝不各写一套。
 - **失败三档**（取代旧五级）：4xx 判死、5xx 与传输错误**留活重试**、2xx 缺 id 判死。
 
@@ -35,7 +35,7 @@
 ```mermaid
 flowchart LR
     C[客户端] --> N[nginx 反代]
-    N -->|batch 前缀| G[网关 app]
+    N -->|queue 前缀| G[网关 app]
     N -->|其余路径| U[上游 new-api]
     G -->|Bearer 令牌透传| U
     G --> R[Redis 会话与计数]
@@ -46,17 +46,17 @@ flowchart LR
     S[scheduler 每分钟] --> W
 ```
 
-- **nginx** 是唯一总入口，`/batch/` 前缀转发本网关、其余转发上游；它**无条件覆盖**
+- **nginx** 是唯一总入口，`/queue/` 前缀转发本网关、其余转发上游；它**无条件覆盖**
   `X-Upstream-Base-Url` 头（防伪造的第一道防线，见 §6）。
 - **网关 web 进程**（`app/main.py`）只做同步段：限流、幂等、并发占槽、寻址校验、落库、
   入队、返回 `202`。**请求内零上游往返**。
-- **taskiq worker 进程**（`app/queue.py`）承担全部出站：上游提交（`batch_submit_task`）、
-  用户回调（`notify_task`）；**scheduler** 承担每分钟收敛（`batch_sweep_task`）。
+- **taskiq worker 进程**（`app/queue.py`）承担全部出站：上游提交（`queue_submit_task`）、
+  用户回调（`notify_task`）；**scheduler** 承担每分钟收敛（`queue_sweep_task`）。
 - **Redis** 只放「丢了能重建」的状态：限流计数、幂等键、并发槽、令牌会话、收敛重入锁、
   队列与死信（`app/redis.py` 的键规范）。
 - **tasks 表**是任务事实源，与 new-api 共享实例与表，网关零建表职责（见 §11）。
 
-## 2. 对外形态：`/batch/{path}` 三件套
+## 2. 对外形态：`/queue/{path}` 三件套
 
 ### 问题
 
@@ -65,32 +65,33 @@ flowchart LR
 
 ### 方案
 
-路由只有三个方法，全部落在 `app/routers/batch_task.py`，语义全在 `app/services/relayflow.py`：
+路由只有三个方法，全部落在 `app/routers/queue_task.py`，语义全在 `app/services/relayflow.py`：
 
 | 方法 | 路径 | 语义 | 实现入口 |
 |---|---|---|---|
-| `POST` | `/batch/{path}` | 受理上游异步任务 | `relayflow.create_batch_task` |
-| `GET` | `/batch/{path}/{task_id}` | 查询本地任务 | `relayflow.view_batch_task` |
-| `GET` | `/batch/{path}` | 免费透传（末段不是本地 id） | `relayflow.free_batch_get` |
-| `DELETE` | `/batch/{path}/{task_id}` | 取消本地任务 | `relayflow.cancel_batch_task` |
+| `POST` | `/queue/{path}` | 受理上游异步任务 | `relayflow.create_queue_task` |
+| `GET` | `/queue/{path}/{task_id}` | 查询本地任务 | `relayflow.view_queue_task` |
+| `GET` | `/queue/{path}` | 免费透传（末段不是本地 id） | `relayflow.free_queue_get` |
+| `DELETE` | `/queue/{path}/{task_id}` | 取消本地任务 | `relayflow.cancel_queue_task` |
 
 - **`{biz}` 段从 URL 彻底消失**（本仓库 ADR-010 §1）：去掉不丢信息，选渠道只依赖 `model`。
 - **不做任何旧形态兼容**（用户明确要求「无需兼容旧版本」）：旧路径不保留、不重定向。
-- `POST` 统一 `202 + {task_id, status}`，带 `Location: /batch/{path}/{task_id}` 头。
+- `POST` 统一 `202 + {task_id, status}`，带 `Location: /queue/{path}/{task_id}` 头。
 - `GET` / `DELETE` 用**最后一段**判定：`nativeapi.is_local_id()` 命中 `LOCAL_ID_RE`
   （`{slug}_{uuid4hex}`）才当本地任务，否则 `GET` 走免费透传、`DELETE` 返回 404。
-- `{path}` 落库前经 `ensure_path_allowed` 检查硬拒前缀（`BATCH_DENY_PREFIXES`，默认
+- `{path}` 落库前经 `ensure_path_allowed` 检查硬拒前缀（`QUEUE_DENY_PREFIXES`，默认
   `/api/,/console/`），命中即 `403`——防止把上游管理面/控制台经本网关暴露。
 
-**为什么前缀是 `/batch` 而不是 `/async`**：本仓库是**异步转异步**（上游本身就是任务型），
-`async` 描述的是「把同步接口异步化」，那正是 stask 的语义，两服务不能共用一个词；更硬的
-理由是 `docs/stask-service-design.md` §7 的 nginx 方案里 `location /async/` 已归 stask
-（本仓库 ADR-010 §1）。
+**两层前缀**（本仓库 ADR-010 §1）：**对外统一 `/async`**（与 stask 一致，客户端只记
+一个），由 nginx 按路径分流（同步类路径 → stask，其余 → 本服务并重写为内部前缀）；
+**网关内部是 `/queue/{上游原生路径}`**，与机制名同源（`data.source='queue'`、
+`queue_*` 词根、`task_id` 前缀）。分流表在 nginx，**接入新上游要多写一条 `location`**，
+兜底应 fail-closed（漏配响亮拒绝，别甩给某个服务）。
 
 ### 不变量
 
 1. 路由层**只做分派与响应塑形**，不碰 DB、不出站（分层约定，本仓库 ADR-009）。
-2. `/batch/{path:path}` 是**唯一通配路由，必须最后注册**——Starlette 按注册顺序首匹配，
+2. `/queue/{path:path}` 是**唯一通配路由，必须最后注册**——Starlette 按注册顺序首匹配，
    通配若排在 `/healthz/*`、`/ops/*`、`/admin/*` 之前会整片吞掉它们且不报错；由静态门禁
    `tests/test_static_gates.py` 机械保证。
 3. `GET` 免费透传**绝不产生任何本地任务事实**（不落 tasks 行、不占并发槽）。
@@ -101,7 +102,7 @@ flowchart LR
 | 现象 | 处置 |
 |---|---|
 | 通配路由注册顺序被改动 | 静态门禁红；`/ops/*` 与 `/admin/*` 直接 404 |
-| 命中 `BATCH_DENY_PREFIXES` | `403`，不落库、不出站 |
+| 命中 `QUEUE_DENY_PREFIXES` | `403`，不落库、不出站 |
 | 未带 `Authorization` | `401`（无凭证既无身份做限流，转发也必被上游拒，就地 fail fast） |
 | 上游基址缺失 / host 不在白名单 / 白名单为空 | `400`（fail-closed，见 §6） |
 
@@ -114,7 +115,7 @@ flowchart LR
 
 ### 方案
 
-`relayflow.create_batch_task` 的顺序（`app/services/relayflow.py`）：
+`relayflow.create_queue_task` 的顺序（`app/services/relayflow.py`）：
 
 1. `extract_token` 取 token，本地只算 `sha256`（`token_hash`）；
 2. **限流 + 幂等占位**（`_rate_and_place`）：`ratelimit.check_rate` 与 `idem.acquire` 并发
@@ -124,14 +125,14 @@ flowchart LR
 4. `ratelimit.conc_acquire(token_hash)` 占并发槽；
 5. 读 body（原样保留为 `request_body`）、浅解析只为取 `model`、取 `X-Callback-Url` 头；
 6. `tokensession.store(task_id, token.raw)`——**明文 token 只进 Redis**；
-7. `taskstore.create(...)` 落库（`platform='gateway'`、`status='SUBMITTED'`），
+7. `taskstore.create(...)` 落库（`platform='atask'`、`status='SUBMITTED'`），
    `idem.set_task_id(...)` 回填幂等键；
-8. `queue.publish_batch_submit(task_id)` 入队，返回 `{task_id, status: 'SUBMITTED'}`。
+8. `queue.publish_queue_submit(task_id)` 入队，返回 `{task_id, status: 'SUBMITTED'}`。
 
 ### 不变量
 
 1. **请求内零上游往返**：受理请求绝不 `await` 任何上游调用。由
-   `tests/test_batch_route.py::test_create_returns_202_location_and_zero_upstream_roundtrip`
+   `tests/test_queue_route.py::test_create_returns_202_location_and_zero_upstream_roundtrip`
    断言「出站拦截器零调用」。
 2. **任何异常即回滚**：还并发槽（`conc_acquired` 为真时）并归还幂等占位（`owned` 且
    `idem_key` 存在时），**不留半套状态**。
@@ -157,16 +158,16 @@ flowchart LR
 ### 方案
 
 **网关不内省**（本仓库 ADR-010 §2）：用户 token 原样 `Bearer` 透传上游，有效性由上游 relay
-判定。网关用 `sha256(token)` 作为**本地身份替身**，只用于限流键 `gw:rl:tok:{token_hash}`
-（`ratelimit.check_rate`）、幂等键 `gw:idem:{token_hash}:{key}`（`app/services/idem.py`）、
-并发槽键 `gw:conc:{token_hash}`（`ratelimit.conc_acquire` / `conc_release`）。免费透传按
+判定。网关用 `sha256(token)` 作为**本地身份替身**，只用于限流键 `atask:rl:tok:{token_hash}`
+（`ratelimit.check_rate`）、幂等键 `atask:idem:{token_hash}:{key}`（`app/services/idem.py`）、
+并发槽键 `atask:conc:{token_hash}`（`ratelimit.conc_acquire` / `conc_release`）。免费透传按
 **IP** 限流（`ratelimit.ip_rate_limit`，取 `X-Forwarded-For` 首段），它可能连本地任务事实都没有。
 
 ### 不变量
 
 1. **`token_hash` 是身份替身、不是凭证**：可离线计算、可入库、可出现在管理面（截断后）。
 2. **`token.raw` 是凭证**：只存 Redis 会话（`tokensession.store`），终态即清
-   （`_finalize_batch`），TTL 由 `SK_SESSION_TTL_SECONDS` 兜底（默认 48h）。
+   （`_finalize_queue`），TTL 由 `SK_SESSION_TTL_SECONDS` 兜底（默认 48h）。
 3. 免费透传**缺凭证直接 `401`**：不是网关自建鉴权，只是把「无凭证必然失败」提前到本地。
 4. 令牌会话的诊断视图（`ops` / `admin`）只暴露存在性与剩余 TTL，**令牌本体绝不离开 Redis**
    （`tokensession.session_info`）。
@@ -190,7 +191,7 @@ flowchart LR
 
 **网关零资金动作**（本仓库 ADR-010 §3）：不持有上游 key、不做任何额度操作，配额由上游
 relay 扣减。因此：`tasks.data` **不写任何资金字段**（由
-`tests/test_batch_route.py::test_create_returns_202_location_and_zero_upstream_roundtrip`
+`tests/test_queue_route.py::test_create_returns_202_location_and_zero_upstream_roundtrip`
 断言受理落库的 `data` 中不存在任何额度相关键）；提交失败分支里**没有资金分支可走**，失败
 分流从五级退化为三档（§7）；并发上限不再能按「余额付得起几个在途任务」推导，只能是固定
 上限 `MAX_CONCURRENT_TASKS`（运营可经 `dynconf` 在线调）。
@@ -269,7 +270,7 @@ flowchart TD
 
 ### 方案
 
-`relayflow.submit_batch_task` 由 `queue.batch_submit_task` 驱动：
+`relayflow.submit_queue_task` 由 `queue.queue_submit_task` 驱动：
 
 ```mermaid
 flowchart TD
@@ -279,7 +280,7 @@ flowchart TD
     B -->|2xx 但缺 id| E[判 FAILURE 还槽 清会话]
 ```
 
-三档的精确定义（由 `tests/test_batch_failure_tiers.py` 钉住）：
+三档的精确定义（由 `tests/test_queue_failure_tiers.py` 钉住）：
 
 | 上游结果 | 本地状态 | 并发槽 | 令牌会话 | 是否重试 |
 |---|---|---|---|---|
@@ -292,18 +293,18 @@ flowchart TD
 宁可让它继续被探测，也不误杀。
 
 重试编排在 `app/queue.py`：`_retry_or_dlq` 按 `_backoff`（2s → 4s → … → 300s 封顶）重新
-`schedule_by_time`，累计到 `EVENT_MAX_ATTEMPTS` 次仍失败则落死信 `gw:events:dlq`，可用
+`schedule_by_time`，累计到 `EVENT_MAX_ATTEMPTS` 次仍失败则落死信 `atask:events:dlq`，可用
 `POST /ops/dlq/replay` 重放（登记在 `_DLQ_TASKS` 的类型才可重放）。
 
 ### 不变量
 
-1. **提交幂等短路**：`submit_batch_task` 开头检查任务是否已终态、是否已有 `upstream_task_id`，
+1. **提交幂等短路**：`submit_queue_task` 开头检查任务是否已终态、是否已有 `upstream_task_id`，
    已提交则直接返回——补投与死信重放不会二次提交。
 2. **提交形态固定**：`POST {upstream_base}{path}`，`Authorization: Bearer <token>`，
    method / query / body / content-type 原样转发（本仓库 ADR-010 §5）。
 3. **空基址按 599 拦下**：`relay.call_upstream` 对空 `base_url` 抛 `RelayError(599)`——
    httpx 会拿相对路径发请求并报出与业务无关的传输层错误，那属于模糊失败而非任务失败。
-4. 确定性拒绝也**走单一收口点**（`_finalize_batch`），保证释槽、清会话、按需回调都被做。
+4. 确定性拒绝也**走单一收口点**（`_finalize_queue`），保证释槽、清会话、按需回调都被做。
 
 ### 失败模式
 
@@ -338,30 +339,40 @@ flowchart TD
     T -->|是| F[单一收口点 finalize]
 ```
 
-- **视图路径** `view_batch_task`：非终态且已有 `upstream_task_id` 时探测上游任务详情；探测
+- **视图路径** `view_queue_task`：非终态且已有 `upstream_task_id` 时探测上游任务详情；探测
   不可达时返回本地快照，**不打断客户端轮询**。
-- **worker 路径** `submit_batch_task`：提交响应直接给出终态时立即收口。
-- **后台路径** `sweep_batch_once` / `batch_sweep_task`：cron 每分钟，取候选
-  `taskstore.stale_batch_active`（`source='batch'`、非终态、超 `TASK_STALE_SECONDS`、
+- **worker 路径** `submit_queue_task`：提交响应直接给出终态时立即收口。
+- **后台路径** `sweep_queue_once` / `queue_sweep_task`：cron 每分钟，取候选
+  `taskstore.stale_queue_active`（`source='queue'`、非终态、超 `TASK_STALE_SECONDS`、
   按 `_secs('updated_at') ASC` **最旧优先**）。
 
 **为什么最旧优先**：这些最老的任务最可能已在上游成功、只差没人回来轮询；用 `DESC` + `limit`
 会让最旧的一批长期排在批次尾部、永远轮不到探测（饿死）。由
-`tests/test_batch_sweep.py::test_stale_batch_query_normalizes_millisecond_rows` 与
+`tests/test_queue_sweep.py::test_stale_queue_query_normalizes_millisecond_rows` 与
 `::test_sweep_probes_oldest_candidate_first_when_limited` 双重钉住。
 
-**重入锁**：一轮可能串行探测 `BATCH_SWEEP_BATCH` 条 × 单条最长 `RELAY_TIMEOUT_SECONDS`，
-最坏会超过 1 分钟 cron（多副本更甚）。`sweep_batch_once` 用 `K_BATCH_SWEEP_LOCK`（`SET NX`，
-TTL = `BATCH_SWEEP_LOCK_TTL_SECONDS`）保证慢轮不叠加并发轮；拿不到锁本轮直接返回 0，不报错。
+**重入锁**：一轮可能串行探测 `QUEUE_SWEEP_LIMIT` 条 × 单条最长 `RELAY_TIMEOUT_SECONDS`，
+最坏会超过 1 分钟 cron（多副本更甚）。`sweep_queue_once` 用 `K_QUEUE_SWEEP_LOCK`（`SET NX`，
+TTL = `QUEUE_SWEEP_LOCK_TTL_SECONDS`）保证慢轮不叠加并发轮；拿不到锁本轮直接返回 0，不报错。
 释放用 `LUA_CAS_DELETE`，只删自己持有的锁。
 
-**用户回调**：受理时接受 `X-Callback-Url` 头，终态时经 `notify.sign`（HMAC-SHA256）签名后由
-`queue.publish_notify` → `notify.push` 投递，至少一次、失败重投、超限落死信；无回调 URL 则
-不投递。回调体优先回放上游原生报文（id 逐字节改写回本地 id），无报文时退回近似词。
+**用户回调地址**：受理时确定——`X-Callback-Url` 头**优先**，body 顶层 `callback_url`
+**兜底**（上游 API 文档口径，如火山方舟 Seedance），两者都必须在任何副作用之前过
+`callback_addr.assert_callback_allowed`：仅 `http`/`https`、拒 URL userinfo、拒私网/回环/
+链路本地字面 IP、host 必须命中 `CALLBACK_ALLOWLIST`（**空 = 全拒**，fail-closed）。
+默认「网关接管」模式下把 body 里该字段**从转发体摘除**（转发改走 `data.submit_body`），
+消除「上游也回调 + 网关也回调」的双投递；`CALLBACK_PASSTHROUGH_UPSTREAM=true` 时取值与
+校验一并跳过、body 原样转发、网关不投递（回调交给上游）。
+
+**用户回调投递**：终态时经 `notify.sign`（HMAC-SHA256）签名后由 `queue.publish_notify`
+→ `notify.push` 投递，至少一次、失败重投、超限落死信；无回调 URL 则不投递。回调体优先
+回放上游原生报文（id 逐字节改写回本地 id），无报文时退回近似词。**只推终态**——网关观测
+到的中间态是抽样而非事件流，推它会有漏报与乱序（与火山方舟 Seedance「每次状态变化都推」
+的差别及客户端应对，见 `docs/CALLBACK-CONTRACT.md` §10）。
 
 ### 不变量
 
-1. **收敛只认 `source='batch'` 自有行**，绝不扫描其他来源（`stale_batch_active` 的 where）。
+1. **收敛只认 `source='queue'` 自有行**，绝不扫描其他来源（`stale_queue_active` 的 where）。
 2. **候选取字段投影，绝不 `SELECT data` 整列**——`data` 含 `token_hash` 与 `request_body`
    全文，整列捞出会经调用栈泄露令牌。
 3. **不设 max-age 判死**（本仓库 ADR-010 已知限制 ②）：判死不可逆，且会永久丢失一个可能已
@@ -381,7 +392,7 @@ TTL = `BATCH_SWEEP_LOCK_TTL_SECONDS`）保证慢轮不叠加并发轮；拿不�
 | 令牌会话过期 | DEBUG 跳过，任务停在非终态（已知限制 ①） |
 | 上游把「成功」写成未知状态词 | `map_status` 返回 `None` → 保持非终态并告警一次（每种未知词只报一次） |
 
-## 9. 单一终态收口点 `_finalize_batch`
+## 9. 单一终态收口点 `_finalize_queue`
 
 ### 问题
 
@@ -391,7 +402,7 @@ sweep 三条路径都可能观察到同一个终态——若各写一份实现�
 
 ### 方案
 
-`relayflow._finalize_batch` 是**唯一收口点**，顺序即语义：
+`relayflow._finalize_queue` 是**唯一收口点**，顺序即语义：
 
 ```mermaid
 flowchart LR
@@ -414,8 +425,8 @@ flowchart LR
 ### 不变量
 
 1. **恰好一次**：状态迁移日志、快照落库、还槽、回调、清会话都在 CAS 成功分支内。
-2. **多条路径共用**：视图 `_advance_from_probe`、worker `submit_batch_task`、sweep
-   `_sweep_batch_rows`——不许各写一套；曾漏释槽的失败分支（4xx）已修正为走收口点。
+2. **多条路径共用**：视图 `_advance_from_probe`、worker `submit_queue_task`、sweep
+   `_sweep_queue_rows`——不许各写一套；曾漏释槽的失败分支（4xx）已修正为走收口点。
 3. 终态一律把 `progress` 置 `100%`、用**秒**刷 `finish_time`（`taskstore.cas` 的纪律）。
 
 ### 失败模式
@@ -431,12 +442,12 @@ flowchart LR
 
 ### 问题
 
-客户端打 `/batch/v1/tasks/{id}` 时期望拿到**上游原生报文**（字段、顺序、未知字段、数值精度
+客户端打 `/queue/v1/tasks/{id}` 时期望拿到**上游原生报文**（字段、顺序、未知字段、数值精度
 都一致），而不是网关归一化的 `{task_id, status}`；重排字段或改写结构会让客户端解析逻辑碎。
 
 ### 方案
 
-- **非终态**：`view_batch_task` 原样取上游报文，`nativeapi.rewrite_ids` 把上游 id **逐字节**
+- **非终态**：`view_queue_task` 原样取上游报文，`nativeapi.rewrite_ids` 把上游 id **逐字节**
   替换为本地 id，其余部分**不重新序列化**（字段顺序、未知字段、浮点写法全部原样），再原样
   回吐，`Content-Type` 沿用上游；响应里的 `status` 用**上游原话**，不做归一化。
 - **终态**：零上游往返，回放落库的 `data.upstream_snapshot`（同一份字节级改写逻辑）。
@@ -551,6 +562,48 @@ CANCELED)` 不可逆，迟到快照丢弃。
 | 同键真并发且占位方失败 | 等待方按 `409` 冲突，摘键重试 |
 | 占槽后进程崩溃 | 槽键 TTL 过期后自然回收 |
 
+## 12.1 攒批：并发槽的占用点从受理搬到放行（本仓库 ADR-011）
+
+### 问题
+
+突发提交会把上游打满（客户端一次提交几百条 = 网关瞬间打出几百个 `POST`）。需要「攒够 N 条
+或等够 T 秒再整批提交上游」，而这与「受理时就占并发槽」直接冲突：等待期也占额度的话，一批
+还没放行就把自己的槽耗光，**批次永远不可能大于并发上限**——攒批就不成立了。
+
+### 方案
+
+- 攒批路径（`BATCH_SIZE>=2` 或客户端 `X-Batch-Size`）受理时**不占槽**、**不投递上游提交**，
+  只落库 `SUBMITTED` + `data.batch_state='waiting'` 并入批（`batching.join`，Redis ZSET）；
+- 放行点 `relayflow.release_batched_task` 才 `conc_try_acquire`：抢到 → 落 `slot_flags=1`
+  并投递提交；抢不到 → 指数退避 + 抖动重排（`batching.requeue`），**不是失败**；
+- 两个触发器（N 触发只在成员数达标时**投递**一个放行任务；T 触发是 `schedule_by_time` 排的
+  延迟任务）+ sweep 的超期兜底，全部收敛到同一个放行点；
+- **还槽**改用 `taskstore.claim_slot_release`（「谁把 `data.slot_flags` 置零，谁去 DECR」）：
+  终态收口、取消、放行后复核会真并发地来还同一个槽，无条件 DECR 会还掉别人的槽，而
+  `LUA_CONC_RELEASE` 只钳 0、发现不了。
+
+### 不变量
+
+1. **等待期的任务不占槽**（掩码 0），且**只能**由放行路径提交上游——`submit_queue_task` 对
+   `batch_state ∈ (waiting, requeued)` 直接短路，挡住 `/ops/requeue` 与 DLQ 重放绕过闸门。
+2. **两层幂等缺一不可**：批次级 `LUA_BATCH_CLAIM` 防整批被摘两次；成员级
+   `taskstore.claim_for_release`（条件更新）防同一成员被两条路径各捞一次。少了后者，
+   上游被调两次且配额被扣两次（网关零资金动作、无从补救）。
+3. **每个槽恰好还一次**（掩码置零与判定在同一条 UPDATE 里）；`slot_flags` 缺键视为已占槽，
+   否则本特性上线前的在途任务终态时不还槽，槽位漏到 TTL（48h）。
+4. 取消**必须退批**，否则整批计数永远差几条到不了 N，只能干等 T。
+5. 放行权与还槽权**都不动状态列**（状态列承载终态不可逆，取消/判死都在抢它）。
+
+### 失败模式
+
+| 现象 | 处置 |
+|---|---|
+| 放行时占不到并发槽 | 退避重排（`data.requeue_attempts` 落库），到点由延迟任务或 sweep 再试 |
+| T 触发的延迟任务丢失 / Redis 整体丢数据 | `sweep_queue_once` 的超期兜底按 `data.batch_due_at` 捞回（最坏多等一个 sweep 周期 + 宽限 120s） |
+| 抢到放行权之后进程崩溃（行停在 `releasing`） | 兜底先用 `unclaim_for_release` 退回等待态再放行；**判据用 `updated_at` 而非 `batch_due_at`**，否则正在飞的放行会被误判 |
+| 客户端在等待期取消 | 退批 + 不还从未占过的槽；上游从未收到过该任务，无需取消上游 |
+| 分批头非法 | `400`（`invalid_batch_size` / `invalid_batch_wait` / `batch_wait_too_long`），且不留任务行、不占槽、不入批 |
+
 ## 13. 已知限制
 
 以下五条取自本仓库 ADR-010「已知限制」，是**必须写进运维文档**的登记项，不是待办清单：
@@ -573,25 +626,31 @@ CANCELED)` 不可逆，迟到快照丢弃。
 
 ## 14. 与 stask 的分工，以及明确不做
 
-分工口径按本仓库 ADR-010 重写：**不再按「有无资金动作」分，而按「包哪种上游」分**。
+分工口径（2026-09-13 修订）：**两者都是任务队列服务**——不按「有无资金动作」分，
+也不是「谁转谁」，而是按**当前准入哪种任务**（包的是哪类上游）分。
 
 | | 本仓库 atask | stask-service |
 |---|---|---|
-| 语义 | **异步转异步**：上游本身就是任务型 | **同步转异步**：把同步接口任务化 |
-| 前缀 | `/batch/{上游原生路径}` | `/async/{上游原生路径}` |
+| 服务身份 | **任务队列**（提交 → 推进 → 取结果） | **任务队列**（同左） |
+| 当前准入 | 只接受**异步任务**：做**排队异步**（上游异步 → 接管为本地异步任务入队排队） | 只接受**同步任务**：上游是同步接口，由它完成任务化（同产本地异步） |
+| 前缀 | `/queue/{上游原生路径}` | `/queue/{上游原生路径}` |
 | 资金 | 零动作，配额上游 relay 扣减 | 零代码，资金在 new-api relay 内闭环 |
 | 持有任务事实源 | 是（tasks 表 + 状态机 + 收敛） | 是 |
 
 **明确不做**（这是「零配置、原样转发」的对价，不许含糊）：渠道级 `model_mapping` /
 `param_override` / `default_params`；产物直链改写（`result_url_template`）；渠道级
 `timeout_sec`（降级为全局 `RELAY_TIMEOUT_SECONDS`）；`auth_type`（固定 Bearer，x-api-key /
-none 形态不支持）；body 字段白名单（`body_allowlist`）；旧形态兼容（本仓库 ADR-010 §1）。
+none 形态不支持）；body 字段白名单（`body_allowlist`）；旧形态兼容（本仓库 ADR-010 §1）；
+**把 N 条攒批合并成一次上游请求**（本仓库 ADR-011 §1，stask 同样不做——攒批只改变**提交
+时机**，不改变请求的数量与形态）。
 
 **接入不符合 new-api 约定的上游需要改代码**——这是本仓库 ADR-010 明示的负向。
 
 ## 15. 相关文档
 
 - **本仓库 ADR-010**：本文的上位决策（对外形态、鉴权与计费下沉、寻址、收敛、失败三档）；
+- **本仓库 ADR-011**：攒批放行（提交时机、并发槽占用点、两层幂等与还槽权）——本文
+  §12.1 是它的架构视图，冲突以 ADR-011 为准；
 - **本仓库 ADR-001**（复用 tasks 表 + `platform` 隔离）、**本仓库 ADR-004**（时间列归一）、
   **本仓库 ADR-009**（异常分层与模块局部性）——**继续有效**；
 - **本仓库 ADR-002 / ADR-005 / ADR-006 / ADR-007**——**已被本仓库 ADR-010 取代**；本仓库

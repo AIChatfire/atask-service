@@ -3,9 +3,9 @@
     make bench TOKEN=sk-xxx                                                  # 默认 dry-run：只探活 + 打印计划
     make bench TOKEN=sk-xxx UPSTREAM_PATH=v1/tasks MODEL=your-model
 
-提交目标形如 ``{base-url}/batch/{上游路径}``——本仓库对外只有 ``/batch/{上游路径}``
-一种形态（ADR-010：异步转异步的统一中继；前缀叫 ``/batch`` 而非 ``/async``，因为
-``/async/`` 在 nginx 上已归 stask-service）。
+提交目标形如 ``{base-url}/queue/{上游路径}``——本仓库对外只有 ``/queue/{上游路径}``
+一种形态（ADR-010：异步转异步的统一中继；前缀叫 ``/queue`` 而非 ``/queue``，因为
+``/queue/`` 在 nginx 上已归 stask-service）。
 
 注意：**真实提交会创建真实任务并消耗上游真实额度**（配额由上游 relay 扣减，
 网关本身零资金动作，不做任何预扣 / 结算）。本脚本因此默认只做 dry-run；要真正
@@ -42,8 +42,8 @@ DEFAULT_BODY: dict[str, Any] = {"model": "your-model", "prompt": "bench", "durat
 
 
 def _target_url(base_url: str, path: str) -> str:
-    """受理 URL：``{base}/batch/{上游路径}``（对外唯一形态，见 ADR-010）。"""
-    return f"{base_url.rstrip('/')}/batch/{path.lstrip('/')}"
+    """受理 URL：``{base}/queue/{上游路径}``（对外唯一形态，见 ADR-010）。"""
+    return f"{base_url.rstrip('/')}/queue/{path.lstrip('/')}"
 
 
 def _percentile(samples: list[float], pct: float) -> float:
@@ -162,7 +162,7 @@ def main() -> int:
     parser.add_argument("--token", required=True, help="new-api 用户令牌 sk-xxx")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     # 默认值只是占位符，跑之前必须替换为真实存在的上游路径与模型。
-    parser.add_argument("--path", default="v1/tasks", help="上游原生路径（受理目标 /batch/{path}）")
+    parser.add_argument("--path", default="v1/tasks", help="上游原生路径（受理目标 /queue/{path}）")
     parser.add_argument("--model", default="your-model")
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--requests", type=int, default=100)

@@ -2,7 +2,7 @@
 
 本模块刻意**不** import ``providers`` / ``pricing`` / ``registry`` /
 ``preflight``——旧链路（keypool 取 key + billing 内省）删除后，
-``extract_token`` 仍被新 ``/batch`` 链路使用（见 ``app/services/relayflow.py``），
+``extract_token`` 仍被新 ``/queue`` 链路使用（见 ``app/services/relayflow.py``），
 故抽到中性位置，删旧模块不打断新链路。
 
 安全红线：``TokenCtx.hash`` 是本地身份替身（限流/并发/幂等键）；

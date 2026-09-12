@@ -51,12 +51,23 @@ async def _run_worker() -> None:
 
 
 async def _run_scheduler() -> None:
-    """在当前事件循环里跑 taskiq scheduler（延迟派发 + 每分钟 sweep）。"""
+    """在当前事件循环里跑 taskiq scheduler（延迟派发 + 每分钟 sweep）。
+
+    ``interval=1s``：攒批的 T 触发走 ``schedule_by_time``（延迟派发），而 scheduler
+    默认**按分钟对点唤醒**（taskiq 0.11 ``run_scheduler_loop``）。不设这一项时，
+    ``batch_wait`` 的实际放行最坏会晚 60s——正确性由 sweep 的超期兜底保证（最坏也是
+    多等一个周期），但「配了 30s 却要等到下一分钟」会让攒批看起来没生效。
+
+    与 compose 形态的 ``taskiq scheduler ... --update-interval 1`` 是同一件事，
+    两处都要改（这是第三个部署形态：Makefile 的 make scheduler / compose / 本文件）。
+    """
+    from datetime import timedelta
+
     from taskiq.api import run_scheduler_task
 
     from app.queue import scheduler
 
-    await run_scheduler_task(scheduler)
+    await run_scheduler_task(scheduler, interval=timedelta(seconds=1))
 
 
 async def _run_web(stop: asyncio.Event) -> None:

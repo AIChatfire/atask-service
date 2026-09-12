@@ -31,7 +31,11 @@ jobs:
           pip install -e '.[dev]'
 
       - name: Lint with ruff
-        run: ruff check app tests
+        # 路径清单必须与 Makefile 的 LINT_PATHS **逐项一致**：本地跑的是
+        # `app tests scripts gunicorn.conf.py`，CI 曾只跑 `app tests`——于是
+        # scripts/ 与 gunicorn.conf.py 的 lint 错误能在 CI 里绿着进主干。
+        # 两份清单是否一致由 tests/test_static_gates.py::test_lint_path_list_matches_ci 机械校验。
+        run: ruff check app tests scripts gunicorn.conf.py
 
       - name: Type check with mypy
         run: mypy app/

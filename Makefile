@@ -39,7 +39,10 @@ worker:  ## 本地起 worker（上游提交/探测/通知/sweep）
 	.venv/bin/taskiq worker app.queue:broker --max-async-tasks 10240
 
 scheduler:  ## 本地起 scheduler（延迟派发 + 每分钟 sweep；必须单副本）
-	.venv/bin/taskiq scheduler app.queue:scheduler
+	# --update-interval 1 让「延迟派发」有秒级精度：攒批的 T 触发走 schedule_by_time，
+	# scheduler 默认按分钟对点唤醒（taskiq 0.11 的 run_scheduler_loop），不设它会让
+	# batch_wait 的实际放行最坏晚 60s（正确性由 sweep 的超期兜底保证，只是慢）。
+	.venv/bin/taskiq scheduler app.queue:scheduler --update-interval 1
 
 standalone:  ## 本地单进程起全套（web + worker + scheduler，免 .env 也可跑）
 	$(PY) -m app.standalone

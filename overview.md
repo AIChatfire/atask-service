@@ -2,24 +2,24 @@
 
 > 体例对齐同族仓库 stask-service 的 `overview.md`。
 > 本文件是**一次专项的交付记录**，不是架构文档——决策看 `docs/decisions/`
-> （本轮核心是本仓库 ADR-010：`docs/decisions/ADR-010-batch-path-zero-billing.md`），
-> 架构总览看 `docs/ARCH-batch-relay-lifecycle.md`，契约看 `docs/SPEC.md`。
+> （本轮核心是本仓库 ADR-010：`docs/decisions/ADR-010-queue-path-zero-billing.md`），
+> 架构总览看 `docs/ARCH-queue-relay-lifecycle.md`，契约看 `docs/SPEC.md`。
 > 凡涉及具体数字，均标注采集时间与采集命令。
 
 ## 已完成
 
-### 对外形态统一为 `/batch/{上游原生路径}`
+### 对外形态统一为 `/queue/{上游原生路径}`
 
-- 唯一形态三件套（`app/routers/batch_task.py`，通配路由最后注册）：
-  `POST /batch/{path}`（受理，`202 + {task_id, status}` + `Location` 头）、
-  `GET /batch/{path}/{task_id}`（查询）、`DELETE /batch/{path}/{task_id}`（取消）。
+- 唯一形态三件套（`app/routers/queue_task.py`，通配路由最后注册）：
+  `POST /queue/{path}`（受理，`202 + {task_id, status}` + `Location` 头）、
+  `GET /queue/{path}/{task_id}`（查询）、`DELETE /queue/{path}/{task_id}`（取消）。
 - `{biz}` 段从 URL **彻底移除**：biz 本就由渠道元数据提供，URL 段只是入口标签，
   去掉不丢信息。**不做任何旧形态兼容**。
-- 前缀刻意选 `/batch` 而非 `/async`：① 本仓库是「异步转异步」，`async` 是 stask 的
-  语义（本仓库 ADR-008）；② 更硬的理由是 nginx 前缀分流冲突——
-  `docs/stask-service-design.md` §7 的 nginx 方案里 `/async/` 已归 stask。
+- **两层前缀**（2026-09-13 定）：对外统一 `/async`（与 stask 一致，客户端只记一个；
+  nginx 按路径分流并重写），网关内部为 `/queue/{上游原生路径}`（与机制名同源）。
+  早先的 `/batch` 前缀已废弃。见本仓库 ADR-010 §1。
 - 旧原生透传形态（`/{biz}/v1/tasks`、`/{biz}/v1/videos`、`/{biz}/{原生路径}`）删除；
-  免费 GET 透传并入 `GET /batch/{path}`（末段不是本地 id 时降级为原样转发）。
+  免费 GET 透传并入 `GET /queue/{path}`（末段不是本地 id 时降级为原样转发）。
 
 ### 鉴权与计费全部下沉上游（网关零资金动作）
 
@@ -44,17 +44,42 @@
 
 ### 终态收敛与失败分流
 
-- **单一终态收口点** `relayflow._finalize_batch`：视图探测 / 后台 sweep / worker 提交
+- **单一终态收口点** `relayflow._finalize_queue`：视图探测 / 后台 sweep / worker 提交
   共用同一份实现——CAS 抢推进权 → 记一条状态迁移日志 → 落终态快照（≤8KB）→ 释放并发槽
   → 投递用户回调 → 清令牌会话。
-- 后台 `batch_sweep_task`（cron 每分钟、独立重入锁）探测非终态任务，候选**最旧优先**
+- 后台 `queue_sweep_task`（cron 每分钟、独立重入锁）探测非终态任务，候选**最旧优先**
   （`updated_at ASC`）；令牌会话过期则跳过（不判死、不释槽）。
-- 用户回调由受理时的 `X-Callback-Url` 头驱动，终态经 `app/services/notify.py`
-  HMAC-SHA256 签名后投递（重试 + 死信）。
+- 用户回调地址在受理时确定：`X-Callback-Url` 头优先，body 顶层 `callback_url` 兜底
+  （上游 API 文档口径，如火山方舟 Seedance）；两者都过 `callback_addr` 的 fail-closed
+  白名单（仅 http(s)、拒私网字面 IP、`CALLBACK_ALLOWLIST` 空即全拒）。终态经
+  `app/services/notify.py` HMAC-SHA256 签名后投递（重试 + 死信）；**只推终态**。
+  客户端对接契约见 `docs/CALLBACK-CONTRACT.md`。
 - 提交失败收敛为**三档**：4xx → FAILURE + 还槽 + 清会话；5xx/传输错误 → 留活重试；
   2xx 缺 id → FAILURE。
-- 保留不变的既有契约：复用 new-api `tasks` 表 + `platform='gateway'` 隔离、
+- 保留不变的既有契约：复用 new-api `tasks` 表 + `platform='atask'` 隔离、
   时间列归一、幂等原子占位、按 token hash 的并发上限、原生报文同构与终态快照回放。
+
+### 攒批放行（ADR-011）
+
+把「上游提交」从受理时刻解耦：攒够 N 条或等够 T 秒才整批**提交上游**
+（**不合并请求**——上游是 new-api 约定式异步接口，没有批量端点；这一条与 stask 一致）。
+
+- 两个触发器一个放行点：N 触发（成员数达到 `BATCH_SIZE`，**只投递不同步放行**）、
+  T 触发（`schedule_by_time` 排的延迟任务，不照搬 stask 的 cron 自旋）、外加 sweep 的
+  超期兜底（跑在既有的每分钟 `queue_sweep_task` 上）；
+- **等待期不占并发槽**，是唯一改变对外语义的一条：占槽点从受理搬到放行，因此攒批路径
+  **受理不再因并发满而 429，改为排队**；放行时占不到槽则指数退避 + 抖动重排；
+- 状态零新增：复用 `SUBMITTED` + `data.batch_state`
+  （`waiting` / `releasing` / `released` / `requeued`），对外只暴露 `waiting` /
+  `released`（`requeued` 漏出去会让客户端去等一个永不到达的批次事件）；
+- 恰好一次的两道关：批次级 Redis 原子摘取（`LUA_BATCH_CLAIM`）+ 成员级 DB 条件更新
+  （`taskstore.claim_for_release`）；还槽则有「谁把 `data.slot_flags` 置零谁去 DECR」
+  （`taskstore.claim_slot_release`）；
+- **默认关闭**：`BATCH_SIZE=0` 表示收到即提交，开箱行为与本特性之前逐字节一致。
+- 新增用例 `tests/test_batching.py`，并对四处关键不变量做过变异测试自证（还槽不校验
+  掩码 / 去掉等待态提交闸门 / 取消不退批 / 放行不抢放行权）。**第一轮抓到一条假绿**：
+  原「已放行的成员只 SKIPPED」用例走的其实是快速路径、从未打到抢放行权那一关，已补
+  `test_lost_claim_race_never_takes_slot_nor_submits` 专门覆盖那个 TOCTOU 窗口。
 
 ### 删除旧链路
 
@@ -89,7 +114,7 @@ $ .venv/bin/python -m pytest tests/ -q
 
 （复核时另出现一次 `1 failed, 182 passed`：唯一失败为静态门禁
 `tests/test_static_gates.py::test_repo_has_no_real_secrets`，命中同期编辑中的
-`docs/ARCH-batch-relay-lifecycle.md` 里的 userinfo 示例写法，属该文档的清理项；
+`docs/ARCH-queue-relay-lifecycle.md` 里的 userinfo 示例写法，属该文档的清理项；
 本轮三个交付文件（`README.md` / `AGENTS.md` / 本文件）不在此门禁命中范围内。）
 
 测试规模：16 个测试文件；单测**不依赖真实** MySQL / Redis / 上游
@@ -101,11 +126,11 @@ $ .venv/bin/python -m pytest tests/ -q
 
 ## 重要契约变化
 
-1. **[破坏性] 对外形态从 `/{biz}/...` 改为 `/batch/{path}`**
+1. **[破坏性] 对外形态从 `/{biz}/...` 改为 `/queue/{path}`**
    旧形态 `POST /{biz}/v1/tasks`、`/{biz}/v1/videos`、通配 `/{biz}/{原生路径}` 全部
    删除，`{biz}` 段不再出现在 URL 中；`DELETE` 取代旧的
    `POST /{biz}/v1/tasks/{task_id}/cancel` 取消形态。**不提供任何旧形态兼容**——
-   客户端必须改打到 `/batch/{上游原生路径}`。
+   客户端必须改打到 `/queue/{上游原生路径}`。
 
 2. **[破坏性] 网关零资金动作，不再有计费接口**
    不再调用任何 freeze / settle / cancel；`tasks.data` 不再写
@@ -134,6 +159,22 @@ $ .venv/bin/python -m pytest tests/ -q
    `docker-compose.yml` 使用 `env_file: .env`；`TASKIQ_ADMIN_API_TOKEN` 使用 `:?`
    守卫，缺失即报错。
 
+8. **[行为变更，仅攒批路径] 受理不再因并发满而 429，改为排队**
+   攒批路径（`BATCH_SIZE>=2` 或客户端声明 `X-Batch-Size`）的并发槽占用点从**受理**
+   搬到**放行**，因此并发满时不再拒绝，而是入批/退避重排（`ADR-011` §3）。非攒批路径
+   行为不变。**依赖 429 做退避的客户端需要相应调整**（429 仍出现在限流
+   `RATE_LIMIT_PER_MINUTE` 与免费 GET 的 IP 限流上）。另外新增 `X-Batch-Size` /
+   `X-Batch-Wait` / `X-Batch-Key` 三个头：**非法值一律 400 且不留痕**（不落库、不占槽、
+   `batch_enabled=false` 时同样报错——否则「关着不报错、打开才报错」会变成切换开关后
+   才暴露的客户端 bug）。
+
+9. **[部署动作] scheduler 需要 `--update-interval 1`**
+   攒批的 T 触发走 `schedule_by_time`，而 taskiq 0.11 的 scheduler 默认按分钟对点唤醒
+   （`next_run = now + 1min`），不设这一项时 `batch_wait` 的实际放行最坏晚约 60s。
+   三个形态都要带上：`Makefile` 的 `make scheduler`、`docker-compose.yml` 的 worker
+   命令、`app/standalone.py` 的 `run_scheduler_task(interval=...)`。
+   **正确性不依赖它**（投递丢失/迟到都由 sweep 的超期兜底接住），只影响准点程度。
+
 ## 后续事项
 
 1. **待轮换凭据**（凭据一旦泄露，改文件不等于止损）：
@@ -144,7 +185,7 @@ $ .venv/bin/python -m pytest tests/ -q
    - `README.md` / `AGENTS.md` / 本文件已按本仓库 ADR-010 更新；
    - `docs/decisions/README.md` 的 ADR 一览与阅读顺序仍按旧架构书写
      （ADR-002 / ADR-005 / ADR-006 / ADR-007 已被 ADR-010 取代），需同步；
-   - `docs/SPEC.md` 与 `docs/ARCH-batch-relay-lifecycle.md` 同步更新中。
+   - `docs/SPEC.md` 与 `docs/ARCH-queue-relay-lifecycle.md` 同步更新中。
 
 3. **线上（宝塔面板）环境变量须对齐**：无前缀键名 + `UPSTREAM_BASE_URL` /
    `UPSTREAM_ALLOWLIST`，并确认 nginx 无条件注入 `X-Upstream-Base-Url`。

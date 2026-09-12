@@ -1,9 +1,13 @@
-"""运维端点：队列观测、任务诊断与补号。
+"""运维端点：队列观测、攒批视图、任务诊断与补号。
 
 安全：鉴权统一走 ``app.deps.admin.require_admin``（``X-Admin-Token``）。
 **未配置 ``ADMIN_TOKEN`` 时整个 /ops/* 返回 404（fail-closed）**——
 与 ``/admin/*`` 同一语义。``/ops/requeue``、``/ops/dlq/replay`` 是写操作，
 更不允许裸奔。
+
+``/ops/batches`` 刻意留在管理面而不是用户面：归组键可能是 ``token:model`` 形式
+（``BATCH_GROUP_BY=token_model``）或客户端自定义串（``X-Batch-Key``），
+**含 token 指纹**——不能给任意已鉴权调用者看。
 """
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app import queue
 from app.deps.admin import require_admin
 from app.logging import log
-from app.services import taskstore, tokensession
+from app.services import batching, taskstore, tokensession
 
 router = APIRouter()
 
@@ -20,6 +24,19 @@ router = APIRouter()
 async def queue_stats(_: None = Depends(require_admin)):
     """队列健康快照：pending 积压 / delayed 延迟任务 / dlq 死信 / 任务状态分布"""
     return await queue.queue_stats()
+
+
+@router.get("/ops/batches")
+async def batch_stats(_: None = Depends(require_admin)):
+    """攒批概览：每个归组键攒了多少条、还有多久到期。
+
+    回答的是 DB 说不清的事——DB 只有逐条的 ``data.batch_due_at``，没有「这一批现在
+    几条」。``due_in`` 为负表示**已过期仍在等**（T 触发的延迟任务漏了，等 sweep 的
+    超期兜底捞回），那正是排障最需要看到的信号。
+    """
+    view = await batching.stats()
+    log.info("ops batch stats: {} batch(es)", len(view["batches"]))
+    return view
 
 
 @router.get("/ops/tasks/{task_id}")
@@ -65,8 +82,8 @@ async def task_diagnostics(task_id: str, _: None = Depends(require_admin)):
 
 @router.post("/ops/requeue/{task_id}")
 async def requeue_task(task_id: str, _: None = Depends(require_admin)):
-    """手动补单：立即把 ``/batch`` 任务重新放入提交队列（worker 执行上游提交）。"""
-    await queue.publish_batch_submit(task_id)
+    """手动补单：立即把 ``/queue`` 任务重新放入提交队列（worker 执行上游提交）。"""
+    await queue.publish_queue_submit(task_id)
     return {"requeued": task_id}
 
 

@@ -37,8 +37,12 @@ from app.services.upstream_addr import assert_upstream_allowed
 
 
 class RelayError(Exception):
-    """中继出站失败。``status`` 口径与 ``upstream.UpstreamError`` 一致：
-    599 / 5xx 为模糊失败（基础设施或上游故障，可重试），4xx 为上游确定性拒绝。
+    """中继出站失败。``status`` 口径（本模块自定，见 ``call_upstream``）：
+
+    - 4xx：上游**确定性拒绝**（重试无意义）→ 调用方判 FAILURE；
+    - 5xx 与 599：**模糊失败**（基础设施/上游故障，或我方 base_url 缺失哨兵），
+      上游可能已接单 → 调用方留活重试，绝不判死；
+    - 传输错误（超时/连接失败）同样按 599 归入模糊失败。
 
     ``body`` 保留上游响应原文（仅用于日志与失败文案，绝不整段外发）。
     """

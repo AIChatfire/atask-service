@@ -22,8 +22,8 @@ from app.redis import K_BREAKER
 from app.services import relay, upstream
 
 UP_BASE = "http://upstream.test"
-BIZ = "upstream.test"          # 熔断键取上游 host:port（relay._breaker_key）
-KEY = K_BREAKER.format(biz=BIZ)
+UPSTREAM_HOST = "upstream.test"   # 熔断键取上游 host:port（relay._breaker_key）
+KEY = K_BREAKER.format(host=UPSTREAM_HOST)
 
 
 @pytest.fixture
@@ -46,18 +46,18 @@ def breaker_settings(monkeypatch: pytest.MonkeyPatch):
 
 async def test_report_accumulates_failures_with_window_ttl(patch_redis, breaker_settings):
     breaker_settings.upstream_breaker_window_seconds = 17
-    await upstream.breaker_report(BIZ, ok=False)
-    await upstream.breaker_report(BIZ, ok=False)
-    await upstream.breaker_report(BIZ, ok=False)
+    await upstream.breaker_report(UPSTREAM_HOST, ok=False)
+    await upstream.breaker_report(UPSTREAM_HOST, ok=False)
+    await upstream.breaker_report(UPSTREAM_HOST, ok=False)
     assert await patch_redis.get(KEY) == "3"
     ttl = await patch_redis.ttl(KEY)
     assert 0 < ttl <= 17                  # 窗口 TTL 落上，计数不会永久残留
 
 
 async def test_report_success_clears_counter(patch_redis, breaker_settings):
-    await upstream.breaker_report(BIZ, ok=False)
+    await upstream.breaker_report(UPSTREAM_HOST, ok=False)
     assert await patch_redis.get(KEY) == "1"
-    await upstream.breaker_report(BIZ, ok=True)
+    await upstream.breaker_report(UPSTREAM_HOST, ok=True)
     assert await patch_redis.get(KEY) is None
 
 
@@ -69,15 +69,15 @@ async def test_report_success_clears_counter(patch_redis, breaker_settings):
 async def test_guard_opens_only_at_threshold(patch_redis, breaker_settings):
     breaker_settings.upstream_breaker_threshold = 3
     await patch_redis.set(KEY, 2)
-    await upstream.breaker_guard(BIZ)                     # 2 < 3：放行
+    await upstream.breaker_guard(UPSTREAM_HOST)                     # 2 < 3：放行
 
     await patch_redis.set(KEY, 3)
     with pytest.raises(upstream.BreakerOpenError):
-        await upstream.breaker_guard(BIZ)                 # 3 >= 3：打开
+        await upstream.breaker_guard(UPSTREAM_HOST)                 # 3 >= 3：打开
 
 
 async def test_guard_passes_when_no_counter(patch_redis, breaker_settings):
-    await upstream.breaker_guard(BIZ)                     # 无键 → 放行，不抛
+    await upstream.breaker_guard(UPSTREAM_HOST)                     # 无键 → 放行，不抛
 
 
 # ---------------------------------------------------------------------------

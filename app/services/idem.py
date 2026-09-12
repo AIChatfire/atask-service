@@ -19,7 +19,8 @@ from app.config import settings
 from app.redis import K_IDEM, LUA_CAS_DELETE, r
 
 #: 占位标记：创建链路在飞（受理 → 落库 → 回填）期间的键值；
-#: task_id 形态为 ``{biz}_{uuid4hex}``，绝不与本标记碰撞
+#: task_id 形态为 ``queue_{uuid4hex}``（``ids.new_task_id("queue")``），
+#: 绝不与本标记碰撞
 PENDING = "pending"
 
 #: 短轮询间隔（秒）：等待占位回填的并发请求按此节奏读键

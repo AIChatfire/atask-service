@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "atask-service"
 version = "0.2.0"
-description = "异步 AI 网关：动态路由 + keypool/newapi-billing 两微服务协同，配置驱动接入任意异步模型"
+description = "任务队列服务：对外统一 /queue/{上游路径} 中继，鉴权与计费下沉上游，网关零资金动作（本仓库 ADR-010）"
 requires-python = ">=3.12"
 dependencies = [
     # Web 框架与 ASGI 服务

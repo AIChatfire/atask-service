@@ -5,7 +5,7 @@
 假会话**直接断言生成的 SQL 文本与绑定参数**。
 
 覆盖：
-- ``stale_batch_active``：``limit`` 夹到 1..200、时间比较走 ``_secs``、**无 ``SELECT data``**；
+- ``stale_queue_active``：``limit`` 夹到 1..200、时间比较走 ``_secs``、**无 ``SELECT data``**；
 - ``search_tasks``：``limit`` 夹紧 / ``offset`` 非负、同样无 ``SELECT data``；
 - ``as_unix_seconds`` / ``duration_seconds`` / ``_row_to_dict`` 的时间单位归一。
 """
@@ -62,18 +62,18 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
 
 
 # ---------------------------------------------------------------------------
-# stale_batch_active
+# stale_queue_active
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(("given", "expected"), [(0, 1), (-5, 1), (9999, 200), (50, 50)])
-async def test_stale_batch_limit_is_clamped(captured, given, expected):
-    await ts.stale_batch_active(stale_seconds=300, limit=given)
+async def test_stale_queue_limit_is_clamped(captured, given, expected):
+    await ts.stale_queue_active(stale_seconds=300, limit=given)
     assert captured[0][1]["lim"] == expected
 
 
-async def test_stale_batch_sql_discipline(captured):
-    await ts.stale_batch_active(stale_seconds=300, limit=50)
+async def test_stale_queue_sql_discipline(captured):
+    await ts.stale_queue_active(stale_seconds=300, limit=50)
     sql, params = captured[0]
     assert ts._secs("updated_at") in sql
     assert "select data" not in sql.lower()               # token_hash 泄露红线

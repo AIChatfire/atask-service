@@ -23,10 +23,10 @@ Redis 不可用时**返回空覆盖并静默回落 env**——动态配置是增
 
 ## 键规范
 
-覆盖值存在**单个 Redis Hash** `gw:dynconf`（一次 HGETALL 拿全量），键前缀与
-本项目 ``gw:`` 规范一致。规范本应集中写在 ``app/redis.py`` 的 ``K_`` 常量区，
-但本模块的改动范围内没有 ``app/redis.py`` 的修改权，故键常量先就地定义；
-**后续应上移到 app/redis.py 并在此处改为 import**（已登记为本模块 TODO）。
+覆盖值存在**单个 Redis Hash** `atask:dynconf`（一次 HGETALL 拿全量）。前缀取自
+``app.redis.KEY_PREFIX``（键名的单一构造点），本模块不再自己拼前缀；而**这个键常量本身
+仍就地定义**——把它上移到 ``app/redis.py`` 的 ``K_`` 常量区是既定 TODO（见下方 ``_KEY``），
+与本次「前缀收敛」是两件事，别顺手合并成一件半成品。
 """
 
 from __future__ import annotations
@@ -38,11 +38,11 @@ from typing import Any, Literal
 
 from app.config import settings
 from app.logging import log
-from app.redis import r
+from app.redis import KEY_PREFIX, r
 
 #: Redis 里存放覆盖值的键（单个 Hash，一次 HGETALL 拿全量）。
 #: TODO: 上移到 app/redis.py 常量区（见模块 docstring）。
-_KEY = "gw:dynconf"
+_KEY = f"{KEY_PREFIX}:dynconf"
 
 #: 进程内缓存 TTL（秒）。
 _CACHE_TTL = 5.0
@@ -133,6 +133,20 @@ MUTABLE: dict[str, Spec] = {
         Spec("upstream_breaker_threshold", "int", "上游熔断阈值 (次)", "上游",
              minimum=1, maximum=100000,
              note="窗口内失败达到该次数即打开熔断 (窗口见 UPSTREAM_BREAKER_WINDOW_SECONDS)"),
+        Spec("batch_enabled", "bool", "攒批总闸门 (线上止血开关)", "攒批",
+             note="false = 忽略策略与客户端头，全部收到即提交。"
+                  "注意它只辖「入批」这一件事：**已经在批里等着的任务不会被它丢下**，"
+                  "仍由 T 触发与 sweep 的超期兜底放行"),
+        Spec("batch_size", "int", "每批条数 N", "攒批",
+             minimum=0, maximum=1000,
+             note="0/1 = 不攒批（收到即提交）；>=2 时攒够 N 条即整批放行。"
+                  "改小只让自己的批次更快放行；客户端可用 X-Batch-Size 逐请求覆盖"),
+        Spec("batch_wait_seconds", "int", "批次窗口 T (秒)", "攒批",
+             minimum=1, maximum=3600,
+             note="自本批首个成员起算，后续成员不刷新（否则涓涓细流永远等不到放行）。"
+                  "客户端可用 X-Batch-Wait 覆盖，上限见 MAX_BATCH_WAIT_SECONDS。"
+                  "硬约束：T + 单次上游提交超时必须远小于 SK_SESSION_TTL_SECONDS，"
+                  "否则放行时取不到令牌会话"),
     )
 }
 
@@ -147,6 +161,14 @@ IMMUTABLE_REASONS: dict[str, str] = {
     "gateway_platform": "启动项：tasks.platform 划分依据，改了会与共享表其他行混行",
     "rate_limit_per_minute": "限流基线：与并发上限不同，改它影响免费 GET 风控面，暂不开放",
     "upstream_allowlist": "安全项：上游 host 白名单，改它等于放开防 SSRF 的第二道防线",
+    "callback_allowlist": "安全项：回调 host 白名单，改它等于放开防 SSRF 的一道"
+                          "防线——网关会把任务报文主动 POST 到任何被放行的地址",
+    "callback_passthrough_upstream": "结构性开关：决定回调由网关还是上游投递，"
+                                     "热改会让在途任务出现两种回调来源",
+    "batch_group_by": "结构性开关：归组维度（model / token_model）改它等于换一套"
+                      "「谁和谁同一批」的语义，在途批次会被劈成两半，须重启时定",
+    "max_batch_wait_seconds": "结构性上限：它是 batch_wait 的取值天花板，"
+                              "与 batch_wait 同时热改会造出「下限高于上限」的自我矛盾配置",
 }
 
 _cache: dict[str, Any] = {}

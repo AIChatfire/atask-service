@@ -437,7 +437,7 @@ def test_no_orphan_service_functions():
 # 顺便记录一条相关约定（详见本仓库 ADR-009）：本项目**不引入统一异常基类**。
 # 因为异常的处置是逐点决策的——同一类失败在不同链路上要做的事不同（重试 /
 # 判死 / 释槽 / 清会话），继承层级帮不上忙。就近定义（谁抛谁定义）让归属一眼可见。
-# ADR-010 后新链路的失败分流已收敛为三档（见 tests/test_batch_failure_tiers.py），
+# ADR-010 后新链路的失败分流已收敛为三档（见 tests/test_queue_failure_tiers.py），
 # 但「谁抛谁定义、不为分类而建基类」这条约定不变。
 
 
@@ -593,10 +593,10 @@ def test_settings_env_prefix_removed():
 
 
 # ---------------------------------------------------------------------------
-# 9. 路由注册顺序：通配 /batch/{path:path} 必须最后
+# 9. 路由注册顺序：通配 /queue/{path:path} 必须最后
 # ---------------------------------------------------------------------------
 # 规则目的：Starlette 的路由匹配是「注册顺序 = 首匹配优先级」，而不是「最具体
-# 优先」。ADR-010 后唯一带变量的路径路由是 ``/batch/{path:path}``（通配），它必须
+# 优先」。ADR-010 后唯一带变量的路径路由是 ``/queue/{path:path}``（通配），它必须
 # 排在字面前缀路由（``/healthz/*``、``/ops/*``、``/admin/*``）之后，否则会吞掉
 # 它们——请求静默落到错误的处理器上，且不会有任何报错提示。
 #
@@ -604,7 +604,7 @@ def test_settings_env_prefix_removed():
 # index——不写死 `grep -n` 行号，因为行号会随任何一次无关编辑漂移：门禁要么假绿
 # （行号移位后仍指向旧位置），要么假红（注释插一行就炸），两种结局都是被人删掉。
 
-_ROUTER_MUST_BE_LAST = "batch_task_router"          # /batch/{path:path} 通配
+_ROUTER_MUST_BE_LAST = "queue_task_router"          # /queue/{path:path} 通配
 
 
 def _include_router_names() -> list[str]:
@@ -629,7 +629,7 @@ def _include_router_names() -> list[str]:
 
 
 def test_router_mount_order():
-    """通配 `batch_task_router`（``/batch/{path:path}``）必须最后注册。
+    """通配 `queue_task_router`（``/queue/{path:path}``）必须最后注册。
 
     反例后果：通配若排在字面前缀路由之前，``/ops/*`` 与 ``/admin/*`` 会被当成
     其后的可变路径吞掉，管理面静默失效——请求照常返回，只是走到了错误的处理器。
@@ -641,7 +641,7 @@ def test_router_mount_order():
 
     assert _ROUTER_MUST_BE_LAST in names, f"{_ROUTER_MUST_BE_LAST} 未注册"
     assert names.index(_ROUTER_MUST_BE_LAST) == len(names) - 1, (
-        f"{_ROUTER_MUST_BE_LAST}（通配 /batch/{{path:path}}）必须最后注册，"
+        f"{_ROUTER_MUST_BE_LAST}（通配 /queue/{{path:path}}）必须最后注册，"
         f"否则会吞掉其后的字面前缀路由。实际注册序：{names}"
     )
 
@@ -719,3 +719,93 @@ def test_gates_scan_non_empty():
     assert list((ROOT / "docs" / "decisions").glob("*.md")), "docs/decisions 下没有决策文档"
     assert (ROOT / ".env.example").exists()
     assert (ROOT / "gunicorn.conf.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# 11. lint 路径清单：Makefile / CI / 本文件三处必须一致
+# ---------------------------------------------------------------------------
+
+
+def test_lint_path_list_is_identical_everywhere():
+    """``ruff`` 的路径清单在 Makefile、CI workflow 与本文件三处必须逐项一致。
+
+    反例后果（本项目真实出现过）：``Makefile`` 的注释写着「与 CI 保持同一份清单」，
+    实际本地跑 ``app tests scripts gunicorn.conf.py``、CI 只跑 ``app tests``——于是
+    ``scripts/`` 与 ``gunicorn.conf.py`` 的 lint 错误能在 CI 里绿着进主干。
+    「本地更严、CI 更宽」这类单向漂移**不会报错**，只会静默降低 CI 的守门能力。
+    """
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    found = re.search(r"^LINT_PATHS\s*:?=\s*(.+)$", makefile, re.M)
+    assert found, "Makefile 里找不到 LINT_PATHS 定义"
+    make_paths = found.group(1).split()
+
+    workflows = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+    assert workflows, "没有 CI workflow 可查（本门禁会空转）"
+    ci_lists = [
+        line.strip().split("ruff check", 1)[1].split()
+        for wf in workflows
+        for line in wf.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("run:") and "ruff check" in line
+    ]
+    assert ci_lists, "CI 里找不到 `ruff check` 的路径清单（本门禁会空转）"
+
+    assert make_paths == LINT_PATHS, (
+        "Makefile 的 LINT_PATHS 与本文件不一致：\n"
+        f"  本文件   {LINT_PATHS}\n  Makefile {make_paths}"
+    )
+    for got in ci_lists:
+        assert got == LINT_PATHS, (
+            "CI 的 ruff 路径清单与 LINT_PATHS 不一致：\n"
+            f"  LINT_PATHS {LINT_PATHS}\n  CI        {got}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12. 现行契约文档引用的模块路径必须真实存在
+# ---------------------------------------------------------------------------
+
+#: 「现行契约」文档：它们必须描述**当前代码**，故文中 `app/*.py` 路径必须存在。
+#: **刻意不含**被取代 / 归档的文档——ADR-002 / 005 / 006 / 007（已被 ADR-010 取代）、
+#: ADR-003 / ADR-004 的「来源」小节、`OPTIMIZATION_BACKLOG.md` 等：它们引用的是
+#: 「当时」的模块，属溯源记录，改掉反而抹掉历史（照 ADR「不要据其实现」的说明即可）。
+_CONTRACT_DOCS: tuple[str, ...] = (
+    "README.md", "AGENTS.md", "overview.md",
+    "docs/SPEC.md", "docs/ARCH-queue-relay-lifecycle.md",
+    "docs/decisions/README.md", "docs/decisions/OPEN-DECISIONS.md",
+    "docs/decisions/ADR-001-reuse-newapi-tasks-table.md",
+    "docs/decisions/ADR-008-division-with-stask-service.md",
+    "docs/decisions/ADR-009-exception-layering-and-module-locality.md",
+    "docs/decisions/ADR-010-queue-path-zero-billing.md",
+)
+#: 本仓库的模块路径形态（只认带 `app/` 前缀的写法）。
+_LOCAL_MODULE_PATH = re.compile(r"\bapp/[A-Za-z0-9_/]+\.py")
+#: **跨仓库引用**的行整行跳过：另一个仓库有同名模块（如 stask 的
+#: `app/services/submit.py`），在本仓库当然不存在。仓库约定是跨仓库引用必须带仓库名，
+#: 故按仓库名识别——带仓库名即视为已声明来源，不再当本仓库路径校验。
+_CROSS_REPO_MARKER = re.compile(r"stask-service|stask 的|stask 仓库")
+
+
+def test_contract_docs_reference_existing_modules():
+    """现行契约文档里引用的 `app/*.py` 路径必须真实存在。
+
+    这条要求本来就写在 `docs/SPEC.md` 自己头上（旧版 SPEC 曾描述 22 个不存在的
+    模块），但此前只靠人守——于是 ADR-009 长期引用已删的 `providers/__init__.py`、
+    `app/services/relay.py` 的 docstring 引用已删的 `UpstreamError`，都没人发现。
+    """
+    scanned = 0
+    offenders: list[str] = []
+    for rel in _CONTRACT_DOCS:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if _CROSS_REPO_MARKER.search(line):
+                continue
+            for path in _LOCAL_MODULE_PATH.findall(line):
+                scanned += 1
+                if not (ROOT / path).exists():
+                    offenders.append(f"{rel}:{lineno}: {path}")
+    # 范围断言：「扫到 0 处 → 0 个违规 → 绿灯」是这类门禁最典型的假绿形态
+    assert scanned >= 20, f"只扫到 {scanned} 处 app/*.py 引用，扫描范围可疑"
+    assert not offenders, (
+        "现行契约文档引用了不存在的模块（文档与代码已漂移）：\n  "
+        + "\n  ".join(offenders)
+    )

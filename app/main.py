@@ -1,8 +1,8 @@
 """FastAPI 应用装配入口。
 
 - 路由注册顺序即 Starlette 首匹配优先级：healthz → ops → admin →
-  ``/batch/{path:path}``（通配，**永远最后**；字面前缀路由必须先于通配注册）。
-- 对外形态只有 ``/batch/{上游原生路径}``（ADR-010）：鉴权与计费全部下沉上游，
+  ``/queue/{path:path}``（通配，**永远最后**；字面前缀路由必须先于通配注册）。
+- 对外形态只有 ``/queue/{上游原生路径}``（ADR-010）：鉴权与计费全部下沉上游，
   网关零资金动作、不持有上游 key。
 - 后台异步协同（提交/收敛/通知）由 taskiq 进程承担：
   ``taskiq worker app.queue:broker`` + ``taskiq scheduler app.queue:scheduler``。
@@ -51,15 +51,15 @@ def create_app() -> FastAPI:
 
     from app.healthz import router as health_router
     from app.routers.admin import router as admin_router
-    from app.routers.batch_task import router as batch_task_router
+    from app.routers.queue_task import router as queue_task_router
     from app.routers.ops import router as ops_router
 
     app.include_router(health_router)     # /healthz/live /healthz/ready
     app.include_router(ops_router)        # /ops/*（队列观测与补号）
     app.include_router(admin_router)      # /admin/*（看板与运行时热配置）
-    # 通配永远最后：``/batch/{path:path}`` 是唯一的可变路径路由，必须排在
+    # 通配永远最后：``/queue/{path:path}`` 是唯一的可变路径路由，必须排在
     # 字面前缀路由之后，否则会吞掉它们。
-    app.include_router(batch_task_router)  # /batch/{path:path}（ADR-010 唯一对外形态）
+    app.include_router(queue_task_router)  # /queue/{path:path}（ADR-010 唯一对外形态）
     return app
 
 

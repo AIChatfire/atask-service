@@ -113,6 +113,20 @@ def test_empty_allowlist_rejects_everything(addr_settings):
         assert exc.value.status_code == 400
 
 
+def test_empty_allowlist_says_so_in_the_error(addr_settings):
+    """空白名单的错误文案必须指向「没配白名单」，而不是「host 未命中」。
+
+    两条分支的行为相同（都是 400），差别只在**诊断方向**：后者会把运维引向
+    「这个 host 为什么没命中」，而真正的原因是压根没配 `UPSTREAM_ALLOWLIST`。
+    变异测试证明去掉空白名单分支后本用例变红（其余用例**抓不到** —— 它们只断言
+    状态码，而空 set 会落到下一条 host 分支，行为等价）。
+    """
+    addr_settings.upstream_allowlist = ""
+    with pytest.raises(HTTPException) as exc:
+        assert_upstream_allowed("http://newapi.internal/x")
+    assert "allowlist is empty" in str(exc.value.detail)
+
+
 def test_empty_base_url_is_400(addr_settings):
     """地址为空 → 无 host → 400（即使白名单已配）。"""
     addr_settings.upstream_allowlist = "newapi.internal"

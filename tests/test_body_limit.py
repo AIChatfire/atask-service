@@ -43,7 +43,7 @@ def body_settings(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(settings, "upstream_allowlist", "upstream.test")
     monkeypatch.setattr(settings, "upstream_base_url", UP_BASE)
-    monkeypatch.setattr(settings, "batch_deny_prefixes", "/api/,/console/")
+    monkeypatch.setattr(settings, "queue_deny_prefixes", "/api/,/console/")
     monkeypatch.setattr(settings, "body_max_bytes", _LIMIT)
     return settings
 
@@ -60,7 +60,7 @@ async def test_oversized_body_rejected_with_zero_side_effects(
     key = "idem-oversize"
     async with _client() as client:
         resp = await client.post(
-            "/batch/v1/tasks",
+            "/queue/v1/tasks",
             content=b"x" * (_LIMIT + 1),
             headers=_headers(**{"Idempotency-Key": key}),
         )
@@ -73,7 +73,7 @@ async def test_oversized_body_rejected_with_zero_side_effects(
 
         # 同键随后发正常请求：若上一发曾占位幂等键，这里会被回放/409，而不是新建
         follow = await client.post(
-            "/batch/v1/tasks",
+            "/queue/v1/tasks",
             content=b'{"model": "m"}',
             headers=_headers(**{"Idempotency-Key": key}),
         )
@@ -94,7 +94,7 @@ async def test_forged_small_content_length_cannot_bypass(
     real = b"x" * (_LIMIT * 4)
     async with _client() as client:
         resp = await client.post(
-            "/batch/v1/tasks",
+            "/queue/v1/tasks",
             content=real,
             headers=_headers(**{"Content-Length": "10"}),
         )
@@ -115,7 +115,7 @@ async def test_missing_content_length_chunked_cannot_bypass(
 
     async with _client() as client:
         resp = await client.post(
-            "/batch/v1/tasks", content=chunks(), headers=_headers(),
+            "/queue/v1/tasks", content=chunks(), headers=_headers(),
         )
 
     assert resp.status_code == 413, resp.text
@@ -134,7 +134,7 @@ async def test_body_exactly_at_limit_is_allowed(
     """恰好等于上限 → 放行（边界不误杀）。"""
     async with _client() as client:
         resp = await client.post(
-            "/batch/v1/tasks", content=b"z" * _LIMIT, headers=_headers(),
+            "/queue/v1/tasks", content=b"z" * _LIMIT, headers=_headers(),
         )
 
     assert resp.status_code == 202, resp.text
@@ -148,7 +148,7 @@ async def test_normal_small_request_unchanged(
     """正常小请求仍 202，受理链路行为不变。"""
     async with _client() as client:
         resp = await client.post(
-            "/batch/v1/tasks", json={"model": "MiniMax-H3"}, headers=_headers(),
+            "/queue/v1/tasks", json={"model": "MiniMax-H3"}, headers=_headers(),
         )
 
     assert resp.status_code == 202, resp.text
@@ -156,5 +156,5 @@ async def test_normal_small_request_unchanged(
     assert view["status"] == "SUBMITTED"
     row = task_store.rows[view["task_id"]]
     assert row["data"]["model"] == "MiniMax-H3"
-    assert queue_events["batch_submit"] == [view["task_id"]]
+    assert queue_events["queue_submit"] == [view["task_id"]]
     assert len(respx_router.calls) == 0

@@ -4,7 +4,7 @@
   ``from app.config import settings``，**禁止散读 ``os.environ``**
   （全项目唯一例外是 ``gunicorn.conf.py``——它由 master 进程在本单例之前加载）；
 - 逗号分隔序列字段以字符串承载、消费侧自行解析（如 ``upstream_allowlist`` /
-  ``batch_deny_prefixes``）。
+  ``queue_deny_prefixes``）。
 """
 
 from __future__ import annotations
@@ -59,8 +59,17 @@ class Settings(BaseSettings):
 
     # ---- 用户回调投递 ----
     callback_sign_secret: str = "change-me"  # 推送用户 callback_url 的 HMAC 签名密钥
+    # 允许的回调 host 列表（逗号分隔；**空 = 全部拒绝**，fail-closed）。用户回调目标
+    # 是可控 URL、而投递是网关主动出站，放行野地址等于开 SSRF 跳板（内网服务 /
+    # 云元数据），见 app/services/callback_addr.py。不配 = 没有客户端能收到回调。
+    callback_allowlist: str = ""
+    # 回调由谁投递：False = 网关接管（默认：提取头的 ``X-Callback-Url`` 或 body 的
+    # ``callback_url``、从转发体摘除、HMAC 签名投递 + 重试 + 死信）；True = 透传上游
+    # （网关既不摘除也不投递，指望上游自己回调）。**仅当上游自身实现了回调语义时
+    # 才开**——开了而上游不回调，客户端一个通知都收不到。
+    callback_passthrough_upstream: bool = False
 
-    # ---- /batch 后台收敛 ----
+    # ---- /queue 后台收敛 ----
     task_stale_seconds: int = 300         # 非终态任务超过该时长未更新则 sweeper 探测
 
     # ---- 上游数据面（提交/探测出站）----
@@ -70,7 +79,7 @@ class Settings(BaseSettings):
     upstream_breaker_threshold: int = 10  # 熔断：窗口内失败 N 次打开
     upstream_breaker_window_seconds: int = 30
 
-    # ---- /batch 中继（ADR-010：鉴权计费下沉上游，网关零资金动作）----
+    # ---- /queue 中继（ADR-010：鉴权计费下沉上游，网关零资金动作）----
     # 约定式链路没有渠道级 timeout_sec（该渠道元数据已整体放弃），
     # 出站超时降级为这一个全局默认值。
     relay_timeout_seconds: float = 60.0
@@ -82,9 +91,36 @@ class Settings(BaseSettings):
     # 502 拒绝且不开始流式（body 不消费）。未声明长度（chunked）不设中途截断，
     # 理由见 app.services.relay.stream_upstream。默认 100 MiB。
     upstream_response_max_bytes: int = 104_857_600      # 100 MiB
-    # 路径准入硬拒前缀（逗号分隔）：/batch/{path} 命中即拒（照 stask 的 /api、/console），
+    # 路径准入硬拒前缀（逗号分隔）：/queue/{path} 命中即拒（照 stask 的 /api、/console），
     # 防把上游管理面/控制台路径经本网关暴露出去。
-    batch_deny_prefixes: str = "/api/,/console/"
+    queue_deny_prefixes: str = "/api/,/console/"
+
+    # ---- 攒批（batching）：把「上游提交」延后到攒够 N 条或等够 T 秒 ----
+    # 语义：受理即落库并返回本地 task_id（状态 SUBMITTED），但**不立刻**投递上游
+    # 提交；入批等待，由「成员数达到 batch_size」或「首个成员写定的 deadline 到期」
+    # 触发整批放行（见 app/services/batching.py）。**不做任何「合并成一次上游请求」**
+    # 的事——上游是 new-api 约定式异步接口，没有批量端点。
+    #
+    # batch_size 默认 0 = 不攒批（收到即提交），因此**开箱行为与加此特性之前逐字节
+    # 一致**；要启用必须显式配 >=2，或由客户端用 X-Batch-Size 声明（仍受
+    # batch_enabled 这个总闸门管辖）。
+    batch_enabled: bool = True
+    batch_size: int = 0                   # 0/1 = 不攒批；>=2 才是攒批（上限 1000）
+    batch_wait_seconds: int = 30          # 批次窗口（首个成员写定，后续成员不刷新）
+    # X-Batch-Wait 的上限；也是「客户端只给 N 不给 T」时的兜底 T（不给兜底会让
+    # 整批立刻到期 = 攒批静默失效）。env-only：它是结构性上限，不开放热改，
+    # 否则「batch_wait 热改到 600 而 max 还是 300」会成为一类自我矛盾的配置。
+    max_batch_wait_seconds: int = 300
+    # 归组维度（谁和谁算同一批）：model（同模型跨 token 合并，批次更大）|
+    # token_model（与并发维度对齐：同一批放行的任务竞争同一个并发窗口）。
+    # env-only 结构性开关，不进热改白名单——改它等于换一套分组语义。
+    batch_group_by: str = "model"
+    # 整批放行的有界并发：一批若全并发放行，N 次 DB 条件更新 + N 次 Redis 往返会把
+    # 连接池打满，反而拖慢正常提交。
+    batch_release_concurrency: int = 8
+    # 放行时占不到并发槽 → 指数退避重排的上限（秒）。退避次数落库
+    # （data.requeue_attempts），Redis 掉数据不会让退避重新从 1 秒起步。
+    batch_backoff_max_seconds: int = 300
 
     # ---- 队列（taskiq）----
     event_max_attempts: int = 8           # 事件任务重试上限，超限落死信
@@ -98,10 +134,10 @@ class Settings(BaseSettings):
     taskiq_admin_api_token: str = ""      # 看板 API access-token
 
     # ---- Sweep（每分钟补数巡检）----
-    batch_sweep_batch: int = 50           # 每轮 /batch 后台收敛（探测推进终态）上限
-    # /batch 收敛独立重入锁 TTL：一轮可能串行探测 batch_sweep_batch 条 × 单条
+    queue_sweep_limit: int = 50           # 每轮 /queue 后台收敛（探测推进终态）上限
+    # /queue 收敛独立重入锁 TTL：一轮可能串行探测 queue_sweep_limit 条 × 单条
     # 出站超时，最坏会超过 1 分钟 cron——锁保证慢轮不叠加并发轮（多副本同理）。
-    batch_sweep_lock_ttl_seconds: int = 300
+    queue_sweep_lock_ttl_seconds: int = 300
     queue_stats_cache_seconds: int = 55   # 队列观测快照缓存（全库 scan + 全表 GROUP BY 降频）
 
 

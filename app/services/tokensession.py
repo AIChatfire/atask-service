@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from app.config import settings
 from app.logging import log
-from app.redis import r
+from app.redis import KEY_PREFIX, r
 
-_K = "gw:sk:{task_id}"
+#: 前缀取自 ``app.redis.KEY_PREFIX``（键名的单一构造点），本模块不再自己拼。
+_K = f"{KEY_PREFIX}:sk:{{task_id}}"
 
 
 async def store(task_id: str, raw_token: str) -> None:

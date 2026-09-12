@@ -1,16 +1,16 @@
-# stask-service 设计 — 同步转异步任务网关
+# stask-service 设计 — 任务队列服务（当前准入：同步任务）
 
 **版本**：v1.2　**日期**：2026-09-12　**状态**：定稿评审
 
-同步生成 API（出图/TTS）加 `/async` 前缀即任务化：毫秒返回本地 task_id，结果异步取回。计费零代码——资金操作全部在 new-api 原生 relay 内闭环。atask-service（异步任务网关）对外统一 `/batch/{上游路径}` 前缀（ADR-010），与本服务前缀互斥、共用同一 nginx 域名与 new-api tasks 表（隔离见 §3）。
+同步生成 API（出图/TTS）加 `/async` 前缀即任务化：毫秒返回本地 task_id，结果异步取回。计费零代码——资金操作全部在 new-api 原生 relay 内闭环。**atask-service 与本服务都是任务队列服务**，区别只在当前准入的任务类型：本服务只接受**同步任务**（同步接口 → 任务），atask 只接受**异步任务**（做**排队异步**：把上游异步接管为本地异步任务）。**对外与本服务共用 `/async` 前缀**（客户端只记一个；由 nginx 按路径分流，atask 侧反代并重写为它的内部端点 `/queue`，见 atask-service ADR-010 §1），共用同一 nginx 域名与 new-api tasks 表（隔离见 §3）。
 
 ## 1. 架构（三网关共域名）
 
 ```
-nginx（同一域名）
-├─ /batch/ → atask-service   （异步任务中继，ADR-010）
-├─ /async/ → stask-service   （本服务：同步转异步）
-└─ 其余    → new-api          （同步 relay 原生直连）
+nginx（同一域名，对外统一前缀 /async）
+├─ /async/<同步类路径>/ → stask-service   （本服务：准入同步任务 → 本地异步）
+├─ /async/其余          → atask-service   （反代并重写为内部 /queue/…；ADR-010）
+└─ 其余                 → new-api          （同步 relay 原生直连）
 
 stask web   提交：幂等占位 + 余额额度占槽 → 落库 SUBMITTED → 令牌会话 → 入队 → 返回 task_id
 stask worker 执行：派发锁 → 用户 sk 调 new-api relay → 响应即终态落库 → 释放槽/清会话/可选回调
@@ -23,14 +23,14 @@ new-api     渠道选择 / 配额扣费（预扣+实结）/ 限流 / 消费日�
 
 ## 2. API
 
-### 提交 `POST /async/{path}`（通配，仅 POST/PUT）
+### 提交 `POST /queue/{path}`（通配，仅 POST/PUT）
 
 - 剥前缀后 path/query/body 原文存储原样转发（浅解析 body 只为提 model）
-- 路径准入：`ST_ASYNC_ALLOW_PREFIXES` 白名单 + deny-list 硬拒 `/api/`、`/console/`、`/batch/`（atask 的地盘，走它自己的端点）；剥前缀后存储路径仍以 `/async/` 开头 → `400 double async prefix`（回环形态下 nginx 会把该路径路由回 stask 套建任务：外层终态响应退化为内层 202 受理回执、外层提前 SUCCESS、双占并发槽——静默语义破坏，必须准入即拒）
+- 路径准入：`ST_ASYNC_ALLOW_PREFIXES` 白名单 + deny-list 硬拒 `/api/`、`/console/`、`/async/`（atask 的地盘，走它自己的端点）；剥前缀后存储路径仍以 `/async/` 开头 → `400 double async prefix`（回环形态下 nginx 会把该路径路由回 stask 套建任务：外层终态响应退化为内层 202 受理回执、外层提前 SUCCESS、双占并发槽——静默语义破坏，必须准入即拒）
 - `Idempotency-Key` SET NX 原子占位，真并发 409；可选 `X-Callback-Url` 头
-- 响应：`202 + {task_id, status}` + `Location: /async/{path}/{task_id}` 头
+- 响应：`202 + {task_id, status}` + `Location: /queue/{path}/{task_id}` 头
 
-### 查询 `GET /async/{path}/{task_id}`（task_id 取最后一段，形态正则预筛）
+### 查询 `GET /queue/{path}/{task_id}`（task_id 取最后一段，形态正则预筛）
 
 | 状态 | 响应 |
 |---|---|
@@ -38,7 +38,7 @@ new-api     渠道选择 / 配额扣费（预扣+实结）/ 限流 / 消费日�
 | SUCCESS | `200` + 上游原生响应体字节级回放（gzip 解压，Content-Type 原样） |
 | FAILURE / CANCELED | 重放上游错误状态码 + 原文；本地失败用 `{"error": {...}}` |
 
-### 取消 `DELETE /async/{path}/{task_id}`
+### 取消 `DELETE /queue/{path}/{task_id}`
 
 排队中 → CANCELED（零资金动作）；执行中 → 409（同步调用不可中止）。
 
@@ -47,7 +47,7 @@ new-api     渠道选择 / 配额扣费（预扣+实结）/ 限流 / 消费日�
 **与 atask 双写隔离的三道闸**（atask 侧对称成立）：
 
 1. **platform 列**：stask 行统一 `platform = 'stask'`（atask 行统一 `platform = 'atask'`，配置 `GATEWAY_PLATFORM`）——双方的 CAS / sweep / 计数全部带 `platform = :p` 过滤，天然互不可见；
-2. **data.source**：stask 行 `source='stask'`（atask 的中继行 `source='batch'`），作为第二道过滤；
+2. **data.source**：stask 行 `source='stask'`（atask 的中继行 `source='queue'`），作为第二道过滤；
 3. **视图校验**：查询/取消链路按 task_id 取到行后校验 `source='stask'`，不是自家任务 → `404`（atask 的 `get()` 是裸主键查询，跨家 task_id 打到对方端点必须靠这层挡住误读）。
 
 task_id：固定前缀 `stask_{uuid4hex}`（同域名双网关并存，人眼可辨归属，不取 model slug）；channel_id 执行前 0、执行后尽力回填；data JSON：
@@ -107,19 +107,31 @@ slots = clamp(floor(balance / ref_price), 1, ST_MAX_SLOTS)
 安全三防线（防 sk 打到野地址）：nginx `proxy_set_header` 无条件覆盖客户端同名气头；host 必须命中 `ST_UPSTREAM_ALLOWLIST` 否则 400；仅 http(s)、拒绝 URL userinfo。
 
 ```nginx
-location /batch/ {
-    proxy_pass http://atask:8000;
-    proxy_set_header X-Upstream-Base-Url "http://newapi:3000";
-}
-location /async/ {
+# 对外统一前缀 /async：先按路径把「同步类」上游分流给 stask（本服务），
+# 其余反代到 atask 并重写为它的内部端点 /queue/*
+location /async/v1/images/ {                 # 示例：同步生成类路径 → 本服务
     proxy_pass http://stask:8000;
     proxy_set_header X-Upstream-Base-Url "http://newapi:3000";
     proxy_read_timeout 65s;
+}
+location /async/ {
+    proxy_pass http://atask:8000/queue/;     # 带 URI 段 = 重写为内部前缀
+    proxy_set_header X-Upstream-Base-Url "http://newapi:3000";
 }
 location / { proxy_pass http://newapi:3000; }
 # atask/stask 的 /ops /admin /healthz 不进公网域名（内网端口直连），
 # 否则会被默认 location 打到 new-api
 ```
+
+**兜底策略必须显式选一条（两条不可兼得，这是共用前缀的核心代价）**：
+
+- **A. `/async/` 兜底给 atask**（即上面的写法）：新增同步类上游只需加一条 stask 的
+  `location`；但**漏配会把同步请求静默打到 atask**（它会当成任务式中继），症状在两边
+  日志里都只露一半；
+- **B. 兜底 `return 404;`（fail-closed）**：漏配响亮失败，与本仓库「失败方向恒为拒绝」
+  的纪律一致；代价是 **atask 的每条路径也必须显式列出**，等于两边都维护分流表。
+
+两者都接受；**不要既不显式选、又默认甩给某一个服务**。
 
 ## 8. 失败分流与超时对账
 
@@ -142,7 +154,7 @@ gzip 落库（b64 压缩率 70%+，10MB 上限）；保留 `ST_RESULT_TTL_SECOND
 ST_NEWAPI_BASE_URL          默认 upstream
 ST_UPSTREAM_ALLOWLIST       允许的 host 列表
 ST_ASYNC_ALLOW_PREFIXES     路径白名单（如 /v1/images,/v1/audio）
-ST_ASYNC_DENY_PREFIXES      硬拒前缀（默认 /api/,/console/,/batch/）
+ST_ASYNC_DENY_PREFIXES      硬拒前缀（默认 /api/,/console/,/async/）
 ST_BALANCE_CACHE_TTL=30     余额缓存秒
 ST_REF_PRICE_{MODEL}        参考单价
 ST_MAX_SLOTS=10             单用户并发额度上限
@@ -161,7 +173,7 @@ ST_PLATFORM=stask           tasks 表 platform 列取值（与 atask 隔离的�
 ## 11. 部署 / 测试 / 实施
 
 - 部署：web（gunicorn+uvicorn）+ worker（taskiq）+ Redis（独立实例）；compose 单机起步，worker 可自由扩副本
-- 测试：pytest + respx + FakeRedis。重点：幂等真并发、额度边界与 429、占位/占槽失败回滚、路径准入（白名单/deny/双前缀/`/batch/` 拒绝）与 upstream 头校验、四类分流、派发锁防重投、对账三态、202/200 回放与错误码重放、长轮询、跨家 task_id → 404（source 校验）
+- 测试：pytest + respx + FakeRedis。重点：幂等真并发、额度边界与 429、占位/占槽失败回滚、路径准入（白名单/deny/双前缀/`/queue/` 拒绝）与 upstream 头校验、四类分流、派发锁防重投、对账三态、202/200 回放与错误码重放、长轮询、跨家 task_id → 404（source 校验）
 - 实施顺序：表契约与状态机 → 提交链路 → worker+派发锁+分流 → 查询/回放/取消 → 超时对账 → 回调与观测 → 结果清理 → 压测
 
 ## 12. 开放问题

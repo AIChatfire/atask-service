@@ -160,7 +160,7 @@
       <div style="overflow:auto;max-height:60vh">
         <table>
           <thead><tr>
-            <th>task_id</th><th>状态</th><th>模型</th><th>biz</th>
+            <th>task_id</th><th>状态</th><th>模型</th><th>来源</th>
             <th>失败原因</th><th class="num">耗时</th><th>创建</th>
           </tr></thead>
           <tbody id="tkBody"></tbody>
@@ -322,7 +322,7 @@ async function loadTasks() {
              style="text-decoration:none">${esc(String(t.task_id).slice(0, 24))}…</a></td>
       <td><span class="tag t-${esc(t.status)}">${esc(t.status)}</span></td>
       <td>${esc(t.model || "-")}</td>
-      <td class="mono faint">${esc(t.biz || "-")}</td>
+      <td class="mono faint">${esc(t.source || "-")}</td>
       <td class="faint">${esc(String(t.fail_reason || "").slice(0, 60) || "-")}</td>
       <td class="num">${dur(t.duration)}</td>
       <td class="faint">${ago(t.created_at)}</td>
@@ -342,11 +342,10 @@ async function showTask(id) {
   const rows = [
     ["状态", `<span class="tag t-${esc(d.status)}">${esc(d.status)}</span>`],
     ["模型", esc(data.model || "-")],
-    ["biz / source", esc((data.biz || "-") + " / " + (data.source || "-"))],
+    ["来源", esc(data.source || "-")],
     ["用户 / 渠道", esc(`${d.user_id} / ${d.channel_id}`)],
     ["上游状态", esc(data.upstream_status || "-")],
-    ["冻结 / 已结算", esc(`${data.freeze_amount ?? 0} / ${data.settled_amount ?? 0}`)],
-    ["已结算", data.settled ? "是" : "否"],
+    ["上游任务 / 路径", esc((data.upstream_task_id || "-") + " / " + (data.request_path || "-"))],
     ["失败原因", d.fail_reason ? `<div class="err" style="margin:0">${esc(d.fail_reason)}</div>` : "-"],
     ["创建 / 更新", esc(`${ago(d.created_at)} / ${ago(d.updated_at)}`)],
     ["令牌会话", session.exists

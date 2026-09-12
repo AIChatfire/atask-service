@@ -1,12 +1,12 @@
 """任务队列层（taskiq）—— 全部异步协同的唯一入口。
 
-- broker：Redis ListQueueBroker（待执行消息 = Redis list `gw:taskiq`）
-- 延迟任务：RedisScheduleSource（`gw:sched:*`），由 scheduler 进程到期派发。
+- broker：Redis ListQueueBroker（待执行消息 = Redis list `atask:taskiq`）
+- 延迟任务：RedisScheduleSource（`atask:sched:*`），由 scheduler 进程到期派发。
   注意：with_labels(delay=...) 对 ListQueueBroker 不生效，延迟必须走 schedule_by_time。
-- 补数：``/batch`` 后台收敛（cron 每分钟）从 tasks 表事实源把非终态任务探到终态
+- 补数：``/queue`` 后台收敛（cron 每分钟）从 tasks 表事实源把非终态任务探到终态
 - 并发：`taskiq worker app.queue:broker --max-async-tasks N`，多副本直接加进程
 - 可观测：queue_stats() 队列深度/延迟任务数/死信数/任务状态分布，供 /ops/queue 与巡检告警
-- 死信：Redis Stream gw:events:dlq，/ops/dlq/replay 可重放
+- 死信：Redis Stream atask:events:dlq，/ops/dlq/replay 可重放
 
 运行（scheduler 已合并进 worker 进程；**scheduler 必须单副本**，worker 扩
 多副本时把 scheduler 拆回独立服务）：
@@ -31,10 +31,10 @@ from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend, RedisSchedule
 from app.config import settings
 from app import observability
 from app.logging import log, logfire_event, setup_logging
-from app.redis import K_QSTATS, S_DLQ, r
+from app.redis import KEY_PREFIX, K_QSTATS, S_DLQ, r
 
-QUEUE_NAME = "gw:taskiq"
-SCHED_PREFIX = "gw:sched"
+QUEUE_NAME = f"{KEY_PREFIX}:taskiq"
+SCHED_PREFIX = f"{KEY_PREFIX}:sched"
 
 # 公共发射点收敛到 app.logging；保留本模块别名，兼容既有调用点与测试的
 # monkeypatch 面（queue._logfire_event）
@@ -196,35 +196,101 @@ async def notify_task(task_id: str, url: str, payload: dict,
 
 
 @broker.task
-async def batch_submit_task(task_id: str, context: Context = TaskiqDepends()) -> None:
-    """``/batch`` 中继链路的异步提交（ADR-010：零资金动作）。
+async def queue_submit_task(task_id: str, context: Context = TaskiqDepends()) -> None:
+    """``/queue`` 中继链路的异步提交（ADR-010：零资金动作）。
 
     只做「按落库的 upstream_base_url 原样转发」，失败没有资金分支可走
     （ADR-010 §3）。幂等短路与重试由 worker 函数与本层退避共同保证。"""
-    from app.services.relayflow import submit_batch_task  # 延迟 import 防循环
+    from app.services.relayflow import submit_queue_task  # 延迟 import 防循环
     try:
-        await submit_batch_task(task_id)
+        await submit_queue_task(task_id)
     except Exception:
-        log.exception("batch submit failed: {}", task_id)
-        await _retry_or_dlq("BATCH_SUBMIT", batch_submit_task.kicker(), context, (task_id,))
+        log.exception("queue submit failed: {}", task_id)
+        await _retry_or_dlq("QUEUE_SUBMIT", queue_submit_task.kicker(), context, (task_id,))
 
 
-@broker.task(schedule=[{"cron": "*/1 * * * *"}])     # 每分钟收敛 /batch 非终态任务
-async def batch_sweep_task() -> None:
-    """``/batch`` 中继链路的后台收敛（ADR-010）。
+@broker.task(schedule=[{"cron": "*/1 * * * *"}])     # 每分钟收敛 /queue 非终态任务
+async def queue_sweep_task() -> None:
+    """``/queue`` 中继链路的后台收敛（ADR-010）+ 攒批的超期兜底。
 
-    只认 ``source='batch'`` 自有行、零资金动作。收敛本身不做重试编排——一轮失败
+    只认 ``source='queue'`` 自有行、零资金动作。收敛本身不做重试编排——一轮失败
     下轮自然重来，是''幂等轮询''而非''一次性事件''，故不走 ``_retry_or_dlq``。"""
-    from app.services.relayflow import sweep_batch_once  # 延迟 import 防循环
-    await sweep_batch_once(limit=settings.batch_sweep_batch)
+    from app.services.relayflow import sweep_queue_once  # 延迟 import 防循环
+    await sweep_queue_once(limit=settings.queue_sweep_limit)
+
+
+@broker.task
+async def batch_release_task(key: str, source: str = "batch") -> None:
+    """整批放行一个归组键的攒批成员（N 触发 / T 触发共用）。
+
+    **刻意不做重试编排**（与 ``queue_sweep_task`` 同一条理由）：摘批是幂等的，没被
+    成功放行的成员会留在 DB 的等待态里，由 sweep 的超期兜底按 ``batch_due_at`` 捞回；
+    给一次可自愈的抖动配重试只会让同一批被反复摘取，收益为零而噪声翻倍。
+
+    异常**不上抛也不吞**——直接交给 taskiq 的错误通道（中间件记 ERROR + logfire），
+    静默吞掉会让看板全绿而任务一条都没出去。
+    """
+    from app.services import batching  # 延迟 import 防循环
+
+    await batching.release(key, source=source)
+
+
+@broker.task
+async def queue_release_task(task_id: str) -> None:
+    """单条放行（放行时占不到并发槽 → 退避重排到点的重新尝试）。
+
+    入口是 ``relayflow.release_batched_task`` 而不是 ``submit_queue_task``：重排后
+    仍然要**再占一次并发槽**。直接投递提交等于绕过并发闸门，那是「排队」语义的
+    完全反面（提交链路里占槽点只在受理与放行两处）。
+    """
+    from app.services.relayflow import release_batched_task  # 延迟 import 防循环
+
+    await release_batched_task(task_id, source="requeue")
 
 
 # ---------------- 发布门面（请求路径只依赖这里） ----------------
 
-async def publish_batch_submit(task_id: str) -> None:
-    """发布 ``/batch`` 中继链路的提交事件（消息落 Redis list，重启不丢）。"""
-    log.debug("publish batch submit: {}", task_id)
-    await batch_submit_task.kiq(task_id)
+async def publish_queue_submit(task_id: str) -> None:
+    """发布 ``/queue`` 中继链路的提交事件（消息落 Redis list，重启不丢）。"""
+    log.debug("publish queue submit: {}", task_id)
+    await queue_submit_task.kiq(task_id)
+
+
+async def publish_batch_release(
+    key: str, source: str = "batch", *, due_at: int | None = None
+) -> None:
+    """投递整批放行：``due_at`` 为 None → 立即（N 触发）；否则排到该时刻（T 触发）。
+
+    **延迟必须走 ``schedule_by_time``**：``with_labels(delay=...)`` 对
+    ``ListQueueBroker`` 不生效（见模块 docstring），那样写会静默变成「立即执行」，
+    批次窗口形同虚设。
+
+    T 触发的精度取决于 scheduler 的轮询间隔（``--update-interval``，见 Makefile /
+    docker-compose / app/standalone）。默认不设时最小粒度是 1 分钟——**正确性不依赖
+    它**：投递丢失或迟到都由 sweep 的超期兜底接住，只是最坏多等一个周期。
+    """
+    if due_at is not None:
+        delay = float(due_at) - time.time()
+        if delay > 0:
+            await batch_release_task.kicker().schedule_by_time(
+                schedule_source, _at(delay), key, source,
+            )
+            log.debug("publish batch release (deferred {}s): key={}", int(delay), key)
+            return
+    log.debug("publish batch release (now): key={} source={}", key, source)
+    await batch_release_task.kiq(key, source)
+
+
+async def publish_task_release(task_id: str, due_at: int) -> None:
+    """把单条任务的放行排到 ``due_at``（退避重排）。
+
+    ``due_at`` 已过（抖动或时钟）则立即投递，绝不排一个负延迟的任务。
+    """
+    delay = float(due_at) - time.time()
+    if delay <= 0:
+        await queue_release_task.kiq(task_id)
+        return
+    await queue_release_task.kicker().schedule_by_time(schedule_source, _at(delay), task_id)
 
 
 async def publish_notify(task_id: str, url: str, payload: dict) -> None:
@@ -270,10 +336,10 @@ async def queue_stats() -> dict:
 
 #: 死信重放登记表：只登记**会经 ``_retry_or_dlq`` 落死信**的任务类型
 #: （``replay_dlq`` 按此把死信 payload 重新 ``kiq``）。cron 巡检任务
-#: （``batch_sweep_task``）一轮失败下轮自然重来、从不落死信，
+#: （``queue_sweep_task``）一轮失败下轮自然重来、从不落死信，
 #: 故**刻意不登记**——登记一个永不写入的键只会误导后来人以为它会被重投。
 _DLQ_TASKS: dict[str, Any] = {
-    "BATCH_SUBMIT": batch_submit_task,
+    "QUEUE_SUBMIT": queue_submit_task,
     "NOTIFY": notify_task,
 }
 

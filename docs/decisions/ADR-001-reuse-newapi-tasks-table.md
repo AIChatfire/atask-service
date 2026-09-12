@@ -2,7 +2,7 @@
 
 > **仓库独立声明**：本 ADR 属于 **atask-service** 的决策系列。stask-service
 > 有一份**同名同号但内容不同**的 `ADR-001`（那边 `platform='stask'`，本仓库
-> `platform='gateway'`）。两套编号各自独立、互不代表，交叉引用时必须带仓库名
+> `platform='atask'`）。两套编号各自独立、互不代表，交叉引用时必须带仓库名
 > （如「stask-service ADR-001」）。
 
 ## Status: Accepted (2026-09-12)
@@ -23,13 +23,13 @@ atask-service 需要持久化「任务事实源」：状态、渠道口径、上
 Redis 故障时不可恢复。
 
 还有一个跨仓库约束：stask-service 的 `ADR-001`（stask 仓库）明确写了
-「atask-service 已经在复用 `tasks` 表（`platform='gateway'`），它有一个
+「atask-service 已经在复用 `tasks` 表（`platform='atask'`），它有一个
 sweeper 会扫描终态但未结算的任务做兜底重发」。本决策是这个既成事实的
 正式化。
 
 ## Decision
 
-**复用 new-api `tasks` 表，`platform = 'gateway'` 划分自有行。零建表、
+**复用 new-api `tasks` 表，`platform = 'atask'` 划分自有行。零建表、
 零 migration。网关自有状态（幂等键、令牌会话、并发槽、熔断、路由缓存、
 上游 id 反查索引、sweep 重入锁）**全部放 Redis**（`app/redis.py`），
 MySQL 只写 `tasks` 一张表。**
@@ -60,22 +60,22 @@ adaptor nil 检查之前，渠道不存在会强制 FAILURE）。因此 `channel
 
 ### 与 stask 行（`platform='stask'`）的共存
 
-两服务共写一张表，但 `platform` 不同（`'gateway'` vs `'stask'`），
+两服务共写一张表，但 `platform` 不同（`'atask'` vs `'stask'`），
 **靠 platform 过滤天然互不可见**：
 
 - 网关所有写入点 `taskstore.cas` / `patch_data` 的 `WHERE` 恒带
   `platform = :p`（taskstore.py:182、:218）；
 - 网关 sweeper 的候选取数（`terminal_unsettled`、`stale_active`、
   `orphan_active`、`held_expired`、`reconcile_candidates`）同样恒带
-  `platform = 'gateway'`，**看不到 stask 行**。
+  `platform = 'atask'`，**看不到 stask 行**。
 
 > **与 stask 文档描述不符之处（已核实）**：stask 仓库的
 > `ADR-001` / `SPEC.md` 声称其 `data` 恒写 `freeze_amount: 0` 与
 > `settled: true`，让「atask 的 sweeper（按 `settled != 'true'` 找候选）
 > 天然跳过 stask 行」。但**当前 stask 代码并不写这两个键**
-> （`app/services/submit.py::build_task_data` / `batch_fields` 的 data
-> 里没有 `freeze_amount`，也没有 `settled`）。好在实际隔离并不依赖它们：
-> 网关 sweeper 已经用 `platform = 'gateway'` 过滤，无论如何都扫不到
+> （**stask-service** 的 `app/services/submit.py::build_task_data` / `batch_fields`
+> 的 data 里没有 `freeze_amount`，也没有 `settled`）。好在实际隔离并不依赖它们：
+> 网关 sweeper 已经用 `platform = 'atask'` 过滤，无论如何都扫不到
 > `platform='stask'` 的行。stask 的这两处文档描述是**过期/未落地的
 > 契约**，见 `OPEN-DECISIONS.md`。
 
@@ -94,7 +94,7 @@ adaptor nil 检查之前，渠道不存在会强制 FAILURE）。因此 `channel
   缓解：只依赖 `task_id/platform/status/data/user_id/channel_id` 等稳定列。
 - 负面：`data ->> '$.xxx'` 无索引（零建表红线下不能加虚拟列），
   `get_by_upstream_id` 的 SQL 兜底是全表扫描。缓解：Redis 反查索引
-  `gw:tidx:*`（taskstore.py:115）、所有扫描带 platform + 状态 + 时间窗
+  `atask:tidx:*`（taskstore.py:115）、所有扫描带 platform + 状态 + 时间窗
   三重收敛并带 LIMIT。
 - 负面：三方共写一张表，任何一方漏加 `platform` 过滤都是生产事故。
   缓解：`taskstore.py` 是唯一数据访问点。

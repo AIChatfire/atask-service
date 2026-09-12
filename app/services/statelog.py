@@ -1,4 +1,4 @@
-"""状态迁移日志：``/batch`` 链路**状态变化的唯一记录点**。
+"""状态迁移日志：``/queue`` 链路**状态变化的唯一记录点**。
 
 旧链路的 ``statelog`` 靠 Redis「最近已上报状态」键去抖，因为它的状态推进有多个
 平等观察者（GET 轮询 / Poller / Callback）互相竞争。ADR-010 后的新链路把推进权
@@ -24,8 +24,8 @@ def record_transition(task_id: str, from_status: str | None, to_status: str,
                       source: str, detail: str = "") -> None:
     """记录一次**已抢到推进权**的状态迁移：恰好一条本地 INFO + 一条 logfire 事件。
 
-    ``source`` 是推进来源（``batch_submit`` / ``batch_probe`` / ``batch_finalize``
-    / ``batch_cancel``），用于定位是哪条路径推进的；``detail`` 只放面向排障的短
+    ``source`` 是推进来源（``queue_submit`` / ``queue_probe`` / ``queue_finalize``
+    / ``queue_cancel``），用于定位是哪条路径推进的；``detail`` 只放面向排障的短
     文案（失败原因等），**绝不放用户令牌**。
     """
     log.info("task_status_changed: {} {} -> {} ({}{})",

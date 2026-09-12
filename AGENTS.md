@@ -2,9 +2,13 @@
 
 ## 这是什么
 
-异步 AI 网关（atask-service）：异步任务型模型（视频生成等）的统一接入网关，
-与 new-api 生态共用用户体系、钱包与渠道配置。**对外唯一形态是 `POST /batch/{path}`**、
-`GET /batch/{path}/{task_id}`、`DELETE /batch/{path}/{task_id}`——`{path}` 是上游原生
+任务队列服务（atask-service）：把「提交 → 推进 → 取结果」的任务语义统一提供，
+并持有任务事实源，与 new-api 生态共用用户体系、钱包与渠道配置。
+**当前准入范围只接受异步任务**，做的是**排队异步**（**上游异步 → 本地异步**：本地
+task_id、入队排队、后台推进到终态）；「异步 / 同步」是**准入的任务类型**，不是「转」的
+方向（同族的 stask-service 只接受同步任务、由它完成任务化，见本仓库 ADR-008）。
+**对外唯一形态是 `POST /queue/{path}`**、
+`GET /queue/{path}/{task_id}`、`DELETE /queue/{path}/{task_id}`——`{path}` 是上游原生
 路径（如 `v1/tasks`）。
 
 **外部协同：没有外部微服务**。这是本仓库 ADR-010 换向的结果——旧架构里的
@@ -22,10 +26,11 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
 
 ## 目录结构
 
-- app/routers/   HTTP 入口（`batch_task` 通配中继 + `ops` 运维 + `admin` 看板 + `healthz` 探针）
+- app/routers/   HTTP 入口（`queue_task` 通配中继 + `ops` 运维 + `admin` 看板 + `healthz` 探针）
 - app/deps/      请求侧横向件（`identity` 令牌提取、`ratelimit` 限流/并发、`admin` 管理面鉴权）
 - app/services/  编排层：
-  - `relayflow.py`   **唯一链路**的生命周期（受理 / 视图 / 取消 / worker 提交 / sweep / 单一终态收口点）
+  - `relayflow.py`   **唯一链路**的生命周期（受理 / 视图 / 取消 / 攒批放行 / worker 提交 / sweep / 单一终态收口点）
+  - `batching.py`    攒批：批次索引（join/leave/claim）、分批头解析、分组键、整批放行（见 ADR-011）
   - `relay.py`       约定式上游交互（`extract_upstream_task_id` / `upstream_status` / `call_upstream`）
   - `nativeapi.py`   原生报文工具（`normalize` / `is_local_id` / `rewrite_ids` / `capture_snapshot`）
   - `statusmap.py`   上游状态自动映射（内置字典 + 前缀猜测）
@@ -33,7 +38,7 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
   - `upstream.py`    上游出站熔断护栏
   - `taskstore.py`   共享 `tasks` 表数据访问单点（时间列归一）
   - `idem.py` / `ids.py` / `tokensession.py` / `notify.py` / `httpc.py` / `dynconf.py` / `statelog.py`
-- app/queue.py   taskiq 任务定义与发布门面（`batch_submit_task` / `batch_sweep_task` / `notify_task`）
+- app/queue.py   taskiq 任务定义与发布门面（`queue_submit_task` / `queue_sweep_task` / `notify_task`）
 - app/schemas.py 共享状态常量（`SUBMITTED`/`QUEUED`/`IN_PROGRESS`/`SUCCESS`/`FAILURE`/`CANCELED`，`ACTIVE`/`TERMINAL`）
 - app/static/admin.html  管理看板单文件页面
 - tests/         pytest（respx 拦 HTTP，FakeRedis + 内存 taskstore，无外部依赖）
@@ -52,7 +57,7 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
 
 ## 关键约定
 
-- **对外形态唯一**：`/batch/{上游原生路径}`。`{biz}` 段已从 URL 移除；不做任何旧形态
+- **对外形态唯一**：`/queue/{上游原生路径}`。`{biz}` 段已从 URL 移除；不做任何旧形态
   兼容（本仓库 ADR-010）。提交 `POST {base}{path}` 原样转发 method / query / body；
   提取上游任务 id 取 `id`、缺失回退 `task_id`；探测 / 取消
   `{base}{path}/{upstream_task_id}`；状态字段 `status`；鉴权固定 Bearer。
@@ -69,15 +74,34 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
   幂等键；`raw` **只进 Redis 会话**，终态即清。
 - **零资金动作**：`tasks.data` 不写 `freeze_amount` / `settled`；没有 HELD 挂起、
   没有冻结续期、没有孤儿资金收口、没有解冻。取消只做尽力源头止损。
-- **提交失败三档**（`app/services/relayflow.py::submit_batch_task`）：
+- **攒批放行（ADR-011）**：`BATCH_SIZE>=2`（或客户端 `X-Batch-Size`）时受理**不再立刻**
+  投递上游提交——落库 `SUBMITTED` + `data.batch_state='waiting'` 入批等待，由「成员数
+  达到 N」或「本批 deadline 到期」成批放行，放行动作在
+  `app/services/relayflow.py::release_batched_task`（批次索引与参数解析在
+  `app/services/batching.py`）。**只改变提交时机，不做合并请求**——上游是 new-api
+  约定式异步接口，没有批量端点。三条不要动的约定：① **等待期不占并发槽**（占槽点从
+  受理搬到放行，故攒批路径受理不再 429 而改为排队；不搬则批次永远不可能大于并发上限）；
+  ② **两层幂等缺一不可**（批次级 `LUA_BATCH_CLAIM` 原子摘取 + 成员级
+  `taskstore.claim_for_release` 条件更新）——少了成员级，两条放行路径会各读到一次
+  `waiting` 再各放一次，上游被调两次；③ **还槽必须走 `taskstore.claim_slot_release`**
+  （谁把 `data.slot_flags` 置零谁去 DECR），无条件 DECR 会还掉别人的槽而
+  `LUA_CONC_RELEASE` 只钳 0、发现不了。
+- **提交失败三档**（`app/services/relayflow.py::submit_queue_task`）：
   上游 4xx → FAILURE + 还并发槽 + 清会话；5xx / 传输错误 → **留活重试**
   （不判死——上游可能已接单，判死会放过真实在跑的单）；2xx 缺 id → FAILURE。
-- **单一终态收口点**：`relayflow._finalize_batch` 是视图探测 / 后台 sweep / worker
+- **提交回填必须走带起点的 CAS**（同函数末尾）：上游提交**在飞期间**（最长
+  `RELAY_TIMEOUT_SECONDS`）用户可以取消，而**终态不可逆**——回填若裸改状态列会把
+  `CANCELED` 复活成 `QUEUED`（留下 `QUEUED + progress=100% + finish_time 已写` 的
+  矛盾行，且 sweep 随后会给一个已取消的任务投递「成功」回调）。CAS 抢不到时**只**把
+  上游 id 记进 `data`（`patch_data`，不迁状态）供运维追溯孤儿单，**绝不复活状态列**。
+  回归锁：`tests/test_queue_route.py::test_worker_submit_success_must_not_resurrect_canceled_task`
+  （旧链路 KI-D 修过同一问题，ADR-010 重写时丢过这道守卫）。
+- **单一终态收口点**：`relayflow._finalize_queue` 是视图探测 / 后台 sweep / worker
   提交**共用**的唯一终态收口实现，顺序即语义：CAS 抢推进权 → 记一条状态迁移日志
   → 落终态快照（≤8KB）→ 释放并发槽 → 投递用户回调 → 清令牌会话。CAS 抢不到即
   整段不执行——这是终态事件「恰好一次」的唯一保证，不许各路径各写一套。
 - **终态收敛双通道**：① 客户端轮询驱动视图探测（GET 时按需探测，无后台 poller）；
-  ② 后台 `batch_sweep_task`（cron 每分钟、独立重入锁 `K_BATCH_SWEEP_LOCK`）按
+  ② 后台 `queue_sweep_task`（cron 每分钟、独立重入锁 `K_QUEUE_SWEEP_LOCK`）按
   `TASK_STALE_SECONDS` 探测非终态任务并推进——候选**最旧优先**（`updated_at ASC`），
   用 DESC 会让最旧那批永远轮不到探测，而它们最可能已在上游成功。
   令牌会话过期则跳过（DEBUG 级，绝不判死、绝不释放并发槽，见 ADR-010 已知限制）。
@@ -108,10 +132,15 @@ keypool-service（上游 key + 渠道元数据 + 计费规则）与 newapi-billi
   静默忽略（`extra="ignore"`，刻意的），因此**写错键名不会有任何提示**，网关会带
   默认值启动（默认 `DATABASE_URL` 指向 `root:root@127.0.0.1`，表现为连库失败而非
   配置报错）。
+- **Redis 键前缀只有一处定义**（`app/redis.py::KEY_PREFIX`，当前 `atask`，命名对齐
+  `GATEWAY_PLATFORM`）：业务模块只 import 常量，不自己拼前缀。**换前缀 = 换一整套
+  键空间**——队列本身（`atask:taskiq` / `atask:sched:*` / `atask:events:dlq`）也在其中，
+  所以**切换前必须先排空队列**，否则积压的待执行消息、延迟任务与死信会一并变成无人
+  认领的孤儿键（幂等键与令牌会话的丢失只影响在飞窗口，队列丢失是真丢任务）。
 - **管理面 fail-closed**：`/ops/*` 与 `/admin/*` 共用 `X-Admin-Token`（`ADMIN_TOKEN`），
   **未配置密钥时整个管理面返回 404**（不是 401，也不依赖内网隔离）——忘配密钥不等于
   裸奔，见 `app/deps/admin.py`。
-- **通配路由必须最后注册**：`/batch/{path:path}` 是唯一可变路径路由，Starlette 按注册
+- **通配路由必须最后注册**：`/queue/{path:path}` 是唯一可变路径路由，Starlette 按注册
   顺序首匹配——排在字面前缀路由（`/healthz/*`、`/ops/*`、`/admin/*`）之前会把它们整片
   吞掉且不报错。由 `tests/test_static_gates.py` 机械保证（见 `app/main.py` 装配顺序）。
 

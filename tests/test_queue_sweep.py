@@ -1,7 +1,7 @@
-"""``/batch`` 后台收敛 + 用户回调（ADR-010 补链）。
+"""``/queue`` 后台收敛 + 用户回调（ADR-010 补链）。
 
 纯客户端轮询驱动的后果是「客户端不轮询 → 任务永远停在非终态、用户回调整条断链」。
-本文件钉住补齐后台收敛（``relayflow.sweep_batch_once``）后的硬不变量：
+本文件钉住补齐后台收敛（``relayflow.sweep_queue_once``）后的硬不变量：
 
 1. 陈旧非终态任务被探测推进到终态，落快照、**释放并发槽**、清令牌会话；
 2. 上游仍非终态时**什么都不做**（不误判、不释槽）；
@@ -26,14 +26,14 @@ import httpx
 import pytest
 
 from app.main import app
-from app.redis import K_BATCH_SWEEP_LOCK
+from app.redis import K_QUEUE_SWEEP_LOCK
 from app.services import notify, relayflow
 
 AUTH = {"Authorization": "Bearer sk-user-1"}
 UP_BASE = "http://upstream.test"
 TOKEN_HASH = hashlib.sha256(b"sk-user-1").hexdigest()
-CONC_KEY = f"gw:conc:{TOKEN_HASH}"
-SESSION_KEY = "gw:sk:{task_id}"
+CONC_KEY = f"atask:conc:{TOKEN_HASH}"
+SESSION_KEY = "atask:sk:{task_id}"
 CB_URL = "https://user.example/callback"
 
 
@@ -47,22 +47,24 @@ def _headers(**extra: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def batch_settings(monkeypatch: pytest.MonkeyPatch):
+def queue_settings(monkeypatch: pytest.MonkeyPatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "upstream_allowlist", "upstream.test")
     monkeypatch.setattr(settings, "upstream_base_url", UP_BASE)
     monkeypatch.setattr(settings, "relay_timeout_seconds", 60.0)
-    monkeypatch.setattr(settings, "batch_deny_prefixes", "/api/,/console/")
+    monkeypatch.setattr(settings, "queue_deny_prefixes", "/api/,/console/")
+    # ADR-012：回调地址必须命中 fail-closed 白名单（CB_URL 的 host 是 user.example）
+    monkeypatch.setattr(settings, "callback_allowlist", "user.example")
     monkeypatch.setattr(settings, "task_stale_seconds", 300)
-    monkeypatch.setattr(settings, "batch_sweep_batch", 50)
-    monkeypatch.setattr(settings, "batch_sweep_lock_ttl_seconds", 300)
+    monkeypatch.setattr(settings, "queue_sweep_limit", 50)
+    monkeypatch.setattr(settings, "queue_sweep_lock_ttl_seconds", 300)
     return settings
 
 
 @pytest.fixture
-def batch_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
-    """拦截 ``queue.publish_batch_submit``（不触真 broker）。"""
+def queue_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
+    """拦截 ``queue.publish_queue_submit``（不触真 broker）。"""
     import app.queue as q
 
     events: dict[str, list] = {"submit": []}
@@ -70,7 +72,7 @@ def batch_queue(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
     async def _publish(task_id: str) -> None:
         events["submit"].append(task_id)
 
-    monkeypatch.setattr(q, "publish_batch_submit", AsyncMock(side_effect=_publish))
+    monkeypatch.setattr(q, "publish_queue_submit", AsyncMock(side_effect=_publish))
     return events
 
 
@@ -95,7 +97,7 @@ def notified(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 
 @pytest.fixture
 def sweep_source(monkeypatch: pytest.MonkeyPatch, task_store):
-    """给内存 taskstore 补 ``stale_batch_active``（conftest 未覆盖该查询）。
+    """给内存 taskstore 补 ``stale_queue_active``（conftest 未覆盖该查询）。
 
     **按 updated_at ASC 排序后再截断**——镜像真实 SQL 的「最旧优先」语义，
     否则第 7 条「最旧优先」断言就成了摆设。
@@ -107,7 +109,7 @@ def sweep_source(monkeypatch: pytest.MonkeyPatch, task_store):
         out = []
         for t in task_store.rows.values():
             d = t.get("data") or {}
-            if d.get("source") != "batch":
+            if d.get("source") != "queue":
                 continue
             if t["status"] not in ("SUBMITTED", "QUEUED", "IN_PROGRESS"):
                 continue
@@ -128,18 +130,18 @@ def sweep_source(monkeypatch: pytest.MonkeyPatch, task_store):
         out.sort(key=lambda r: r["_updated_at"])          # 最旧优先（同真实 SQL）
         return out[:limit]
 
-    monkeypatch.setattr(ts, "stale_batch_active", _stale)
+    monkeypatch.setattr(ts, "stale_queue_active", _stale)
     return task_store
 
 
 async def _seed(client: httpx.AsyncClient, task_store, *, callback: str = "",
                 status: str = "QUEUED", upstream_id: str = "up-1",
                 age_seconds: int = 10_000, path: str = "/v1/tasks") -> str:
-    """受理一条 ``/batch`` 任务并把它做成「陈旧非终态」候选。"""
+    """受理一条 ``/queue`` 任务并把它做成「陈旧非终态」候选。"""
     headers = _headers()
     if callback:
         headers["X-Callback-Url"] = callback
-    resp = await client.post(f"/batch{path}", json={"model": "m"}, headers=headers)
+    resp = await client.post(f"/queue{path}", json={"model": "m"}, headers=headers)
     assert resp.status_code == 202, resp.text
     task_id = resp.json()["task_id"]
     await task_store.patch_data(task_id, {"upstream_task_id": upstream_id}, status=status)
@@ -153,7 +155,7 @@ async def _seed(client: httpx.AsyncClient, task_store, *, callback: str = "",
 
 
 async def test_sweep_advances_stale_task_to_terminal(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, respx_router,
 ):
     probe = respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
         return_value=httpx.Response(200, json={"id": "up-1", "status": "succeeded"})
@@ -163,7 +165,7 @@ async def test_sweep_advances_stale_task_to_terminal(
 
     assert await patch_redis.get(CONC_KEY) == "1"        # 受理时占了一个并发槽
 
-    advanced = await relayflow.sweep_batch_once()
+    advanced = await relayflow.sweep_queue_once()
 
     assert advanced == 1
     row = task_store.rows[task_id]
@@ -172,7 +174,7 @@ async def test_sweep_advances_stale_task_to_terminal(
     assert row["data"]["upstream_snapshot"] == {"id": "up-1", "status": "succeeded"}
     assert await patch_redis.get(CONC_KEY) == "0"        # 槽被 DECR 释放
     assert await patch_redis.get(SESSION_KEY.format(task_id=task_id)) is None  # 终态清会话
-    assert await patch_redis.get(K_BATCH_SWEEP_LOCK) is None                    # 锁已释放
+    assert await patch_redis.get(K_QUEUE_SWEEP_LOCK) is None                    # 锁已释放
     assert probe.calls
     # 探测用**用户本人 token**（从 Redis 会话取，不落库）
     assert probe.calls[0].request.headers["authorization"] == "Bearer sk-user-1"
@@ -184,7 +186,7 @@ async def test_sweep_advances_stale_task_to_terminal(
 
 
 async def test_sweep_leaves_non_terminal_untouched(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, respx_router,
 ):
     respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
         return_value=httpx.Response(200, json={"id": "up-1", "status": "running"})
@@ -192,7 +194,7 @@ async def test_sweep_leaves_non_terminal_untouched(
     async with _client() as client:
         task_id = await _seed(client, task_store)
 
-    advanced = await relayflow.sweep_batch_once()
+    advanced = await relayflow.sweep_queue_once()
 
     assert advanced == 0
     row = task_store.rows[task_id]
@@ -207,10 +209,10 @@ async def test_sweep_leaves_non_terminal_untouched(
 
 
 async def test_sweep_delivers_signed_user_callback(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, notified,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, notified,
     respx_router, monkeypatch,
 ):
-    monkeypatch.setattr(batch_settings, "callback_sign_secret", "test-secret")
+    monkeypatch.setattr(queue_settings, "callback_sign_secret", "test-secret")
     respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
         return_value=httpx.Response(200, json={"id": "up-1", "status": "succeeded"})
     )
@@ -218,7 +220,7 @@ async def test_sweep_delivers_signed_user_callback(
     async with _client() as client:
         task_id = await _seed(client, task_store, callback=CB_URL)
 
-    advanced = await relayflow.sweep_batch_once()
+    advanced = await relayflow.sweep_queue_once()
 
     assert advanced == 1
     assert len(notified) == 1
@@ -242,7 +244,7 @@ async def test_sweep_delivers_signed_user_callback(
 
 
 async def test_sweep_does_not_notify_without_callback_url(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, notified,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, notified,
     respx_router,
 ):
     respx_router.get(f"{UP_BASE}/v1/tasks/up-1").mock(
@@ -252,7 +254,7 @@ async def test_sweep_does_not_notify_without_callback_url(
         task_id = await _seed(client, task_store)          # 无 X-Callback-Url
 
     assert "callback_url" not in task_store.rows[task_id]["data"]
-    advanced = await relayflow.sweep_batch_once()
+    advanced = await relayflow.sweep_queue_once()
 
     assert advanced == 1
     assert notified == []                                  # 绝不凭空投递
@@ -264,14 +266,14 @@ async def test_sweep_does_not_notify_without_callback_url(
 
 
 async def test_sweep_skips_when_token_session_expired(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, respx_router,
 ):
     # 任何出站都会撞 respx 的 assert_all_mocked —— 没有会话就不该探测
     async with _client() as client:
         task_id = await _seed(client, task_store)
     await patch_redis.delete(SESSION_KEY.format(task_id=task_id))
 
-    advanced = await relayflow.sweep_batch_once()
+    advanced = await relayflow.sweep_queue_once()
 
     assert advanced == 0
     row = task_store.rows[task_id]
@@ -284,7 +286,7 @@ async def test_sweep_skips_when_token_session_expired(
 # ---------------------------------------------------------------------------
 
 
-async def test_stale_batch_query_normalizes_millisecond_rows(monkeypatch):
+async def test_stale_queue_query_normalizes_millisecond_rows(monkeypatch):
     """直接断言真实 SQL：时间比较套 ``_secs('updated_at')``，排序为 ``ASC``。
 
     变异说明（两条独立断言各自可被变异打红）：
@@ -319,7 +321,7 @@ async def test_stale_batch_query_normalizes_millisecond_rows(monkeypatch):
 
     monkeypatch.setattr(ts, "get_session_factory", lambda: (lambda: _Session()))
 
-    rows = await ts.stale_batch_active(stale_seconds=300, limit=50)
+    rows = await ts.stale_queue_active(stale_seconds=300, limit=50)
 
     assert rows == []
     sql = captured["sql"]
@@ -329,7 +331,7 @@ async def test_stale_batch_query_normalizes_millisecond_rows(monkeypatch):
     for field in ("upstream_base_url", "request_path", "upstream_task_id",
                   "callback_url", "token_hash", "source"):
         assert f"data ->> '$.{field}'" in sql
-    assert "data ->> '$.source' = 'batch'" in sql          # 落库判别值已改 batch
+    assert "data ->> '$.source' = 'queue'" in sql          # 落库判别值已改 queue
     # cutoff 是秒（毫秒直比会让所有真实行都不满足 < cutoff 或全部误判）
     assert int(time.time()) - 400 < captured["params"]["cutoff"] <= int(time.time()) - 299
     # 归一函数本身：毫秒值折算为秒
@@ -343,7 +345,7 @@ async def test_stale_batch_query_normalizes_millisecond_rows(monkeypatch):
 
 
 async def test_sweep_probes_oldest_candidate_first_when_limited(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, respx_router,
 ):
     old = respx_router.get(f"{UP_BASE}/v1/tasks/up-old").mock(
         return_value=httpx.Response(200, json={"id": "up-old", "status": "succeeded"})
@@ -355,7 +357,7 @@ async def test_sweep_probes_oldest_candidate_first_when_limited(
         old_id = await _seed(client, task_store, upstream_id="up-old", age_seconds=20_000)
         new_id = await _seed(client, task_store, upstream_id="up-new", age_seconds=10_000)
 
-    advanced = await relayflow.sweep_batch_once(limit=1)
+    advanced = await relayflow.sweep_queue_once(limit=1)
 
     assert advanced == 1
     assert old.calls and not new.calls                    # 只探最旧那条
@@ -369,15 +371,15 @@ async def test_sweep_probes_oldest_candidate_first_when_limited(
 
 
 async def test_sweep_skips_when_lock_held(
-    batch_settings, patch_redis, task_store, batch_queue, sweep_source, respx_router,
+    queue_settings, patch_redis, task_store, queue_queue, sweep_source, respx_router,
 ):
     # 预置锁（模拟上一轮还没跑完）；任何出站都会撞 respx assert_all_mocked
-    await patch_redis.set(K_BATCH_SWEEP_LOCK, "someone-else", ex=300)
+    await patch_redis.set(K_QUEUE_SWEEP_LOCK, "someone-else", ex=300)
     async with _client() as client:
         task_id = await _seed(client, task_store)
 
-    advanced = await relayflow.sweep_batch_once()
+    advanced = await relayflow.sweep_queue_once()
 
     assert advanced == 0
     assert task_store.rows[task_id]["status"] == "QUEUED"  # 未探测、未推进
-    assert await patch_redis.get(K_BATCH_SWEEP_LOCK) == "someone-else"  # 他人锁不被动
+    assert await patch_redis.get(K_QUEUE_SWEEP_LOCK) == "someone-else"  # 他人锁不被动

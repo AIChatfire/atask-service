@@ -23,15 +23,15 @@ P99 / 吞吐 / CPU 占用的具体数值——写出没有测过的数字，比�
 
 ## 1. 待测的关键路径与性能敏感点
 
-现行对外形态只有 `/batch/{上游原生路径}`（本仓库 ADR-010）。要测的路径与敏感点如下：
+现行对外形态只有 `/queue/{上游原生路径}`（本仓库 ADR-010）。要测的路径与敏感点如下：
 
 | # | 路径（代码入口） | 敏感点 | 期望口径（定性，不是数字） |
 |---|---|---|---|
-| 1 | 受理：`POST /batch/{path}`（`app/routers/batch_task.py` → `relayflow.create_batch_task`） | 限流（Redis Lua）+ 幂等占位 + 并发占槽 + 幂等回填，随后落库即返回 | **请求内零上游往返**；延迟只由本地 Redis + MySQL 写决定；这是限流/幂等/并发真正的竞争面 |
-| 2 | worker 提交：`app/queue.py::batch_submit_task` → `relayflow.submit_batch_task` | 上游 RTT 主导；受 `RELAY_TIMEOUT_SECONDS`、队列积压、`QUEUE_MAX_ASYNC_TASKS` 影响 | 不在用户同步路径内；关注单 worker 吞吐与上游连接占用 |
-| 3 | 视图查询：`GET /batch/{path}/{task_id}` → `relayflow.view_batch_task` | **非终态**缓冲转发 `await` 上游至 `RELAY_TIMEOUT_SECONDS`；**终态零上游往返**（快照回放） | 终态查询应与本地读 DB 同级；非终态受上游 RTT 与 gunicorn `timeout` 约束 |
-| 4 | 免费透传：`GET /batch/{path}`（末段非本地 id）→ `relayflow.free_batch_get` | 按 **IP** 限流；原样转发上游（可能是图片/二进制大包）；长时间占用 worker | 关注 worker 被长转发占用的时长与响应体大小，而非 CPU |
-| 5 | 后台收敛：`app/queue.py::batch_sweep_task` → `relayflow.sweep_batch_once` | 每分钟一轮、独立重入锁、最旧优先；每轮串行探测至多 `BATCH_SWEEP_BATCH` 条 | 关注积压能否在合理轮数内收敛，而非吞吐峰值 |
+| 1 | 受理：`POST /queue/{path}`（`app/routers/queue_task.py` → `relayflow.create_queue_task`） | 限流（Redis Lua）+ 幂等占位 + 并发占槽 + 幂等回填，随后落库即返回 | **请求内零上游往返**；延迟只由本地 Redis + MySQL 写决定；这是限流/幂等/并发真正的竞争面 |
+| 2 | worker 提交：`app/queue.py::queue_submit_task` → `relayflow.submit_queue_task` | 上游 RTT 主导；受 `RELAY_TIMEOUT_SECONDS`、队列积压、`QUEUE_MAX_ASYNC_TASKS` 影响 | 不在用户同步路径内；关注单 worker 吞吐与上游连接占用 |
+| 3 | 视图查询：`GET /queue/{path}/{task_id}` → `relayflow.view_queue_task` | **非终态**缓冲转发 `await` 上游至 `RELAY_TIMEOUT_SECONDS`；**终态零上游往返**（快照回放） | 终态查询应与本地读 DB 同级；非终态受上游 RTT 与 gunicorn `timeout` 约束 |
+| 4 | 免费透传：`GET /queue/{path}`（末段非本地 id）→ `relayflow.free_queue_get` | 按 **IP** 限流；原样转发上游（可能是图片/二进制大包）；长时间占用 worker | 关注 worker 被长转发占用的时长与响应体大小，而非 CPU |
+| 5 | 后台收敛：`app/queue.py::queue_sweep_task` → `relayflow.sweep_queue_once` | 每分钟一轮、独立重入锁、最旧优先；每轮串行探测至多 `QUEUE_SWEEP_LIMIT` 条 | 关注积压能否在合理轮数内收敛，而非吞吐峰值 |
 | 6 | 用户回调：`app/queue.py::notify_task` → `notify.push` | 出站 POST（timeout 15s），至少一次投递、失败退避重投 | 关注投递成功率与重投次数，不并入受理延迟 |
 
 ## 2. 已知容量约束与推导关系
@@ -72,15 +72,15 @@ P99 / 吞吐 / CPU 占用的具体数值——写出没有测过的数字，比�
   是缓存快照，用于把「全库 scan + 全表 GROUP BY」降频。压测期间读队列观测值时，注意这是最多
   滞后一个缓存周期的快照，不要当作实时值。
 
-### 2.4 `/batch` 后台收敛：每轮上限与重入锁
+### 2.4 `/queue` 后台收敛：每轮上限与重入锁
 
-- `BATCH_SWEEP_BATCH`（默认 50）：每轮收敛的处理上限；cron 周期固定每分钟。
-  积压追赶速度 ≈ `BATCH_SWEEP_BATCH ÷ 1 分钟`；把队列打满后要观察 sweep 能否在合理轮数内
+- `QUEUE_SWEEP_LIMIT`（默认 50）：每轮收敛的处理上限；cron 周期固定每分钟。
+  积压追赶速度 ≈ `QUEUE_SWEEP_LIMIT ÷ 1 分钟`；把队列打满后要观察 sweep 能否在合理轮数内
   收敛，而不是只看吞吐峰值。
 - `TASK_STALE_SECONDS`（默认 300）：任务多久未被推进才进入收敛候选——它决定「客户端停止
   轮询后多久开始兜底」。
-- `BATCH_SWEEP_LOCK_TTL_SECONDS`（默认 300）：收敛重入锁 TTL。一轮可能串行探测
-  `BATCH_SWEEP_BATCH` 条 × 单条最长 `RELAY_TIMEOUT_SECONDS`，最坏会超过 1 分钟 cron；
+- `QUEUE_SWEEP_LOCK_TTL_SECONDS`（默认 300）：收敛重入锁 TTL。一轮可能串行探测
+  `QUEUE_SWEEP_LIMIT` 条 × 单条最长 `RELAY_TIMEOUT_SECONDS`，最坏会超过 1 分钟 cron；
   锁保证慢轮不叠加并发轮（多副本同理）。**该 TTL 必须 ≥ 一轮最坏耗时**，否则锁会在慢轮
   中途过期、第二轮叠加进来。
 
@@ -125,7 +125,7 @@ make bench TOKEN=sk-xxx BIZ=example MODEL=your-model
 
 **必须先修的事实（否则测的不是本架构）**：该脚本当前仍把目标 URL 拼成
 `{base_url}/{biz}/v1/tasks`、取消示例也指向旧形态——**旧形态在本架构里已不存在**（本仓库
-ADR-010）。要压新链路，须先把脚本目标改为 `{base_url}/batch/{上游原生路径}`（并把
+ADR-010）。要压新链路，须先把脚本目标改为 `{base_url}/queue/{上游原生路径}`（并把
 `--biz` 语义改为「上游原生路径」），否则请求只会 404，测到的是错误路径的延迟。
 `scripts/bench_submit.py` 不属本文件的改动范围，故在此登记为**待修项**。
 
@@ -165,7 +165,7 @@ ADR-010）。要压新链路，须先把脚本目标改为 `{base_url}/batch/{�
 | 队列深度 / 积压 | pending / delayed / dlq / 任务状态分布 | `GET /ops/queue`（`X-Admin-Token`；注意 §2.3 缓存滞后）与 `GET /admin/api/overview` |
 | worker 饱和 | 提交/探测是否排队、单 worker 吞吐 | taskiq-admin 看板（compose 内 `127.0.0.1:3000`）；容器日志 |
 | DB 连接占用 | 实际连接数 vs §2.1 推导预算 | 实例 `SHOW STATUS LIKE 'Threads_connected'`；`gunicorn.conf.py::on_starting` 启动日志打印的预算与生效 worker 数 |
-| sweep 收敛 | 积压是否在合理轮数内回落；锁是否被长期持有 | 容器日志（sweep DEBUG/INFO 行）、`GET /ops/queue`、Redis `gw:batch_sweep_lock` |
+| sweep 收敛 | 积压是否在合理轮数内回落；锁是否被长期持有 | 容器日志（sweep DEBUG/INFO 行）、`GET /ops/queue`、Redis `atask:queue_sweep_lock` |
 | 回调投递 | 投递成功/失败、重投次数、死信 | 容器日志、`GET /ops/queue` 的 `dlq`、logfire `taskiq_task_failed` 事件 |
 | 双侧 CPU | 客户端 CPU vs 服务端 CPU | `--server-pid` 类采样 + `docker stats --no-stream` 快照 |
 
@@ -179,7 +179,7 @@ CPU 时的吞吐数字是客户端瓶颈，不能当服务容量结论（完整�
 数字可信度: 无数字，尚无任何真实环境采集
 基线有效性: 无优化前基线，需先按 §5 采集
 口径确认: 已定义待测路径（§1）、容量约束（§2）、复现脚本（§3）
-复现前提: scripts/bench_submit.py 仍指向旧形态路径，须先改为 /batch/{原生路径}（§3）
+复现前提: scripts/bench_submit.py 仍指向旧形态路径，须先改为 /queue/{原生路径}（§3）
 环境资格: 开发机 / 共享 CI 只能做同环境 A/B，无生产容量资格
 安全前提: 不假定任何组合免费，须先向 provider 确认当前免费组合
 瓶颈归属: 未知；尚无双侧 CPU 采样

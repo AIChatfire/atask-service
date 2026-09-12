@@ -1,8 +1,14 @@
-# atask-service（异步 AI 网关）
+# atask-service（任务队列服务）
 
-异步任务型 AI 模型（视频生成等）的统一接入网关：对上承接用户请求（令牌原样透传、
-本地限流/幂等/并发上限），对下把**本身就是异步任务接口**的上游再包一层统一受理
-（`/batch` 中继形态），与 new-api 生态共用用户体系、钱包与渠道配置。
+**任务队列服务**：把「提交 → 推进 → 取结果」这套任务语义从上游剥离出来统一提供——
+对上承接用户请求（令牌原样透传、本地限流/幂等/并发上限），对下把请求中继到上游并
+**持有任务事实源**（`/queue` 中继形态），与 new-api 生态共用用户体系、钱包与渠道配置。
+
+**当前准入范围：只接受异步任务**，做的事是**排队异步**——把**上游异步**任务接管成
+**本地异步**任务（本地 task_id → 入队排队 → 后台推进到终态 → 可选回调），并持有任务
+事实源。「异步 / 同步」描述的是**当前接受哪种任务**，不是「转」的方向：同族的
+stask-service 只接受同步任务（由它完成任务化），两者产出的都是**本地异步**任务，
+差别只在输入（见本仓库 ADR-008）。
 
 **核心特点**（现行架构见本仓库 ADR-010）
 
@@ -11,10 +17,10 @@
   原样透传，凭证面缩到「无」。
 - **零渠道配置**：渠道路由全部按 new-api 约定硬编码，接入新上游 =
   配一个 base_url + 白名单，**零渠道元数据依赖、零计费规则配置**。
-- **异步受理**：`POST /batch/{path}` 落库即返回本地 task_id，客户端侧零上游往返；
+- **异步受理**：`POST /queue/{path}` 落库即返回本地 task_id，客户端侧零上游往返；
   上游提交交 worker（`app/services/relayflow.py`）。
 - **无状态**：自有状态全在 Redis，零自有 MySQL 表（只读写与 new-api 共享的
-  `tasks` 表，`platform='gateway'` 隔离）。
+  `tasks` 表，`platform='atask'` 隔离）。
 
 ## 架构
 
@@ -25,30 +31,45 @@
           ├─► 上游 new-api 原生异步任务接口（渠道选择与配额扣减都在上游 relay 内闭环）
           │
           ├─► Redis（taskiq 队列、幂等键、令牌会话、并发槽、熔断计数）
-          └─► MySQL（与 new-api 共享 tasks 表，任务事实源，platform='gateway'）
+          └─► MySQL（与 new-api 共享 tasks 表，任务事实源，platform='atask'）
 
-后台：taskiq worker（上游提交 + 用户回调投递 + scheduler 每分钟 batch_sweep 收敛；
+后台：taskiq worker（上游提交 + 用户回调投递 + scheduler 每分钟 queue_sweep 收敛；
 scheduler 必须单副本，worker 扩副本时拆回独立服务）
 ```
 
-## 为什么是 `/batch` 而不是 `/async`
+## 对外前缀与网关内部前缀（两层）
 
-不是随意择名，两个理由：
+| 层 | 前缀 | 谁负责 |
+|---|---|---|
+| 对外（客户端看到） | **`/async`**（与 stask 统一，客户端只记一个） | nginx |
+| 网关自身端点 | **`/queue/{上游原生路径}`** | 本仓库（`app/routers/queue_task.py`） |
 
-1. **本仓库是「异步转异步」**——上游本身就是异步任务型接口，网关只是再包一层统一
-   受理并持有任务事实源。`async` 描述的是「把同步接口异步化」，那正是
-   **stask-service 的语义**（stask 与 atask 是两个独立服务，见本仓库 ADR-008）。
-2. **更硬的理由是 nginx 前缀分流冲突**：`docs/stask-service-design.md` §7 的 nginx
-   方案里 `location /async/ { proxy_pass http://stask:8000; }`——同域名下 `/async/`
-   已经归 stask，两个服务不可能共用同一前缀。atask 必须另占一个。
+nginx 在同一域名下做两件事：
+
+1. **按路径分流**：同步类上游的路径先路由给 stask（`location /async/<同步类路径>/` → stask）；
+2. **其余 `/async/*` 反代到 atask 并重写为内部 `/queue/*`**：
+   `location /async/ { proxy_pass http://atask:8000/queue/; }`
+   （`proxy_pass` 带 URI 段时，用 `/queue/` 替换掉匹配到的 `/async/`）。
+
+**为什么这样分层**：`/async` 对调用方的承诺是「异步交付」，两个服务都成立，所以对外可以
+共用；而「这条路径属于哪类上游」在共域名下只能由 nginx 的路径表给出——**代价是接入新上游
+要多写一条 `location`**（不共用前缀则新上游零 nginx 改动，两种取舍见本仓库 ADR-010 §1）。
+**漏配必须响亮**：兜底建议 `return 404`（fail-closed），别默认甩给某一个服务——否则一个
+漏配的 stask 路径会打到 atask，症状在两边日志里都只露一半。
+
+**历史**：2026-09-13 之前对外前缀是 `/batch`（换向前「批量提交」时期的遗留词）；当日先
+改 `/queue`，最终定为「对外 `/async` + 网关内部 `/queue`」。不做任何别名兼容（本仓库既定立场）。
+
+**一行记法**：`/async` 对调用方承诺「异步交付」，`/queue` 是网关内部「排队接管」的机制名
+（与 `data.source='queue'`、`queue_*` 词根同源）。取舍与历史见本仓库 ADR-010 §1。
 
 ## API 形态
 
 | 端点 | 说明 |
 |---|---|
-| `POST /batch/{path:path}` | 受理：落库即返回 `202 + {task_id, status}`，带 `Location: /batch/{path}/{task_id}` 头；需 `Authorization` + 可选 `Idempotency-Key` |
-| `GET /batch/{path:path}` | 末段是本地 `task_id` → 任务视图（非终态按需探测上游，终态零上游往返）；末段不是本地 id → **免费透传**（原样转发上游，不落 tasks 行） |
-| `DELETE /batch/{path:path}` | 取消：本地 CAS 置 CANCELED + 尽力源头止损（末段不是本地 id 则 404） |
+| `POST /queue/{path:path}` | 受理：落库即返回 `202 + {task_id, status}`，带 `Location: /queue/{path}/{task_id}` 头；需 `Authorization` + 可选 `Idempotency-Key` |
+| `GET /queue/{path:path}` | 末段是本地 `task_id` → 任务视图（非终态按需探测上游，终态零上游往返）；末段不是本地 id → **免费透传**（原样转发上游，不落 tasks 行） |
+| `DELETE /queue/{path:path}` | 取消：本地 CAS 置 CANCELED + 尽力源头止损（末段不是本地 id 则 404） |
 | `GET /ops/queue` | 队列健康快照（积压/延迟/死信/状态分布） |
 | `GET /ops/tasks/{task_id}` | 任务内部诊断视图（令牌会话只给存在性与 TTL） |
 | `POST /ops/requeue/{task_id}` | 手动补投：立即把非终态任务重新放入提交队列 |
@@ -98,21 +119,21 @@ scheduler 必须单副本，worker 扩副本时拆回独立服务）
 
 ```bash
 # 受理：立刻拿到本地 task_id（不等上游）
-curl -X POST https://gw.example.com/batch/v1/tasks \
+curl -X POST https://gw.example.com/queue/v1/tasks \
   -H 'Authorization: Bearer sk-user-xxx' \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: my-key-1' \
   -H 'X-Callback-Url: https://app.example.com/webhook' \
   -d '{"model":"your-model","prompt":"a cat"}'
-# → 202 {"task_id":"batch_5f2c...e91","status":"SUBMITTED"}
-#   Location: /batch/v1/tasks/batch_5f2c...e91
+# → 202 {"task_id":"queue_5f2c...e91","status":"SUBMITTED"}
+#   Location: /queue/v1/tasks/queue_5f2c...e91
 
 # 查询：末段是本地 task_id → 任务视图（非终态按需探测上游）
-curl https://gw.example.com/batch/v1/tasks/batch_5f2c...e91 \
+curl https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
   -H 'Authorization: Bearer sk-user-xxx'
 
 # 取消
-curl -X DELETE https://gw.example.com/batch/v1/tasks/batch_5f2c...e91 \
+curl -X DELETE https://gw.example.com/queue/v1/tasks/queue_5f2c...e91 \
   -H 'Authorization: Bearer sk-user-xxx'
 ```
 
@@ -129,23 +150,23 @@ curl -X DELETE https://gw.example.com/batch/v1/tasks/batch_5f2c...e91 \
   `app/services/idem.py`，接线 `app/services/relayflow.py`。
 - **提交失败三档**：上游 4xx（确定性拒绝）→ FAILURE + 还并发槽 + 清会话；
   5xx / 传输错误（模糊失败）→ **留活重试**（不判死——上游可能已接单）；
-  2xx 却缺 id → FAILURE。实现：`app/services/relayflow.py::submit_batch_task`。
-- **单一终态收口点**：`relayflow._finalize_batch` 是视图路径 / worker 路径 / sweep
+  2xx 却缺 id → FAILURE。实现：`app/services/relayflow.py::submit_queue_task`。
+- **单一终态收口点**：`relayflow._finalize_queue` 是视图路径 / worker 路径 / sweep
   路径共用的**唯一**收口实现——CAS 抢推进权 → 记一条状态迁移日志 → 落终态快照 →
   释放并发槽 → 投递用户回调 → 清令牌会话。CAS 抢不到即整段不执行，保证终态事件
   「恰好一次」。
 - **用户回调**：受理时接受 `X-Callback-Url` 头，终态经 `app/services/notify.py`
   以 HMAC-SHA256 签名（`X-Gateway-Signature: t=...,v1=...`）后投递，走既有
   `queue.publish_notify`（重试 + 死信）。无回调 URL 则不投递。
-- **后台收敛**：`batch_sweep_task`（cron 每分钟，`app/queue.py`）探测非终态任务并
-  推进到终态，用独立重入锁 `K_BATCH_SWEEP_LOCK` 防慢轮叠加；候选**最旧优先**
+- **后台收敛**：`queue_sweep_task`（cron 每分钟，`app/queue.py`）探测非终态任务并
+  推进到终态，用独立重入锁 `K_QUEUE_SWEEP_LOCK` 防慢轮叠加；候选**最旧优先**
   （`updated_at ASC`），因为它们最可能已在上游成功。
 - **并发上限 + 限流**：并发槽按 token hash 计（不依赖内省与余额），上限走运行时
   热配置 `max_concurrent_tasks`；免费 GET 与受理按限流（`RATE_LIMIT_PER_MINUTE`）。
   实现：`app/deps/ratelimit.py`。
 - **上游出站熔断**：窗口内失败达阈值即打开（键取目标 host），出站复用进程级连接池。
   实现：`app/services/upstream.py` + `app/services/httpc.py`。
-- **保留不变的既有契约**：复用 new-api `tasks` 表 + `platform='gateway'` 隔离
+- **保留不变的既有契约**：复用 new-api `tasks` 表 + `platform='atask'` 隔离
   （本仓库 ADR-001）；共享表时间列归一（本仓库 ADR-004，`taskstore.as_unix_seconds`
   / `_secs()`）；**原生报文同构**与**终态快照回放**（终态零上游往返）；幂等原子
   占位；按 token hash 的并发上限。
@@ -208,7 +229,7 @@ make            # 无参数列出全部命令
 关键决策（含被否决的替代方案、真实踩过的坑、上游源码事实）在
 [`docs/decisions/`](docs/decisions/)：ADR-001 ~ ADR-010 + `OPEN-DECISIONS.md`
 （未决事项登记册）。**现行架构的权威是本仓库 ADR-010**
-（`docs/decisions/ADR-010-batch-path-zero-billing.md`）。
+（`docs/decisions/ADR-010-queue-path-zero-billing.md`）。
 
 注意：**本仓库与 stask-service 各有一套独立的 ADR 编号**，同一编号在两仓库含义
 不同，交叉引用时必须写明仓库名（见 `docs/decisions/README.md`）。

@@ -2,8 +2,8 @@
 
 ## 路由注册顺序（main.py）
 
-管理面必须注册在通配路由 ``/{biz}/{path:path}`` **之前**——否则
-``/admin/api/overview`` 会被通配当成 ``biz=admin / path=api/overview`` 吞掉
+管理面必须注册在通配路由 ``/queue/{path:path}`` **之前**——否则
+``/admin/api/overview`` 会被通配当成 ``path=api/overview`` 吞掉
 （通配永远最后，这是本仓库的装配纪律）。
 
 ## 鉴权
@@ -22,7 +22,7 @@
 
 ## 破坏性操作边界
 
-只提供「重投提交」（对 ``/batch`` 非终态任务重发队列消息）与「配置回落」两类
+只提供「重投提交」（对 ``/queue`` 非终态任务重发队列消息）与「配置回落」两类
 写操作。**没有删除任务**之类的入口——终态推进的唯一入口是 relayflow，管理面
 绝不绕过它。
 """
@@ -48,15 +48,19 @@ _STATIC = Path(__file__).resolve().parent.parent / "static"
 
 #: 列表视图白名单字段（与 taskstore.search_tasks 的列投影一一对应）。
 #: 凡不在此列的字段一律不返回——即便数据层多带了列，本层也会剥掉。
+#: ADR-010 后**没有** ``biz`` / ``freeze_amount`` / ``settled``：渠道分组与资金
+#: 动作都已下沉上游，这些键永远不会再被写入，留在白名单里等于给看板喂恒 null
+#: 的列（看板会把「已结算：否」读成结算失败）。
 _LIST_FIELDS = (
     "task_id", "status", "progress", "action", "user_id", "channel_id",
     "created_at", "finish_time", "updated_at",
-    "model", "biz", "source", "result", "freeze_amount", "settled",
+    "model", "source", "result",
 )
-#: 详情视图的 data 白名单（任务行经 taskstore.get 拿到的是嵌套 data）
+#: 详情视图的 data 白名单（任务行经 taskstore.get 拿到的是嵌套 data）。
+#: ``upstream_task_id`` / ``request_path`` 是现行链路唯一的「问的是谁/打到哪里」
+#: 诊断面（旧链路的对应物 ``key_id`` / ``key_index`` 随 keypool 退场）。
 _DETAIL_DATA_FIELDS = (
-    "biz", "source", "model", "upstream_status", "key_index",
-    "freeze_amount", "settled", "settled_amount",
+    "source", "model", "upstream_status", "upstream_task_id", "request_path",
 )
 #: 详情视图的顶层白名单
 _DETAIL_FIELDS = (
@@ -216,7 +220,7 @@ async def task_detail(task_id: str, _: None = Depends(require_admin)) -> dict:
 
 @router.post("/api/tasks/{task_id}/requeue")
 async def requeue(task_id: str, _: None = Depends(require_admin)) -> dict:
-    """手动补投：立即把 ``/batch`` 任务重新放入提交队列（``queue.publish_batch_submit``）。
+    """手动补投：立即把 ``/queue`` 任务重新放入提交队列（``queue.publish_queue_submit``）。
 
     **只对非终态任务开放**。终态任务重投毫无意义，且会绕过 relayflow 的
     单一终态收口点，制造重复事件的口子——所以这里对终态明确 409 拒绝。
@@ -227,7 +231,7 @@ async def requeue(task_id: str, _: None = Depends(require_admin)) -> dict:
     if task["status"] in TERMINAL:
         raise HTTPException(
             409, f"task already terminal: {task['status']} (requeue only for non-terminal)")
-    await queue.publish_batch_submit(task_id)
+    await queue.publish_queue_submit(task_id)
     log.warning("task requeued from admin: task_id={} status={}", task_id, task["status"])
     return {"task_id": task_id, "status": task["status"], "requeued": True}
 

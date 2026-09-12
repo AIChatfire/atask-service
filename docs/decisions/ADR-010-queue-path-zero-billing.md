@@ -1,6 +1,6 @@
-# ADR-010: 对外形态统一为 `/batch/{上游路径}`，鉴权与计费全部下沉上游
+# ADR-010: 对外形态统一为 `/queue/{上游路径}`，鉴权与计费全部下沉上游
 
-**Status**: Accepted (2026-09-12)
+**Status**: Accepted (2026-09-12)；**2026-09-13 修订**：路由前缀 `/batch` → `/queue`（见 §1「2026-09-13 改名」）
 **Supersedes**: **本仓库 ADR-002 / ADR-005 / ADR-006 / ADR-007**
 **Rewrites**: **本仓库 ADR-008**——atask 与 stask 的分工不再是「有无资金动作」，而是「包哪种上游」。
 
@@ -19,7 +19,7 @@
 都要判死。
 
 决策依据是 stask-service 的既有取舍（见 `docs/stask-service-design.md`）：它把
-「同步生成 API 加 `/async` 前缀即任务化」做得极薄——**计费零代码，资金操作全部在上游
+「同步生成 API 加 `/queue` 前缀即任务化」做得极薄——**计费零代码，资金操作全部在上游
 relay 内闭环**，网关只用用户自己的 sk 转发。
 
 ## Decision
@@ -28,24 +28,89 @@ relay 内闭环**，网关只用用户自己的 sk 转发。
 
 | 方法 | 路径 | 语义 |
 |---|---|---|
-| `POST` | `/batch/{path}` | 受理。`{path}` 是**上游原生路径**（如 new-api 视频生成 `v1/tasks`） |
-| `GET` | `/batch/{path}/{task_id}` | 查询。`task_id` 取**最后一段** |
-| `DELETE` | `/batch/{path}/{task_id}` | 取消 |
+| `POST` | `/queue/{path}` | 受理。`{path}` 是**上游原生路径**（如 new-api 视频生成 `v1/tasks`） |
+| `GET` | `/queue/{path}/{task_id}` | 查询。`task_id` 取**最后一段** |
+| `DELETE` | `/queue/{path}/{task_id}` | 取消 |
 
-- 响应统一 `202 + {task_id, status}`，并带 `Location: /batch/{path}/{task_id}` 头。
+- 响应统一 `202 + {task_id, status}`，并带 `Location: /queue/{path}/{task_id}` 头。
 - **`{biz}` 段从 URL 彻底消失**：biz 本来就由渠道元数据提供，URL 段只是入口标签，
   去掉不丢信息（提交链路的选渠道一直只依赖 body 里的 `model`）。
 - 不再有 `/{biz}/v1/tasks`、`/{biz}/v1/videos`、`/{biz}/{原生路径}` 等旧形态。
 - **不做任何旧形态兼容**（用户明确要求「无需兼容旧版本」）。
 
-#### 为什么不是 `/async`（命名理由，不是随意挑的）
+#### 两层前缀：对外 `/async`、网关内部 `/queue`
 
-1. **本仓库是「异步转异步」**：上游本身就是异步任务型接口，网关只是再包一层统一受理。
-   `async` 这个词描述的是「把同步接口异步化」，那正是 **stask 的语义**——
-   而 stask 与 atask 是两个独立服务（本仓库 ADR-008）。
-2. **更硬的理由是 nginx 前缀分流冲突**：`docs/stask-service-design.md` §7 的 nginx
-   方案里 `location /async/ { proxy_pass http://stask:8000; }`——**`/async/` 已经归
-   stask**。同域名下两个服务不可能共用同一前缀，atask 必须另占一个。
+**决策（2026-09-13 定稿）**：**对外统一 `/async`**（与 stask 一致，客户端只记一个
+前缀）；**网关自身端点仍是 `/queue/{上游原生路径}`**，与内部机制名同源
+（`data.source='queue'`、`queue_*` 词根、`task_id` 前缀 `queue_`）。
+
+两层的分工与理由：
+
+| 层 | 前缀 | 谁负责 | 理由 |
+|---|---|---|---|
+| 对外 | `/async` | nginx | `/async` 承诺的是「异步交付」，**两个服务都成立**，故对外可以共用；客户端不必记「哪族打哪个前缀」 |
+| 网关内部 | `/queue` | 本仓库 | 「排队接管」是本服务对输入做的事，与内部词根同源，避免 URL 与落库标记两套词 |
+
+nginx 在同一域名下做两件事：① **按路径分流**——同步类上游的路径先路由给 stask；
+② 其余 `/async/*` **反代到 atask 并重写为内部 `/queue/*`**
+（`location /async/ { proxy_pass http://atask:8000/queue/; }`，`proxy_pass` 带 URI
+段即用 `/queue/` 替换匹配到的 `/async/`）。
+
+**这是有代价的取舍，必须写清**：分流依据从「前缀互斥」变成了**运维侧手写的 nginx
+路径表**——**接入新上游要多写一条 `location`**（不共用前缀时，新上游零 nginx 改动，
+这是本 ADR 原先把「零渠道配置」当卖点的含义，此处相应降级为「零发版」）。写错的
+后果不是明确报错，而是**请求落到错误的服务**（stask 会把任务式请求当同步接口去调），
+症状在两边日志里都只露一半。**因此兜底必须 fail-closed**：`location` 未命中的
+`/async/*` 建议直接 `return 404`，不要默认甩给某一个服务——失败方向恒为拒绝，
+与本仓库「白名单为空即全拒」「未配 ADMIN_TOKEN 即整个管理面 404」同一条纪律。
+
+#### 2026-09-13 改名：`/batch` → `/queue`（命名对齐定位，后升格为上面的两层口径）
+
+> **后续**（同日）：本小节记录的「网关前缀 = `/queue`」保持不变，**对外前缀再统一为
+> `/async`**（见上一小节）——即下表的 `queue` 词根全部保留，只是又多了一层「对外由
+> nginx 重写」的约定。
+
+**决策**：路由前缀由 `/batch` 改为 **`/queue`**，概念词根一并由 `batch` 改为 `queue`。
+理由：本服务的定位是**任务队列**，做的是**排队异步**（上游异步 → 本地异步），`batch`
+是换向前「批量提交」时期的遗留词，与被接受的语义无关；命名应当直接读出「排队」。
+
+**范围（一次改净，不做别名兼容——本仓库既定立场「无需兼容旧版本」）**：
+
+| 类别 | 旧 | 新 |
+|---|---|---|
+| URL 前缀 | `/batch/{path}` | `/queue/{path}` |
+| 本地 task_id 前缀 | `batch_` | `queue_` |
+| 落库标记 | `data.source='batch'` | `'queue'` |
+| 环境变量 | `BATCH_DENY_PREFIXES` | `QUEUE_DENY_PREFIXES` |
+| 环境变量 | `BATCH_SWEEP_BATCH`（词根重复且歧义） | `QUEUE_SWEEP_LIMIT` |
+| 环境变量 | `BATCH_SWEEP_LOCK_TTL_SECONDS` | `QUEUE_SWEEP_LOCK_TTL_SECONDS` |
+| Redis 键 | `atask:batch_sweep_lock` | `atask:queue_sweep_lock` |
+| taskiq 任务 / DLQ | `batch_submit_task` / `batch_sweep_task` / `BATCH_SUBMIT` | `queue_submit_task` / `queue_sweep_task` / `QUEUE_SUBMIT` |
+| 函数族 | `submit_batch_task` / `sweep_batch_once` / `_finalize_batch` / `stale_batch_active` 等 | 同名换词根为 `queue_*` |
+| 模块与文档 | `routers/batch_task.py`、`test_batch_*.py`、`ARCH-batch-relay-lifecycle.md`、本文件原名 `ADR-010-batch-path-...` | 同步改名 |
+
+**刻意不改的地方（否则是误伤）**：
+
+- **`batch` 的另一个正当含义「一批」**：dynconf 的「整批校验」（任一项非法则整批拒绝）
+  保留原词——那是「一批配置项」，与路由无关；
+- **跨仓库引用**：stask-service 自己的 `batching.py` / `batch_fields` 等标识符不属于本仓库，
+  引述时保持原样；
+- **已归档 / 已被取代的文档**（`OPTIMIZATION_BACKLOG.md`、ADR-002/005/006/007）保留原文
+  ——它们是「当时的记录」，仓内体例本就不许在里找现行口径；其中出现的 `/batch` 是改名
+  前的写法。
+
+**必须由本仓库之外同步完成的三件事**（改名是对外契约的破坏性变更，本仓库改不到）：
+
+1. **nginx**：`location /batch/` 改为 `location /queue/`（宝塔面板代管，不在本仓库）；
+2. **stask-service**：`ST_ASYNC_DENY_PREFIXES` 里硬拒的 `/batch/` 改为 `/async/`（否则
+   atask 的新前缀可能被 stask 抢路由或反之）；
+3. **客户端**：调用路径改打 `/queue/{上游原生路径}`。存量 `batch_*` 任务行与
+   `source='batch'` 行按「不迁移」处置（在途任务由运维按需 `DELETE`，同 ADR-001 对旧
+   `platform` 行的立场）。
+
+**判据（这次学到的）**：命名是否合理，与迁移成本是**两个独立问题**——不能因为「改起来
+贵」就把不合理命名固化下来。正确做法是：**先把外部依赖清单列全（本表就是），再一次性
+改净**，而不是拖成半新半旧。
 
 ### 2. 鉴权：网关不做内省
 
@@ -87,7 +152,7 @@ relay 内闭环**，网关只用用户自己的 sk 转发。
 
 ### 6. 终态收敛与用户回调
 
-- **后台 sweep**（`batch_sweep_task`，cron 每分钟，独立重入锁）按 `TASK_STALE_SECONDS`
+- **后台 sweep**（`queue_sweep_task`，cron 每分钟，独立重入锁）按 `TASK_STALE_SECONDS`
   探测非终态任务、推进到终态；**最旧优先**（`_secs('updated_at') ASC`）——
   用 DESC 会让最旧那批永远轮不到探测，而它们最可能已在上游成功。
 - **用户回调**：受理时接受 `X-Callback-Url` 头，终态时经 `notify.sign` 签名后投递，
@@ -134,9 +199,9 @@ relay 内闭环**，网关只用用户自己的 sk 转发。
 
 **保留不变**（这些是 atask 区别于 stask 的本体能力）
 
-- **异步受理**：`POST /batch/{path}` 落库即返回本地 task_id（客户端侧零上游往返），
+- **异步受理**：`POST /queue/{path}` 落库即返回本地 task_id（客户端侧零上游往返），
   上游提交交 worker；
-- **任务事实源**：复用 new-api `tasks` 表，`platform='gateway'` 隔离（**本仓库 ADR-001**）；
+- **任务事实源**：复用 new-api `tasks` 表，`platform='atask'` 隔离（**本仓库 ADR-001**）；
 - **共享表时间列归一**（**本仓库 ADR-004**）：`as_unix_seconds` / `_secs()` / 判死前二次核龄；
 - **原生报文同构**：探测响应把上游 id 逐字节改写回本地 id；**终态零上游往返**（快照回放）；
 - **幂等原子占位**（SET NX 占位 → 回填，真并发 409）；
@@ -163,7 +228,7 @@ relay 内闭环**，网关只用用户自己的 sk 转发。
 6. **收敛延迟是分钟级——这是明确接受的取舍**。后台收敛只按 `TASK_STALE_SECONDS`
    （默认 300s）这个 **stale 阈值**选候选任务，**没有探测阶梯**（旧链路曾有
    5/15/30/120/300 秒的阶梯 + 每分钟 sweep 重投）。因此任务完成后**最长约 300–360s**
-   才会被后台观察到 → **用户回调延迟为分钟级**；客户端主动 `GET /batch/{path}/{task_id}`
+   才会被后台观察到 → **用户回调延迟为分钟级**；客户端主动 `GET /queue/{path}/{task_id}`
    仍是即时探测。
    **明确决定：不恢复阶梯。** 阶梯会显著抬高探测频率、把负载压到上游，而收益只是
    「回调早几分钟到」；需要更快结果时应由客户端轮询，而不是把阶梯加回来。
